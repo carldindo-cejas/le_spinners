@@ -15,8 +15,9 @@ function compile(path) {
   return { re: new RegExp(`^${pattern || ''}/?$`), keys };
 }
 
+/** Routes with `absolute: true` live outside `base` (e.g. /revenue/ in the admin console). */
 export function createRouter({ routes, notFound, base = '', ignore = [] }) {
-  const compiled = routes.map((r) => ({ ...r, ...compile(base + r.path) }));
+  const compiled = routes.map((r) => ({ ...r, ...compile(r.absolute ? r.path : base + r.path) }));
   let current = null;
   let navId = 0;
   const scrollPositions = new Map();
@@ -97,7 +98,7 @@ export function createRouter({ routes, notFound, base = '', ignore = [] }) {
   }
 
   function handles(pathname) {
-    if (base && !pathname.startsWith(base)) return false;
+    if (base && !pathname.startsWith(base) && !compiled.some((r) => r.absolute && r.re.test(pathname))) return false;
     return !ignore.some((prefix) => pathname.startsWith(prefix));
   }
 

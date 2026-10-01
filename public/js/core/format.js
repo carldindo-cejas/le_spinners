@@ -30,6 +30,33 @@ export function rangeLabel(start, end) {
   return `${a} – ${b}`;
 }
 
+/**
+ * A booking's times: "6:00 – 7:00 PM", or with gaps "4:00 – 5:00 PM, 7:00 – 8:00 PM".
+ * Uses `b.segments` (the API's booked times) and falls back to `b.start`–`b.end`.
+ * `full` keeps AM/PM on both ends of each range.
+ */
+export function bookingTime(b, { full = false } = {}) {
+  const segs = b.segments && b.segments.length ? b.segments : [{ start: b.start, end: b.end }];
+  return segs.map((s) => (full ? rangeLabelFull(s.start, s.end) : rangeLabel(s.start, s.end))).join(', ');
+}
+
+/** Slot starts merged into continuous stretches: [960, 1020, 1140] with 60-minute slots → 4–6 PM and 7–8 PM. */
+export function mergeStarts(starts, slotMinutes) {
+  const out = [];
+  for (const s of [...new Set(starts)].sort((a, b) => a - b)) {
+    const last = out[out.length - 1];
+    if (last && last.end === s) last.end = s + slotMinutes;
+    else out.push({ start: s, end: s + slotMinutes });
+  }
+  return out;
+}
+
+/** 60 → "1 hour", 120 → "2 hours", 90 → "90 min" */
+export function durationLabel(minutes) {
+  if (minutes % 60 === 0) return `${minutes / 60} hour${minutes === 60 ? '' : 's'}`;
+  return `${minutes} min`;
+}
+
 /** "6:00 PM – 7:00 PM" */
 export function rangeLabelFull(start, end) {
   return `${minutesLabel(start)} – ${minutesLabel(end)}`;

@@ -409,10 +409,19 @@ a.list-row:hover, button.list-row:hover { background: var(--row-hover); color: i
 .toast .t-body small { display: block; font-weight: 500; color: var(--ink-muted); font-size: 13.5px; }
 .toast .t-action { background: none; border: 0; color: var(--volt-400); font-weight: 800; font-size: 14px; min-height: 44px; padding: 0 6px; text-decoration: none; }
 .toast.leaving { opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s; }
+.toast .t-close { width: 36px; height: 36px; margin-right: -4px; border: 0; border-radius: 10px; background: transparent; color: var(--ink-muted); display: grid; place-items: center; flex-shrink: 0; }
+.toast .t-close:hover { background: var(--ink-active); color: #fff; }
+.toast .t-close:focus-visible { outline-color: var(--volt-400); }
+/* Swipe to dismiss (touch): follows the finger, then slides out the way it was thrown. */
+.toast { touch-action: pan-y; transform: translateX(var(--dx, 0)); transition: transform .18s ease-out; }
+.toast.dragging { transition: none; opacity: .9; }
+.toast.leaving.swiped-right { transform: translateX(110%); }
+.toast.leaving.swiped-left { transform: translateX(-110%); }
+@media (prefers-reduced-motion: reduce) { .toast.leaving.swiped-right, .toast.leaving.swiped-left { transform: translateX(var(--dx, 0)); } }
 
 /* ── Dialogs and sheets ─────────────────────────────────────────────────── */
 
-.scrim { position: fixed; inset: 0; z-index: 80; background: var(--scrim); display: flex; align-items: center; justify-content: center; padding: 20px; animation: ls-fade .2s ease-out; }
+.scrim { position: fixed; inset: 0; z-index: 88; background: var(--scrim); display: flex; align-items: center; justify-content: center; padding: 20px; animation: ls-fade .2s ease-out; }
 .scrim.sheet-host { align-items: flex-end; padding: 0; }
 .dialog { position: relative; width: 100%; max-width: 480px; max-height: calc(100vh - 40px); overflow: auto; background: #fff; border-radius: var(--r-dialog); padding: 24px; box-shadow: var(--sh-overlay); display: flex; flex-direction: column; gap: 14px; animation: ls-pop .22s ease-out; }
 .dialog.wide { max-width: 580px; }

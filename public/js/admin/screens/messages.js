@@ -1,12 +1,13 @@
 import { api } from '../../core/api.js';
 import { $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
-import { firstName, initials, rangeLabel, relTime, shortDate } from '../../core/format.js';
+import { bookingTime, firstName, initials, relTime, shortDate } from '../../core/format.js';
 import { messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { frame, refreshBadges } from '../shell.js';
+import { API, BASE } from '../console.js';
 
-const QUICK = ['Verifying now — a few minutes.', 'Please upload a clearer screenshot.', 'Please send your GCash reference no.'];
+export const QUICK = ['Verifying now — a few minutes.', 'Please upload a clearer screenshot.', 'Please send your GCash reference no.'];
 const STATUS_WORD = {
   PAYMENT_SUBMITTED: ['verifying', 'w-violet'],
   TEMPORARY: ['on hold', 'w-amber'],
@@ -16,7 +17,7 @@ const STATUS_WORD = {
 
 function convRow(c, activeId) {
   const w = STATUS_WORD[c.status];
-  return html`<a class="conv${c.unread ? ' unread' : ''}" href="/admin/messages/${c.bookingId}" ${c.bookingId === activeId ? html`aria-current="page"` : ''}>
+  return html`<a class="conv${c.unread ? ' unread' : ''}" href="${BASE}/messages/${c.bookingId}" ${c.bookingId === activeId ? html`aria-current="page"` : ''}>
     <span class="avatar sm${c.unread ? '' : ' muted-av'}">${initials(c.userName)}</span>
     <span class="grow stack stack-4">
       <span class="row row-between"><span class="c-name">${c.userName}</span><span class="c-time">${relTime(c.last.at)}</span></span>
@@ -76,11 +77,11 @@ export function messagesView({ params }) {
     const threadEl = $('[data-thread]', root);
     if (!threadEl.querySelector('[data-log]')) {
       render(threadEl, html`<header class="thread-head">
-          <a class="icon-btn flat only-mobile" href="/admin/messages" aria-label="Back to messages">${icon('chevron-left', 22, 2.2)}</a>
+          <a class="icon-btn flat only-mobile" href="${BASE}/messages" aria-label="Back to messages">${icon('chevron-left', 22, 2.2)}</a>
           <span class="avatar">${initials(b.user.name)}</span>
           <div class="grow"><p class="strong">${b.user.name}</p><p class="small row" data-gap="6">${icon('lock', 13, 2.4)}<span class="mono">${b.ref}</span> · private to ${firstName(b.user.name)} &amp; staff</p></div>
         </header>
-        <div class="thread-strip"><span class="small strong">${b.resource.name} · ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</span>${statusPill(b.status, { small: true })}${b.status === 'PAYMENT_SUBMITTED' ? html`<a class="btn btn-secondary btn-xs ml-auto" href="/admin/verify/${b.id}">Review payment</a>` : ''}</div>
+        <div class="thread-strip"><span class="small strong">${b.resource.name} · ${shortDate(b.date)} · ${bookingTime(b)}</span>${statusPill(b.status, { small: true })}${b.status === 'PAYMENT_SUBMITTED' ? html`<a class="btn btn-secondary btn-xs ml-auto" href="${BASE}/verify/${b.id}">Review payment</a>` : ''}</div>
         <ol class="thread-log" role="log" aria-live="polite" data-log></ol>
         <div class="thread-compose">
           <div class="quick-replies">${QUICK.map((q) => html`<button type="button" class="chip" data-quick="${q}">${q}</button>`)}</div>
@@ -107,7 +108,7 @@ export function messagesView({ params }) {
     const p = detail.proofs[0];
     render(el, html`<p class="eyebrow">This booking</p>
       <p class="h3">${b.resource.name}</p>
-      <p class="small">${b.activityLabel} · ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</p>
+      <p class="small">${b.activityLabel} · ${shortDate(b.date)} · ${bookingTime(b)}</p>
       <div>${statusPill(b.status, { small: true })}</div>
       <dl class="kv">
         <div><dt>Amount</dt><dd class="mono">${b.amountLabel}</dd></div>
@@ -115,8 +116,8 @@ export function messagesView({ params }) {
         <div><dt>GCash ref.</dt><dd class="mono">${p && p.gcashRef ? p.gcashRef : '—'}</dd></div>
         <div><dt>Customer</dt><dd>${b.user.membership === 'member' ? 'Member' : 'Non-member'}</dd></div>
       </dl>
-      ${b.status === 'PAYMENT_SUBMITTED' ? html`<a class="btn btn-violet btn-block" href="/admin/verify/${b.id}">Review payment</a>` : ''}
-      <a class="btn btn-secondary btn-block" href="/admin/bookings/${b.id}">View booking</a>
+      ${b.status === 'PAYMENT_SUBMITTED' ? html`<a class="btn btn-violet btn-block" href="${BASE}/verify/${b.id}">Review payment</a>` : ''}
+      <a class="btn btn-secondary btn-block" href="${BASE}/bookings/${b.id}">View booking</a>
       <p class="small">Each conversation belongs to one booking. A player with three bookings has three separate threads.</p>`);
   }
 
@@ -145,7 +146,7 @@ export function messagesView({ params }) {
       const btn = form.querySelector('.send-btn');
       btn.disabled = true;
       try {
-        const res = await api.post(`/api/admin/bookings/${encodeURIComponent(activeId)}/messages`, { body });
+        const res = await api.post(`${API}/bookings/${encodeURIComponent(activeId)}/messages`, { body });
         input.value = '';
         input.style.removeProperty('height');
         thread.messages = res.messages;
@@ -171,7 +172,7 @@ export function messagesView({ params }) {
 
   async function loadList() {
     try {
-      const res = await api.get('/api/admin/messages');
+      const res = await api.get(`${API}/messages`);
       conversations = res.conversations;
       paintList();
     } catch (err) {
@@ -186,8 +187,8 @@ export function messagesView({ params }) {
     if (!activeId) return;
     try {
       const [t, d] = await Promise.all([
-        api.get(`/api/admin/bookings/${encodeURIComponent(activeId)}/messages`),
-        first || !detail ? api.get(`/api/admin/bookings/${encodeURIComponent(activeId)}`) : Promise.resolve(detail),
+        api.get(`${API}/bookings/${encodeURIComponent(activeId)}/messages`),
+        first || !detail ? api.get(`${API}/bookings/${encodeURIComponent(activeId)}`) : Promise.resolve(detail),
       ]);
       thread = t;
       detail = d;

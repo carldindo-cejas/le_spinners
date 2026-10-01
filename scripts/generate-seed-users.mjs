@@ -23,6 +23,7 @@ const people = [
   ['u_pedro', 'pedro.cruz@example.com', 'Pedro Cruz', '0928 555 0192', 'player', 'none', null, null],
   ['u_kim', 'kim.aquino@example.com', 'Kim Aquino', '0995 555 0158', 'player', 'pending', 'LS-M-0201', null],
   ['u_ana', 'ana.reyes@lespinners.example', 'Ana Reyes', '0917 555 0100', 'admin', 'none', null, null],
+  ['u_rhea', 'rhea.lim@lespinners.example', 'Rhea Lim', '0917 555 0130', 'staff', 'none', null, null],
 ];
 
 const q = (v) => (v === null ? 'NULL' : `'${String(v).replace(/'/g, "''")}'`);

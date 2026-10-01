@@ -2,10 +2,11 @@
    - API calls are never cached: availability, holds and payments are live.
    - Pages and static files are network-first with an offline fallback. */
 
-const VERSION = 'ls-2026-09-30-2';
+const VERSION = 'ls-2026-10-02-2';
 const SHELL = [
   '/',
   '/admin/',
+  '/staff/',
   '/css/app.css',
   '/css/player.css',
   '/css/admin.css',
@@ -56,7 +57,9 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return; // fonts etc. use the browser cache
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/cdn-cgi/')) return; // always live, never cached
   if (request.mode === 'navigate') {
-    event.respondWith(networkFirst(request, url.pathname.startsWith('/admin') ? '/admin/' : '/'));
+    // Each app falls back to its own shell. Shells hold no account data; screens load it live.
+    const shell = url.pathname.startsWith('/admin') || url.pathname.startsWith('/revenue') ? '/admin/' : url.pathname.startsWith('/staff') ? '/staff/' : '/';
+    event.respondWith(networkFirst(request, shell));
     return;
   }
   if (/\.(?:js|css|png|svg|webmanifest|woff2?)$/.test(url.pathname)) {

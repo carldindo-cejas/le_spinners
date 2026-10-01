@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppEnv, ResourceRow } from '../types';
 import { alternativesFor, dayAvailability, daysSummary } from '../lib/availability';
-import { requireUser } from '../lib/auth';
-import { activityLabel, underMaintenance, type HoursRow } from '../lib/bookings';
+import { requirePlayer, requireUser } from '../lib/auth';
+import { activityLabel, isOpenPlay, underMaintenance, type HoursRow } from '../lib/bookings';
 import { notFound, unprocessable } from '../lib/errors';
 import { publicSettings, loadSettings } from '../lib/settings';
 import { addDays, dateLabel, daysBetween, hoursLabel, isValidDate, localNow, offsetMinutes, peso } from '../lib/time';
@@ -64,7 +64,7 @@ facilityRoutes.get('/facility', async (c) => {
         id: r.id,
         activity: r.activity,
         name: r.name,
-        status: maintenance ? 'maintenance' : 'active',
+        status: maintenance ? 'maintenance' : isOpenPlay(r) ? 'open_play' : 'active',
         maintenance: maintenance ? { note: r.maintenance_note, until: r.maintenance_until, untilLabel: r.maintenance_until ? dateLabel(r.maintenance_until) : null } : null,
         priceMember: r.price_member,
         priceNonMember: r.price_non_member,
@@ -73,7 +73,7 @@ facilityRoutes.get('/facility', async (c) => {
   });
 });
 
-/** The GCash QR image, for signed-in players on the payment screen. */
+/** The GCash QR image. Any signed-in role: players on the payment screen, admins in Settings. */
 facilityRoutes.get('/facility/gcash-qr', async (c) => {
   requireUser(c);
   const settings = await loadSettings(c.env.DB);
@@ -102,7 +102,7 @@ function checkPlayerDate(date: string, today: string, windowDays: number) {
 
 /** One day of slots for an activity. No names, ids or amounts of other players. */
 facilityRoutes.get('/availability', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const q = query(c, z.object({ activity: zActivity, date: zDate }));
   const settings = await loadSettings(c.env.DB);
   const now = Date.now();
@@ -114,22 +114,31 @@ facilityRoutes.get('/availability', async (c) => {
 
 /** The bookable date strip for an activity. */
 facilityRoutes.get('/availability/days', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const q = query(c, z.object({ activity: zActivity }));
   const settings = await loadSettings(c.env.DB);
   return c.json(await daysSummary(c.env, settings, q.activity, { userId: user.id, membership: user.membership }));
 });
 
-/** Free slots near a given one (the booking screen asks after a conflict). */
+/** Open times near the given ones: `start=1080`, or `starts=960,1080` for several. */
 facilityRoutes.get('/availability/alternatives', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const q = query(
     c,
-    z.object({ resourceId: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/), date: zDate, start: z.coerce.number().int().min(0).max(1439) }),
+    z
+      .object({
+        resourceId: z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/),
+        date: zDate,
+        start: z.coerce.number().int().min(0).max(1439).optional(),
+        starts: z.string().regex(/^\d{1,4}(,\d{1,4}){0,95}$/, 'List start minutes like 960,1080').optional(),
+      })
+      .refine((v) => v.start != null || Boolean(v.starts), { message: 'Give start or starts.', path: ['starts'] }),
   );
+  const starts = q.starts ? q.starts.split(',').map(Number).filter((n) => n <= 1439) : [q.start!];
   const settings = await loadSettings(c.env.DB);
   const now = Date.now();
   const local = localNow(offsetMinutes(c.env.TZ_OFFSET_MINUTES), now);
   checkPlayerDate(q.date, local.date, settings.bookingWindowDays);
-  return c.json({ alternatives: await alternativesFor(c.env, settings, { userId: user.id, membership: user.membership }, q, now) });
+  const input = { resourceId: q.resourceId, date: q.date, starts };
+  return c.json({ alternatives: await alternativesFor(c.env, settings, { userId: user.id, membership: user.membership }, input, now) });
 });

@@ -1,22 +1,32 @@
 import { api } from '../../core/api.js';
 import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
-import {
-  bytes, clock, dayClock, firstName, minutesBetween, monthDayYear, peso, rangeLabel, rangeLabelFull, shortDate, weekdayShort,
-} from '../../core/format.js';
+import { bookingTime, bytes, clock, dayClock, firstName, minutesBetween, monthDayYear, peso, shortDate, weekdayShort } from '../../core/format.js';
 import { copyText, errorState, memberTag, openModal, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { frame, navigate, refreshBadges, state } from '../shell.js';
 import { waitLabel } from './dashboard.js';
+import { miniChat } from '../minichat.js';
+import { API, BASE } from '../console.js';
 
 async function staffSettings() {
   if (!state.settings) {
     try {
-      state.settings = (await api.get('/api/admin/settings')).settings;
+      state.settings = (await api.get(`${API}/rules`)).settings;
     } catch {
       state.settings = { gcashNumber: '', resubmitMinutes: 10 };
     }
   }
   return state.settings;
+}
+
+/** "Before you approve": every item must be ticked before a payment can be approved. */
+function checklistItems(b, p) {
+  return [
+    `Amount on the screenshot is ${b.amountLabel}`,
+    `Sent to Le Spinners' GCash (${(state.settings && state.settings.gcashNumber) || 'your number'})`,
+    p && p.gcashRef ? `Reference ${p.gcashRef} is in our GCash history` : 'Reference is in our GCash history',
+    `Paid after the booking was made (${clock(b.createdAt)})`,
+  ];
 }
 
 function amountPill(check) {
@@ -35,7 +45,7 @@ function pendingCard(b, i, now) {
     <div class="stack stack-4">
       <span class="who-line">${b.user.name}${memberTag(b.user.membership, { small: true })}</span>
       <span class="strong">${b.activityLabel} — ${b.resource.name}</span>
-      <span class="small">${weekdayShort(b.date)}, ${shortDate(b.date)} • ${rangeLabel(b.start, b.end)}</span>
+      <span class="small">${weekdayShort(b.date)}, ${shortDate(b.date)} • ${bookingTime(b)}</span>
       <span class="mono small ink">${b.ref}</span>
     </div>
     <dl class="vq-details">
@@ -45,16 +55,16 @@ function pendingCard(b, i, now) {
       <div><dt>Submitted</dt><dd>${waitLabel(b.submittedAt, now, i === 0)}</dd></div>
     </dl>
     <div class="vq-actions">
-      <a class="btn btn-primary btn-sm" href="/admin/verify/${b.id}">Review</a>
-      <a class="btn btn-secondary btn-sm" href="/admin/messages/${b.id}">${icon('chat', 16)}Chat${b.unreadMessages ? html`<span class="badge inline">${b.unreadMessages}</span>` : ''}</a>
+      <a class="btn btn-primary btn-sm" href="${BASE}/verify/${b.id}">Review</a>
+      <a class="btn btn-secondary btn-sm" href="${BASE}/messages/${b.id}">${icon('chat', 16)}Chat${b.unreadMessages ? html`<span class="badge inline">${b.unreadMessages}</span>` : ''}</a>
     </div>
   </article>`;
 }
 
 function approvedRow(b) {
-  return html`<a class="panel list-row" href="/admin/bookings/${b.id}">
+  return html`<a class="panel list-row" href="${BASE}/bookings/${b.id}">
     <span class="tile green sm">${icon('check', 20, 2.6)}</span>
-    <span class="grow"><span class="strong">${b.user.name}</span><br><span class="small">${b.resource.name} · ${shortDate(b.date)} ${rangeLabel(b.start, b.end)} · ${b.amountLabel}</span><br><span class="meta">Approved by ${firstName(b.confirmedBy || 'staff')} · ${b.confirmedAt ? clock(b.confirmedAt) : ''}</span></span>
+    <span class="grow"><span class="strong">${b.user.name}</span><br><span class="small">${b.resource.name} · ${shortDate(b.date)} ${bookingTime(b)} · ${b.amountLabel}</span><br><span class="meta">Approved by ${firstName(b.confirmedBy || 'staff')} · ${b.confirmedAt ? clock(b.confirmedAt) : ''}</span></span>
     ${statusPill(b.status, { small: true })}
   </a>`;
 }
@@ -65,11 +75,11 @@ function rejectedCard(b) {
       : b.status === 'PAYMENT_SUBMITTED' ? 'New proof sent · back in the queue'
         : b.status === 'CONFIRMED' ? 'New proof approved · booking confirmed' : 'Closed';
   return html`<article class="panel panel-body stack stack-12">
-    <div class="row row-between"><span><span class="strong">${b.user.name}</span><br><span class="small">${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</span></span>${statusPill(b.status, { small: true })}</div>
+    <div class="row row-between"><span><span class="strong">${b.user.name}</span><br><span class="small">${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)} · ${bookingTime(b)}</span></span>${statusPill(b.status, { small: true })}</div>
     <div class="reason-box ink-box"><span class="eyebrow">Reason sent to ${firstName(b.user.name)}</span><p class="body">${b.rejectReason || ''}</p></div>
     <p class="row small" data-gap="8"><span class="dot red-dot"></span>Rejected by ${firstName(b.rejectedBy || 'staff')} · ${b.rejectedAt ? clock(b.rejectedAt) : ''}</p>
     <p class="row small" data-gap="8"><span class="dot grey-dot"></span>${outcome}</p>
-    <a class="btn btn-secondary btn-sm" href="/admin/messages/${b.id}">Open conversation</a>
+    <a class="btn btn-secondary btn-sm" href="${BASE}/messages/${b.id}">Open conversation</a>
   </article>`;
 }
 
@@ -130,7 +140,7 @@ export async function queueView({ query }) {
 
   on(root, 'click', '[data-tab]', (_e, btn) => {
     tab = btn.dataset.tab;
-    history.replaceState(history.state, '', tab === 'pending' ? '/admin/verify' : `/admin/verify?tab=${tab}`);
+    history.replaceState(history.state, '', tab === 'pending' ? `${BASE}/verify` : `${BASE}/verify?tab=${tab}`);
     data = null;
     render(list, skeletonRows(3, 'sk-card'));
     load();
@@ -142,7 +152,7 @@ export async function queueView({ query }) {
 
   async function load() {
     try {
-      data = await api.get(`/api/admin/verifications?tab=${tab}`);
+      data = await api.get(`${API}/verifications?tab=${tab}`);
       paint();
     } catch (err) {
       render(list, errorState(err));
@@ -237,7 +247,7 @@ function zoomTools(prefix = '') {
 }
 
 /** Full-screen proof viewer (A39). */
-export function openViewer({ url, booking: b, proof, onDecision, canDecide = true }) {
+export function openViewer({ url, booking: b, proof, onDecision, canDecide = true, checklistDone = false }) {
   const host = document.createElement('div');
   host.className = 'viewer';
   host.setAttribute('role', 'dialog');
@@ -252,7 +262,7 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
     <aside class="v-rail">
       <p class="eyebrow volt-text">Booking</p>
       <p class="h3">${b.resource.name} · ${b.activityLabel}</p>
-      <p class="small light-text">${weekdayShort(b.date)}, ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</p>
+      <p class="small light-text">${weekdayShort(b.date)}, ${shortDate(b.date)} · ${bookingTime(b)}</p>
       <p class="mono small">${b.ref}</p>
       <dl class="kv">
         <div><dt>Customer</dt><dd>${b.user.name} · ${b.user.membership === 'member' ? 'Member' : 'Non-member'}</dd></div>
@@ -287,7 +297,7 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
       close();
       if (onDecision) onDecision();
     };
-    if (btn.dataset.decide === 'approve') openApprove(b, proof, after);
+    if (btn.dataset.decide === 'approve') openApprove(b, proof, after, { checklistDone });
     else openReject(b, after);
   });
   $('[data-close]', host).focus();
@@ -298,15 +308,16 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
 
 async function nextPending(exceptId) {
   try {
-    const res = await api.get('/api/admin/verifications?tab=pending');
+    const res = await api.get(`${API}/verifications?tab=pending`);
     return res.items.find((x) => x.id !== exceptId) || null;
   } catch {
     return null;
   }
 }
 
-function openApprove(b, proof, onDone) {
+function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
   const first = firstName(b.user.name);
+  const items = checklistItems(b, proof);
   const dayName = new Date(`${b.date}T00:00:00Z`).toLocaleString('en-US', { weekday: 'long', timeZone: 'UTC' });
   const chatText = `Payment verified — see you on ${dayName}!`;
   let busy = false;
@@ -317,21 +328,32 @@ function openApprove(b, proof, onDone) {
       <h2 class="dialog-title">Approve this booking?</h2>
       <p class="body">This marks the payment as verified and confirms the booking.</p>
       <dl class="kv card-soft">
-        <div><dt>Booking</dt><dd>${b.resource.name} · ${monthDayYear(b.date).replace(/, \d{4}$/, '')} · ${rangeLabel(b.start, b.end)}</dd></div>
+        <div><dt>Booking</dt><dd>${b.resource.name} · ${monthDayYear(b.date).replace(/, \d{4}$/, '')} · ${bookingTime(b)}</dd></div>
         <div><dt>Customer</dt><dd>${b.user.name} · ${b.user.membership === 'member' ? 'Member' : 'Non-member'}</dd></div>
         <div><dt>Payment</dt><dd>${b.amountLabel} · ${proof && proof.gcashRef ? `GCash ref ${proof.gcashRef}` : 'no ref. entered'}</dd></div>
       </dl>
       ${proof && proof.amountCheck === 'differs' ? html`<p class="banner warn compact">${icon('alert', 18, 2.2)}<span>${first} entered <b>${peso(proof.amountClaimed)}</b> but <b>${b.amountLabel}</b> is due. Approve only if the screenshot shows the full amount.</span></p>` : ''}
+      ${checklistDone ? '' : html`<fieldset class="fieldset stack stack-4"><legend class="label">Before you approve <span class="req">*</span> <span class="opt">— tick every check</span></legend>
+        ${items.map((c, i) => html`<label class="check-toggle"><input type="checkbox" data-gate="${i}"><span>${c}</span></label>`)}
+      </fieldset>`}
       <label class="check-row"><input type="checkbox" name="post" checked><span class="check-box">${icon('check', 16, 3)}</span><span><b>Also post in the booking chat:</b> "${chatText}"</span></label>
       <p class="small row row-top" data-gap="8">${icon('bell', 18)}<span>${first} gets an in-app notification right away: "Your payment has been verified and your booking is confirmed."</span></p>
-      <div class="dialog-actions inline"><button type="button" class="btn btn-secondary" data-close>Cancel</button><button type="button" class="btn btn-primary" data-act="approve">Approve booking</button></div>`,
+      <div class="dialog-actions inline"><button type="button" class="btn btn-secondary" data-close>Cancel</button><button type="button" class="btn btn-primary" data-act="approve" ${checklistDone ? '' : 'disabled'}>${checklistDone ? 'Approve booking' : 'Tick every check to approve'}</button></div>`,
     onOpen: (panel) => {
+      const go = panel.querySelector('[data-act="approve"]');
+      const gates = [...panel.querySelectorAll('[data-gate]')];
+      const allTicked = () => gates.every((g) => g.checked);
+      on(panel, 'change', '[data-gate]', () => {
+        go.disabled = !allTicked();
+        go.textContent = allTicked() ? 'Approve booking' : 'Tick every check to approve';
+      });
       on(panel, 'click', '[data-act="approve"]', async (_e, btn) => {
+        if (!allTicked()) return;
         busy = true;
         setBusy(btn, true, 'Approving…');
         try {
           const post = panel.querySelector('[name="post"]').checked;
-          await api.post(`/api/admin/bookings/${b.id}/approve`, post ? { message: chatText } : {});
+          await api.post(`${API}/bookings/${b.id}/approve`, post ? { message: chatText, checklist: true } : { checklist: true });
           busy = false;
           m.close();
           await refreshBadges();
@@ -340,7 +362,7 @@ function openApprove(b, proof, onDone) {
           toast('Booking confirmed', {
             sub: left ? `${first} was notified · ${left} left to verify` : `${first} was notified`,
             timeout: 8000,
-            action: next ? { label: 'Next', onClick: () => navigate(`/admin/verify/${next.id}`) } : null,
+            action: next ? { label: 'Next', onClick: () => navigate(`${BASE}/verify/${next.id}`) } : null,
           });
           onDone();
         } catch (err) {
@@ -371,7 +393,7 @@ function openReject(b, onDone) {
     wide: true,
     label: 'Reject payment proof?',
     locked: () => busy,
-    content: () => html`<div class="row" data-gap="12"><span class="tile red">${icon('x-circle', 24)}</span><div><h2 class="dialog-title">Reject payment proof?</h2><p class="small">${b.user.name} · ${b.resource.name} · ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)} · ${b.amountLabel}</p></div></div>
+    content: () => html`<div class="row" data-gap="12"><span class="tile red">${icon('x-circle', 24)}</span><div><h2 class="dialog-title">Reject payment proof?</h2><p class="small">${b.user.name} · ${b.resource.name} · ${shortDate(b.date)} · ${bookingTime(b)} · ${b.amountLabel}</p></div></div>
       <fieldset class="fieldset stack stack-8"><legend class="label">Reason <span class="req">*</span> <span class="opt">— ${first} will see this</span></legend>
         <div class="stack stack-8" role="radiogroup" aria-label="Reason">
           ${[...REASONS, 'Other — I will explain in the message.'].map((r, i) => html`<button type="button" class="reason-opt" role="radio" aria-checked="${choice === i ? 'true' : 'false'}" data-reason="${i}"><span class="radio"></span><span>${r}</span></button>`)}
@@ -405,7 +427,7 @@ function openReject(b, onDone) {
         busy = true;
         setBusy(submit, true, 'Rejecting…');
         try {
-          await api.post(`/api/admin/bookings/${b.id}/reject`, { reason, message: message || undefined, keepHold });
+          await api.post(`${API}/bookings/${b.id}/reject`, { reason, message: message || undefined, keepHold });
           busy = false;
           m.close();
           refreshBadges();
@@ -414,7 +436,7 @@ function openReject(b, onDone) {
             type: 'info',
             sub: `${first} was notified with your reason.${keepHold ? ` ${b.resource.name} stays on hold for ${minutes} minutes.` : ' The slot was released.'}`,
             timeout: 8000,
-            action: next ? { label: 'Next', onClick: () => navigate(`/admin/verify/${next.id}`) } : null,
+            action: next ? { label: 'Next', onClick: () => navigate(`${BASE}/verify/${next.id}`) } : null,
           });
           onDone();
         } catch (err) {
@@ -437,6 +459,10 @@ export async function verifyDetailView({ params }) {
   const id = params.id;
   await staffSettings();
   let d = null;
+  let chat = null;
+  // Ticked checklist items survive repaints; they reset when another proof comes in.
+  const ticked = new Set();
+  let tickedFor = null;
   const root = frame({
     key: 'verify',
     eyebrow: 'Payment verification',
@@ -453,20 +479,19 @@ export async function verifyDetailView({ params }) {
     const p = d.proofs[0];
     const first = firstName(b.user.name);
     const decided = b.status !== 'PAYMENT_SUBMITTED';
-    const checks = [
-      `Amount on the screenshot is ${b.amountLabel}`,
-      `Sent to Le Spinners' GCash (${state.settings.gcashNumber || 'your number'})`,
-      p && p.gcashRef ? `Reference ${p.gcashRef} is in our GCash history` : 'Reference is in our GCash history',
-      `Paid after the booking was made (${clock(b.createdAt)})`,
-    ];
+    const checks = checklistItems(b, p);
+    if (tickedFor !== (p ? p.id : null)) {
+      ticked.clear();
+      tickedFor = p ? p.id : null;
+    }
     render(body, html`<div class="tb-mobile vd-head">
-        <div class="row row-between"><a class="icon-btn" href="/admin/verify" data-back aria-label="Back to verification queue">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}</div>
+        <div class="row row-between"><a class="icon-btn" href="${BASE}/verify" data-back aria-label="Back to verification queue">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}</div>
         <div><p class="m-title row row-wrap" data-gap="8">${b.user.name}${memberTag(b.user.membership, { small: true })}</p>
-        <p class="small light-text">${b.activityLabel} · ${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</p>
+        <p class="small light-text">${b.activityLabel} · ${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)} · ${bookingTime(b)}</p>
         <p class="small light-text mono">${b.ref}${b.submittedAt ? ` · proof sent ${clock(b.submittedAt)} · ${minutesBetween(b.submittedAt, d.now)} min ago` : ''}</p></div>
       </div>
       <div class="page no-tabbar">
-        <div class="row only-desktop" data-gap="12"><a class="icon-btn" href="/admin/verify" data-back aria-label="Back to queue">${icon('chevron-left', 22, 2.2)}</a><span class="small">Payment verification / <span class="mono">${b.ref}</span></span>${statusPill(b.status, { small: true })}</div>
+        <div class="row only-desktop" data-gap="12"><a class="icon-btn" href="${BASE}/verify" data-back aria-label="Back to queue">${icon('chevron-left', 22, 2.2)}</a><span class="small">Payment verification / <span class="mono">${b.ref}</span></span>${statusPill(b.status, { small: true })}</div>
         ${decided ? html`<p class="banner ${b.status === 'CONFIRMED' ? 'success' : b.status === 'REJECTED' || b.status === 'EXPIRED' ? 'error' : 'neutral'}">${icon(b.status === 'CONFIRMED' ? 'check-circle' : 'info', 20, 2.2)}<span>${
           b.status === 'CONFIRMED' ? html`<b>Payment verified.</b> Approved by ${b.confirmedBy || 'staff'} · ${b.confirmedAt ? dayClock(b.confirmedAt) : ''}.`
             : b.status === 'REJECTED' ? html`<b>Proof rejected</b> by ${b.rejectedBy || 'staff'} · ${b.rejectedAt ? dayClock(b.rejectedAt) : ''}. Waiting for new proof${b.holdExpiresAt ? ` until ${clock(b.holdExpiresAt)}` : ''}.`
@@ -477,12 +502,12 @@ export async function verifyDetailView({ params }) {
           <div class="stack stack-16">
             <section class="panel panel-body stack stack-8"><p class="eyebrow">Booking verification</p>
               <dl class="kv">
-                <div><dt>Customer</dt><dd><a href="/admin/bookings/${b.id}">${b.user.name}</a></dd></div>
+                <div><dt>Customer</dt><dd><a href="${BASE}/bookings/${b.id}">${b.user.name}</a></dd></div>
                 <div><dt>Account</dt><dd>${memberTag(b.user.membership, { small: true })}</dd></div>
                 <div><dt>Activity</dt><dd>${b.activityLabel}</dd></div>
                 <div><dt>Resource</dt><dd>${b.resource.name}</dd></div>
                 <div><dt>Date</dt><dd>${monthDayYear(b.date)}</dd></div>
-                <div><dt>Time</dt><dd>${rangeLabelFull(b.start, b.end)}</dd></div>
+                <div><dt>Time</dt><dd>${bookingTime(b, { full: true })}${b.durationMin > 60 ? ` · ${b.durationLabel}` : ''}</dd></div>
                 <div><dt>Amount due</dt><dd class="mono big-amt">${b.amountLabel}</dd></div>
               </dl></section>
             <section class="panel panel-body stack stack-8"><p class="eyebrow">What ${first} submitted</p>
@@ -493,8 +518,10 @@ export async function verifyDetailView({ params }) {
               </dl>
               <p class="small">These are the details ${first} typed. Match them against the screenshot and your GCash history before approving.</p>` : html`<p class="small">No payment proof yet.</p>`}
             </section>
-            <section class="panel panel-body stack stack-4"><div class="row row-between"><p class="eyebrow">Before you approve</p><span class="small" data-checked>0 of 4 checked</span></div>
-              ${checks.map((c, i) => html`<label class="check-toggle"><input type="checkbox" data-check="${i}"><span>${c}</span></label>`)}
+            <section class="panel panel-body stack stack-4 checklist-panel" data-checklist>
+              <div class="row row-between"><p class="eyebrow">Before you approve <span class="req" aria-hidden="true">*</span></p><span class="small" data-checked aria-live="polite"></span></div>
+              ${!decided ? html`<p class="small">Required · tick every check before approving.</p>` : ''}
+              ${checks.map((c, i) => html`<label class="check-toggle"><input type="checkbox" data-check="${i}" ${ticked.has(i) ? 'checked' : ''} ${decided ? 'disabled' : ''}><span>${c}</span></label>`)}
             </section>
           </div>
           <div class="stack stack-16">
@@ -504,12 +531,12 @@ export async function verifyDetailView({ params }) {
                 <div class="proof-stage" data-stage><span class="stage-chip">${icon('lock', 12, 2.4)}Private · signed link expires in 5–10 min</span><img src="${p.url}" alt="Payment screenshot from ${b.user.name}" draggable="false"></div>` : html`<div class="empty"><p class="empty-body">No screenshot uploaded.</p></div>`}
               ${d.proofs.length > 1 ? html`<p class="small">Earlier proofs: ${d.proofs.slice(1).map((x) => `${dayClock(x.createdAt)} (${x.status})`).join(' · ')}</p>` : ''}
             </section>
-            <a class="panel list-row" href="/admin/messages/${b.id}"><span class="tile blue sm">${icon('chat', 20)}</span><span class="grow"><span class="row-title">Booking chat · ${b.user.name}</span><br><span class="row-meta">${d.unreadMessages ? `${d.unreadMessages} unread message${d.unreadMessages === 1 ? '' : 's'}` : 'Open the conversation'}</span></span>${d.unreadMessages ? html`<span class="badge inline">${d.unreadMessages}</span>` : ''}${icon('chevron-right', 18, 2.2, 'chev')}</a>
+            <div data-chat-slot></div>
           </div>
         </div>
       </div>
-      ${!decided ? html`<div class="decision-bar"><p>Your decision notifies ${first} right away and is recorded with your name.</p><div class="btns"><button type="button" class="btn btn-danger-outline" data-act="reject">Reject payment</button><button type="button" class="btn btn-primary" data-act="approve">Approve payment</button></div></div>`
-        : html`<div class="decision-bar"><p>${b.status === 'CONFIRMED' ? 'Decision recorded.' : 'Nothing to decide right now.'}</p><div class="btns"><a class="btn btn-dark" href="/admin/verify" data-next>Back to queue</a></div></div>`}`);
+      ${!decided ? html`<div class="decision-bar"><p data-decision-note></p><div class="btns"><button type="button" class="btn btn-danger-outline" data-act="reject">Reject payment</button><button type="button" class="btn btn-primary" data-act="approve" aria-describedby="decision-note">Approve payment</button></div></div>`
+        : html`<div class="decision-bar"><p>${b.status === 'CONFIRMED' ? 'Decision recorded.' : 'Nothing to decide right now.'}</p><div class="btns"><a class="btn btn-dark" href="${BASE}/verify" data-next>Back to queue</a></div></div>`}`);
     for (const a of body.querySelectorAll('[data-back]')) {
       a.addEventListener('click', (e) => {
         if (history.state && history.state.depth > 0) {
@@ -518,6 +545,10 @@ export async function verifyDetailView({ params }) {
         }
       });
     }
+    if (!chat) chat = miniChat({ bookingId: b.id, playerName: b.user.name, unread: d.unreadMessages });
+    chat.setUnread(d.unreadMessages);
+    chat.mount($('[data-chat-slot]', body));
+    syncChecklist();
     stopStageKeys();
     const stage = $('[data-stage]', body);
     if (stage) {
@@ -529,23 +560,55 @@ export async function verifyDetailView({ params }) {
       nextPending(b.id).then((next) => {
         const a = body.querySelector('[data-next]');
         if (a && next) {
-          a.setAttribute('href', `/admin/verify/${next.id}`);
+          a.setAttribute('href', `${BASE}/verify/${next.id}`);
           a.textContent = `Next payment · ${state.badges.pendingVerification || 1} left`;
         }
       });
     }
   }
 
-  on(body, 'click', '[data-check]', () => {
-    const n = $$('[data-check]', body).filter((c) => c.checked).length;
-    $('[data-checked]', body).textContent = `${n} of 4 checked`;
+  /** Approve stays off until every checklist item is ticked. */
+  function syncChecklist() {
+    const total = $$('[data-check]', body).length;
+    const done = ticked.size >= total && total > 0;
+    const count = $('[data-checked]', body);
+    if (count) count.textContent = `${ticked.size} of ${total} checked`;
+    $('[data-checklist]', body)?.classList.toggle('complete', done);
+    const approve = $('.decision-bar [data-act="approve"]', body);
+    if (approve) approve.disabled = !done;
+    const note = $('[data-decision-note]', body);
+    if (note) {
+      note.id = 'decision-note';
+      note.textContent = done
+        ? `Your decision notifies ${firstName(d.booking.user.name)} right away and is recorded with your name.`
+        : `Tick all ${total} checks under "Before you approve" to approve. ${total - ticked.size} left.`;
+    }
+  }
+
+  on(body, 'change', '[data-check]', (_e, box) => {
+    const i = Number(box.dataset.check);
+    if (box.checked) ticked.add(i);
+    else ticked.delete(i);
+    syncChecklist();
   });
   on(body, 'click', '[data-copy]', async (_e, btn) => {
     if (await copyText(btn.dataset.copy)) toast('Reference copied');
   });
-  on(body, 'click', '[data-act="approve"]', () => openApprove(d.booking, proofWithCheck(), load));
+  on(body, 'click', '[data-act="approve"]', (_e, btn) => {
+    if (btn.disabled || ticked.size < checklistItems(d.booking, d.proofs[0]).length) {
+      $('[data-checklist]', body)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    openApprove(d.booking, proofWithCheck(), load, { checklistDone: true });
+  });
   on(body, 'click', '[data-act="reject"]', () => openReject(d.booking, load));
-  on(body, 'click', '[data-act="full"]', () => openViewer({ url: d.proofs[0].url, booking: d.booking, proof: proofWithCheck(), onDecision: load }));
+  on(body, 'click', '[data-act="full"]', () => openViewer({
+    url: d.proofs[0].url,
+    booking: d.booking,
+    proof: proofWithCheck(),
+    onDecision: load,
+    checklistDone: ticked.size >= checklistItems(d.booking, d.proofs[0]).length,
+  }));
 
   function proofWithCheck() {
     const p = d.proofs[0];
@@ -554,7 +617,7 @@ export async function verifyDetailView({ params }) {
 
   async function load() {
     try {
-      d = await api.get(`/api/admin/bookings/${encodeURIComponent(id)}`);
+      d = await api.get(`${API}/bookings/${encodeURIComponent(id)}`);
       paint();
     } catch (err) {
       render(body, html`<div class="page">${errorState(err, { title: err.status === 404 ? 'Booking not found' : undefined, retry: err.status !== 404 })}</div>`);
@@ -562,6 +625,9 @@ export async function verifyDetailView({ params }) {
     }
   }
   await load();
-  return () => stopStageKeys();
+  return () => {
+    stopStageKeys();
+    chat?.destroy();
+  };
 }
 

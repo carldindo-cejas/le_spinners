@@ -60,6 +60,8 @@ export type ResourceRow = {
   status: 'active' | 'maintenance' | 'disabled';
   maintenance_note: string | null;
   maintenance_until: string | null;
+  /** 1 = open play (free for all, not bookable). Only applies while status is 'active'. */
+  open_play: number;
   price_member: number;
   price_non_member: number;
 };
@@ -86,9 +88,16 @@ export type BookingRow = {
   cancelled_at: number | null;
   cancelled_by: string | null;
   cancel_reason: string | null;
+  source: BookingSource;
+  created_by: string | null;
+  payment_method: PaymentMethod;
   created_at: number;
   updated_at: number;
 };
+
+/** Where a booking was made: the player app, or a console (by staff or an admin). */
+export type BookingSource = 'online' | 'staff' | 'admin';
+export type PaymentMethod = 'gcash' | 'on_site' | 'none';
 
 export type ProofRow = {
   id: string;

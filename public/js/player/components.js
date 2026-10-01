@@ -1,6 +1,6 @@
 import { html } from '../core/dom.js';
 import { icon, resourceGlyph } from '../core/icons.js';
-import { dateLabel, isoDate, peso, rangeLabel } from '../core/format.js';
+import { bookingTime, dateLabel, isoDate, peso } from '../core/format.js';
 import { ringSvg, startCountdown, statusPill } from '../core/ui.js';
 
 export const HOLDING = new Set(['TEMPORARY', 'REJECTED']);
@@ -22,7 +22,7 @@ function chatButton(b) {
  * live countdown (call `startCardCountdowns(root, now)` after rendering).
  */
 export function bookingCard(b) {
-  const where = html`<span class="row" data-gap="16"><span class="row" data-gap="6">${icon('calendar', 16)}${dateLabel(b.date)}</span><span class="row" data-gap="6">${icon('clock', 16)}${rangeLabel(b.start, b.end)}</span></span>`;
+  const where = html`<span class="row" data-gap="16"><span class="row" data-gap="6">${icon('calendar', 16)}${dateLabel(b.date)}</span><span class="row" data-gap="6">${icon('clock', 16)}${bookingTime(b)}</span></span>`;
   const holding = HOLDING.has(b.status) && b.holdExpiresAt;
   const past = b.status === 'COMPLETED' || b.status === 'EXPIRED' || b.status === 'CANCELLED';
   return html`<article class="card bcard${holding ? ' action' : ''}${past ? ' past' : ''}">

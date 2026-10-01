@@ -1,4 +1,5 @@
-import type { Activity, Bindings, BookingRow, BookingStatus, ResourceRow, SessionUser } from '../types';
+import * as z from 'zod';
+import type { Activity, Bindings, BookingRow, BookingSource, BookingStatus, PaymentMethod, ResourceRow, SessionUser } from '../types';
 import { conflict, notFound, unprocessable } from './errors';
 import { newId } from './crypto';
 import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt, type Guard } from './notify';
@@ -20,6 +21,11 @@ export const OCCUPYING = (alias: string, nowParam: string) =>
   `(${alias}.status IN ('PAYMENT_SUBMITTED', 'CONFIRMED') OR (${alias}.status IN ('TEMPORARY', 'REJECTED') AND ${alias}.hold_expires_at > ${nowParam}))`;
 
 export const MAX_OPEN_HOLDS = 2;
+/**
+ * A booking holds any number of slots on one court or table on one day, gaps allowed.
+ * There is no business limit; this only bounds a request (a whole day of 15-minute slots).
+ */
+export const MAX_SLOTS = 96;
 
 export type BookingJoin = BookingRow & {
   resource_name: string;
@@ -30,17 +36,55 @@ export type BookingJoin = BookingRow & {
   user_membership?: string;
   confirmed_by_name?: string | null;
   rejected_by_name?: string | null;
+  created_by_name?: string | null;
+  /** JSON [[start, end], …] from booking_times (SEGMENTS_SQL); see segmentsOf. */
+  segments_json?: string | null;
 };
+
+const zMinute = z.number().int().min(0).max(1439);
+
+/**
+ * Request fields for the slots to book: `starts` (any slots on the chosen court that day,
+ * gaps allowed), or a single `start`. `slots` is what clients from before gaps were
+ * allowed send: that many slots in a row from `start`.
+ */
+export const zSlotPick = {
+  start: zMinute.optional(),
+  starts: z.array(zMinute).min(1, 'Pick at least one time.').max(MAX_SLOTS, `Pick at most ${MAX_SLOTS} times.`).optional(),
+  slots: z.number().int().min(1).max(MAX_SLOTS).optional(),
+};
+
+/** zod refine for zSlotPick: at least one time was picked. Use as `.refine(hasSlotPick, PICK_A_TIME)`. */
+export const hasSlotPick = (b: { start?: number; starts?: number[] }) => Boolean(b.starts?.length) || b.start != null;
+export const PICK_A_TIME: { message: string; path: string[] } = { message: 'Pick at least one time.', path: ['starts'] };
+
+/** The slot starts a request asked for (see zSlotPick). */
+export function requestedStarts(b: { start?: number; starts?: number[]; slots?: number }, slotMinutes: number): number[] {
+  if (b.starts?.length) return b.starts;
+  if (b.start == null) return [];
+  const first = b.start;
+  return Array.from({ length: b.slots ?? 1 }, (_, k) => first + k * slotMinutes);
+}
+
+/** One continuous stretch of booked time, in minutes from local midnight. */
+export type Segment = { start: number; end: number };
+
+/** SQL column: a booking's times as JSON [[start, end], …], earliest first. `alias` is the bookings table alias. */
+export const SEGMENTS_SQL = (alias: string) =>
+  `(SELECT json_group_array(json_array(t.start_min, t.end_min))
+      FROM (SELECT start_min, end_min FROM booking_times WHERE booking_id = ${alias}.id ORDER BY start_min) t) AS segments_json`;
 
 export const BOOKING_SELECT = `
   SELECT b.*, r.name AS resource_name, r.activity AS activity,
          u.name AS user_name, u.email AS user_email, u.phone AS user_phone, u.membership AS user_membership,
-         cu.name AS confirmed_by_name, ru.name AS rejected_by_name
+         cu.name AS confirmed_by_name, ru.name AS rejected_by_name, bu.name AS created_by_name,
+         ${SEGMENTS_SQL('b')}
     FROM bookings b
     JOIN resources r ON r.id = b.resource_id
     JOIN users u ON u.id = b.user_id
     LEFT JOIN users cu ON cu.id = b.confirmed_by
-    LEFT JOIN users ru ON ru.id = b.rejected_by`;
+    LEFT JOIN users ru ON ru.id = b.rejected_by
+    LEFT JOIN users bu ON bu.id = b.created_by`;
 
 export function effectiveStatus(b: Pick<BookingRow, 'status' | 'hold_expires_at'>, now: number): BookingStatus {
   if ((b.status === 'TEMPORARY' || b.status === 'REJECTED') && (b.hold_expires_at ?? 0) <= now) return 'EXPIRED';
@@ -51,8 +95,56 @@ export function activityLabel(a: Activity): string {
   return a === 'pickleball' ? 'Pickleball' : 'Table Tennis';
 }
 
-export function slotLabel(b: Pick<BookingRow, 'start_min' | 'end_min'>): string {
-  return `${minutesLabel(b.start_min)} – ${minutesLabel(b.end_min)}`;
+type Timed = Pick<BookingRow, 'start_min' | 'end_min'> & { segments_json?: string | null };
+
+/** Slot starts merged into continuous segments: [960, 1020, 1140] with 60-minute slots → 4–6 PM, 7–8 PM. */
+export function mergeSlots(starts: number[], slotMinutes: number): Segment[] {
+  const out: Segment[] = [];
+  for (const s of [...new Set(starts)].sort((a, b) => a - b)) {
+    const last = out[out.length - 1];
+    if (last && last.end === s) last.end = s + slotMinutes;
+    else out.push({ start: s, end: s + slotMinutes });
+  }
+  return out;
+}
+
+/** A booking's times (from segments_json), or its start–end block when they weren't selected. */
+export function segmentsOf(b: Timed): Segment[] {
+  if (b.segments_json) {
+    try {
+      const segs = (JSON.parse(b.segments_json) as unknown[])
+        .filter((x): x is [number, number] => Array.isArray(x) && Number.isInteger(x[0]) && Number.isInteger(x[1]))
+        .map(([start, end]) => ({ start, end }))
+        .sort((x, y) => x.start - y.start);
+      if (segs.length) return segs;
+    } catch {
+      // fall through to the block
+    }
+  }
+  return [{ start: b.start_min, end: b.end_min }];
+}
+
+/** "6:00 PM – 7:00 PM", or with gaps "4:00 PM – 5:00 PM, 7:00 PM – 8:00 PM". */
+export function slotLabel(b: Timed): string {
+  return segmentsOf(b).map((s) => `${minutesLabel(s.start)} – ${minutesLabel(s.end)}`).join(', ');
+}
+
+/** Minutes actually booked (gaps between segments don't count). */
+export function bookedMinutes(b: Timed): number {
+  return segmentsOf(b).reduce((n, s) => n + s.end - s.start, 0);
+}
+
+/** "1 hour", "2 hours", "90 min". */
+export function durationLabel(minutes: number): string {
+  if (minutes % 60 === 0) return `${minutes / 60} hour${minutes === 60 ? '' : 's'}`;
+  return `${minutes} min`;
+}
+
+const SOURCE_LABEL: Record<BookingSource, string> = { online: 'Online', staff: 'Staff', admin: 'Admin' };
+const METHOD_LABEL: Record<PaymentMethod, string> = { gcash: 'GCash', on_site: 'Paid on site', none: 'No charge' };
+
+export function paymentMethodLabel(m: PaymentMethod): string {
+  return METHOD_LABEL[m];
 }
 
 export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offsetMin: number, forStaff = false) {
@@ -60,6 +152,8 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
   const startsAt = localToMs(b.date, b.start_min, offsetMin);
   const cancelDeadline = startsAt - settings.cancelCutoffHours * 3_600_000;
   const holding = status === 'TEMPORARY' || status === 'REJECTED';
+  const segments = segmentsOf(b);
+  const minutes = segments.reduce((n, s) => n + s.end - s.start, 0);
   const dto = {
     id: b.id,
     ref: b.ref,
@@ -71,7 +165,11 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     dateLabel: dateLabel(b.date),
     start: b.start_min,
     end: b.end_min,
+    /** The booked times, earliest first. More than one when the booking has gaps. */
+    segments: segments.map((s) => ({ start: s.start, end: s.end })),
     timeLabel: slotLabel(b),
+    durationMin: minutes,
+    durationLabel: durationLabel(minutes),
     startsAt,
     amountDue: b.amount_due,
     amountLabel: peso(b.amount_due),
@@ -86,8 +184,11 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     createdAt: b.created_at,
     canSubmitProof: holding && (b.hold_expires_at ?? 0) > now,
     canRelease: holding && (b.hold_expires_at ?? 0) > now,
-    canCancel: status === 'CONFIRMED' && now < cancelDeadline,
+    canCancel: false, // booked or paid bookings can't be cancelled
     cancelDeadline,
+    source: b.source,
+    paymentMethod: b.payment_method,
+    paymentMethodLabel: METHOD_LABEL[b.payment_method],
   };
   if (!forStaff) return dto;
   return {
@@ -101,6 +202,12 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     },
     confirmedBy: b.confirmed_by_name ?? null,
     rejectedBy: b.rejected_by_name ?? null,
+    // "Online", or "Staff · Ana Reyes" / "Admin · Ana Reyes" for console bookings.
+    bookedBy: {
+      source: b.source,
+      label: SOURCE_LABEL[b.source],
+      name: b.source === 'online' ? null : b.created_by_name ?? null,
+    },
   };
 }
 
@@ -246,6 +353,16 @@ export function underMaintenance(r: Pick<ResourceRow, 'status' | 'maintenance_un
   return !r.maintenance_until || date < r.maintenance_until;
 }
 
+/** In service but free for all: players see it, nobody can book it. */
+export function isOpenPlay(r: Pick<ResourceRow, 'status' | 'open_play'>): boolean {
+  return r.status === 'active' && Boolean(r.open_play);
+}
+
+/** The status the API reports: 'active' | 'open_play' | 'maintenance' | 'disabled'. */
+export function resourceStatus(r: Pick<ResourceRow, 'status' | 'open_play'>) {
+  return isOpenPlay(r) ? ('open_play' as const) : r.status;
+}
+
 export type HoursRow = { weekday: number; is_open: number; open_min: number; close_min: number };
 export type ClosureRow = { id: string; date: string; resource_id: string | null; start_min: number | null; end_min: number | null; reason: string | null };
 
@@ -255,23 +372,30 @@ export function closureCovers(c: ClosureRow, resourceId: string, start: number, 
   return c.start_min < end && c.end_min > start;
 }
 
-export async function createHold(
-  env: Bindings,
-  settings: Settings,
-  user: SessionUser,
-  input: { resourceId: string; date: string; start: number },
-  now = Date.now(),
-) {
+type SlotInput = { resourceId: string; date: string; starts: number[] };
+
+/**
+ * Checks that every slot in `starts` can be booked: one court or table, one day, any
+ * number of slots, gaps allowed. Returns the resource and the slots merged into
+ * continuous segments (4–5 PM + 5–6 PM → 4–6 PM).
+ */
+async function checkSlots(env: Bindings, settings: Settings, input: SlotInput, now: number) {
   const db = env.DB;
-  const offset = offsetMinutes(env.TZ_OFFSET_MINUTES);
-  const local = localNow(offset, now);
-  const { resourceId, date, start } = input;
+  const local = localNow(offsetMinutes(env.TZ_OFFSET_MINUTES), now);
+  const { resourceId, date } = input;
+  const starts = [...new Set(input.starts)].sort((a, b) => a - b);
+  if (!starts.length || starts.length > MAX_SLOTS || starts.some((s) => !Number.isInteger(s))) {
+    throw unprocessable('INVALID_SLOT', 'Pick one or more of the listed times.');
+  }
 
   const resource = await db.prepare('SELECT * FROM resources WHERE id = ?').bind(resourceId).first<ResourceRow>();
   if (!resource || resource.status === 'disabled') throw unprocessable('RESOURCE_UNAVAILABLE', 'That court or table is not available.');
   if (underMaintenance(resource, date)) {
     const until = resource.maintenance_until ? ` until ${dateLabel(resource.maintenance_until)}` : '';
     throw unprocessable('MAINTENANCE', `${resource.name} is under maintenance${until}.`);
+  }
+  if (isOpenPlay(resource)) {
+    throw unprocessable('OPEN_PLAY', `${resource.name} is open play: free for all, so it can't be booked.`);
   }
 
   const ahead = daysBetween(local.date, date);
@@ -283,67 +407,146 @@ export async function createHold(
   const hours = await db.prepare('SELECT * FROM opening_hours WHERE weekday = ?').bind(weekdayOf(date)).first<HoursRow>();
   if (!hours || !hours.is_open) throw unprocessable('CLOSED', 'The facility is closed that day.');
   const slot = settings.slotMinutes;
-  const end = start + slot;
-  if (start < hours.open_min || end > hours.close_min || (start - hours.open_min) % slot !== 0) {
+  if (starts.some((s) => s < hours.open_min || s + slot > hours.close_min || (s - hours.open_min) % slot !== 0)) {
     throw unprocessable('INVALID_SLOT', 'Pick one of the listed times.');
   }
-  if (ahead === 0 && start <= local.minutes) {
-    throw unprocessable('TIME_STARTED', `${minutesLabel(start)} has already started. Pick a later time.`);
+  const first = starts[0]!;
+  if (ahead === 0 && first <= local.minutes) {
+    throw unprocessable('TIME_STARTED', `${minutesLabel(first)} has already started. Pick a later time.`);
   }
+  const segments = mergeSlots(starts, slot);
   const { results: closures } = await db.prepare('SELECT * FROM closures WHERE date = ?').bind(date).all<ClosureRow>();
-  const closure = closures.find((c) => closureCovers(c, resourceId, start, end));
+  const closure = closures.find((c) => segments.some((s) => closureCovers(c, resourceId, s.start, s.end)));
   if (closure) throw unprocessable('CLOSED', closure.reason ? `Unavailable: ${closure.reason}.` : 'That time is unavailable.');
 
   // Release stale holds first so they can't trip the unique index.
   await sweepExpired(env, now);
+  return { resource, segments, slots: starts.length };
+}
 
-  const rate = user.membership === 'member' ? 'member' : 'non_member';
-  const amount = rate === 'member' ? resource.price_member : resource.price_non_member;
-  const id = newId('b_');
-  const holdUntil = now + settings.holdMinutes * 60_000;
+type NewBooking = {
+  id: string;
+  userId: string;
+  resourceId: string;
+  date: string;
+  segments: Segment[];
+  status: 'TEMPORARY' | 'CONFIRMED';
+  amount: number;
+  rate: 'member' | 'non_member';
+  holdUntil: number | null;
+  source: BookingSource;
+  createdBy: string;
+  paymentMethod: PaymentMethod;
+  submittedAt: number | null;
+  confirmedAt: number | null;
+  confirmedBy: string | null;
+};
 
+/** SQL: some held, verifying or confirmed booking matching `who` has a time overlapping one of the JSON segments in `segsParam`. */
+function clashSql(who: string, dateParam: string, segsParam: string, nowParam: string): string {
+  return `EXISTS (
+    SELECT 1 FROM booking_times t JOIN bookings b ON b.id = t.booking_id, json_each(${segsParam}) n
+     WHERE ${who} AND t.date = ${dateParam}
+       AND t.start_min < json_extract(n.value, '$[1]') AND t.end_min > json_extract(n.value, '$[0]')
+       AND ${OCCUPYING('b', nowParam)})`;
+}
+
+/**
+ * Inserts the booking and its times in one transaction. The booking row is inserted only
+ * if none of its times overlap another active booking on the resource, or another active
+ * booking of the same user (INSERT … WHERE NOT EXISTS, evaluated atomically); the times
+ * are inserted only if the booking was. Returns rows inserted (0 or 1).
+ */
+async function insertBooking(db: D1Database, row: NewBooking, now: number, maxOpenHolds: number | null): Promise<number> {
+  const segs = JSON.stringify(row.segments.map((s) => [s.start, s.end]));
+  const start = row.segments[0]!.start;
+  const end = row.segments[row.segments.length - 1]!.end;
+  const holdCap = maxOpenHolds != null
+    ? `AND (SELECT COUNT(*) FROM bookings b WHERE b.user_id = ?2 AND b.status = 'TEMPORARY' AND b.hold_expires_at > ?10) < ${maxOpenHolds}`
+    : '';
   const insert = db
     .prepare(
-      `INSERT INTO bookings (id, ref, user_id, resource_id, date, start_min, end_min, status, amount_due, rate, hold_expires_at, created_at, updated_at)
+      `INSERT INTO bookings (id, ref, user_id, resource_id, date, start_min, end_min, status, amount_due, rate, hold_expires_at, created_at, updated_at,
+                             source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by)
        SELECT ?1,
               'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, -3) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
-              ?2, ?3, ?4, ?5, ?6, 'TEMPORARY', ?7, ?8, ?9, ?10, ?10
-        WHERE NOT EXISTS (
-                SELECT 1 FROM bookings b WHERE b.resource_id = ?3 AND b.date = ?4 AND b.start_min < ?6 AND b.end_min > ?5
-                   AND ${OCCUPYING('b', '?10')})
-          AND NOT EXISTS (
-                SELECT 1 FROM bookings b WHERE b.user_id = ?2 AND b.date = ?4 AND b.start_min < ?6 AND b.end_min > ?5
-                   AND ${OCCUPYING('b', '?10')})
-          AND (SELECT COUNT(*) FROM bookings b WHERE b.user_id = ?2 AND b.status = 'TEMPORARY' AND b.hold_expires_at > ?10) < ${MAX_OPEN_HOLDS}`,
+              ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17
+        WHERE NOT ${clashSql('t.resource_id = ?3', '?4', '?18', '?10')}
+          AND NOT ${clashSql('b.user_id = ?2', '?4', '?18', '?10')}
+          ${holdCap}`,
     )
-    .bind(id, user.id, resourceId, date, start, end, amount, rate, holdUntil, now);
-
-  let changes = 0;
+    .bind(
+      row.id, row.userId, row.resourceId, row.date, start, end, row.amount, row.rate, row.holdUntil, now,
+      row.status, row.source, row.createdBy, row.paymentMethod, row.submittedAt, row.confirmedAt, row.confirmedBy, segs,
+    );
+  const times = db
+    .prepare(
+      `INSERT INTO booking_slots (booking_id, resource_id, date, start_min, end_min)
+       SELECT ?1, ?2, ?3, json_extract(n.value, '$[0]'), json_extract(n.value, '$[1]') FROM json_each(?4) n
+        WHERE EXISTS (SELECT 1 FROM bookings WHERE id = ?1)`,
+    )
+    .bind(row.id, row.resourceId, row.date, segs);
   try {
-    const res = await insert.run();
-    changes = res.meta.changes ?? 0;
+    const [res] = await db.batch([insert, times]);
+    return res?.meta.changes ?? 0;
   } catch (err) {
     if (!String(err).includes('UNIQUE')) throw err;
-    changes = 0; // lost a race on the exact slot
+    return 0; // lost a race on the exact slot
   }
+}
 
-  if (changes === 0) {
-    const own = await db
-      .prepare(`SELECT id FROM bookings b WHERE b.user_id = ?1 AND b.date = ?2 AND b.start_min < ?4 AND b.end_min > ?3 AND ${OCCUPYING('b', '?5')} LIMIT 1`)
-      .bind(user.id, date, start, end, now)
-      .first<{ id: string }>();
-    if (own) throw unprocessable('OVERLAP_OWN', 'You already have a booking at this time.', { bookingId: own.id });
+/** Says why insertBooking inserted nothing. */
+async function explainRefusal(
+  db: D1Database,
+  userId: string,
+  input: { date: string; segments: Segment[]; slots: number },
+  now: number,
+  opts: { checkHolds: boolean; self: boolean },
+): Promise<never> {
+  const own = await db
+    .prepare(
+      `SELECT b.id FROM booking_times t JOIN bookings b ON b.id = t.booking_id, json_each(?3) n
+        WHERE b.user_id = ?1 AND t.date = ?2
+          AND t.start_min < json_extract(n.value, '$[1]') AND t.end_min > json_extract(n.value, '$[0]')
+          AND ${OCCUPYING('b', '?4')} LIMIT 1`,
+    )
+    .bind(userId, input.date, JSON.stringify(input.segments.map((s) => [s.start, s.end])), now)
+    .first<{ id: string }>();
+  if (own) throw unprocessable('OVERLAP_OWN', opts.self ? 'You already have a booking at this time.' : 'You already have a booking at this time on your account.', { bookingId: own.id });
+  if (opts.checkHolds) {
     const holds = await db
       .prepare(`SELECT COUNT(*) AS n FROM bookings WHERE user_id = ? AND status = 'TEMPORARY' AND hold_expires_at > ?`)
-      .bind(user.id, now)
+      .bind(userId, now)
       .first<{ n: number }>();
     if ((holds?.n ?? 0) >= MAX_OPEN_HOLDS) {
       throw unprocessable('TOO_MANY_HOLDS', `You already have ${MAX_OPEN_HOLDS} unpaid holds. Pay for or release one first.`);
     }
-    throw conflict('SLOT_TAKEN', 'This slot was just taken by another player.');
   }
+  throw conflict('SLOT_TAKEN', input.slots > 1 ? 'Some of those times were just taken by another player.' : 'This slot was just taken by another player.');
+}
 
-  const where = `${resource.name} · ${dateLabel(date)} · ${minutesLabel(start)}`;
+/** "6:00 PM" for a single slot, otherwise every range: "4:00 PM – 5:00 PM, 7:00 PM – 8:00 PM". */
+function whenLabel(segments: Segment[], slots: number): string {
+  if (slots === 1) return minutesLabel(segments[0]!.start);
+  return segments.map((s) => `${minutesLabel(s.start)} – ${minutesLabel(s.end)}`).join(', ');
+}
+
+export async function createHold(env: Bindings, settings: Settings, user: SessionUser, input: SlotInput, now = Date.now()) {
+  const db = env.DB;
+  const { resourceId, date } = input;
+  const { resource, segments, slots } = await checkSlots(env, settings, input, now);
+
+  const rate = user.membership === 'member' ? 'member' : 'non_member';
+  const amount = (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+  const id = newId('b_');
+  const changes = await insertBooking(db, {
+    id, userId: user.id, resourceId, date, segments, status: 'TEMPORARY', amount, rate,
+    holdUntil: now + settings.holdMinutes * 60_000, source: 'online', createdBy: user.id, paymentMethod: 'gcash',
+    submittedAt: null, confirmedAt: null, confirmedBy: null,
+  }, now, MAX_OPEN_HOLDS);
+  if (changes === 0) await explainRefusal(db, user.id, { date, segments, slots }, now, { checkHolds: true, self: true });
+
+  const where = `${resource.name} · ${dateLabel(date)} · ${whenLabel(segments, slots)}`;
   await db.batch([
     eventStmt(db, id, 'created', user.id, 'player', null, now),
     systemMessageStmt(db, id, 'Temporary booking created', now),
@@ -361,6 +564,41 @@ export async function createHold(
       link: `/admin/bookings/${id}`,
       bookingId: id,
     }, now),
+  ]);
+  return getBooking(db, id);
+}
+
+/**
+ * Staff or an admin books a court or table for themselves from the console (a personal
+ * booking on site). There is no GCash step: it is confirmed at once, either paid at the
+ * front desk (counted as revenue) or free of charge.
+ */
+export async function createConsoleBooking(
+  env: Bindings,
+  settings: Settings,
+  staff: SessionUser,
+  input: SlotInput & { rate: 'member' | 'non_member'; payment: 'on_site' | 'none' },
+  now = Date.now(),
+) {
+  const db = env.DB;
+  const { resourceId, date, rate, payment } = input;
+  const { resource, segments, slots } = await checkSlots(env, settings, input, now);
+  const source: BookingSource = staff.role === 'admin' ? 'admin' : 'staff';
+  const amount = payment === 'none' ? 0 : (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+  const id = newId('b_');
+  const changes = await insertBooking(db, {
+    id, userId: staff.id, resourceId, date, segments, status: 'CONFIRMED', amount, rate, holdUntil: null,
+    source, createdBy: staff.id, paymentMethod: payment,
+    // Paid at the desk counts as a verified payment for revenue; a free booking has no payment.
+    submittedAt: payment === 'on_site' ? now : null,
+    confirmedAt: now,
+    confirmedBy: staff.id,
+  }, now, null);
+  if (changes === 0) await explainRefusal(db, staff.id, { date, segments, slots }, now, { checkHolds: false, self: false });
+
+  await db.batch([
+    eventStmt(db, id, 'console_booked', staff.id, 'staff', payment === 'on_site' ? `Paid on site · ${peso(amount)}` : 'No charge', now),
+    systemMessageStmt(db, id, `Booked on site by ${source === 'admin' ? 'an admin' : 'staff'} · confirmed`, now),
   ]);
   return getBooking(db, id);
 }
@@ -384,45 +622,21 @@ export async function releaseHold(env: Bindings, user: SessionUser, bookingId: s
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This hold has already ended.');
 }
 
-export async function cancelByPlayer(env: Bindings, settings: Settings, user: SessionUser, bookingId: string, reason: string | null, now = Date.now()) {
-  const db = env.DB;
-  const b = await getBooking(db, bookingId);
+/**
+ * Policy: a booking with a submitted payment or a confirmation can't be cancelled
+ * (by the player or by staff). Unpaid holds are released instead (releaseHold).
+ */
+export async function cancelByPlayer(env: Bindings, user: SessionUser, bookingId: string): Promise<never> {
+  const b = await getBooking(env.DB, bookingId);
   if (b.user_id !== user.id) throw notFound('Booking not found.');
-  const offset = offsetMinutes(env.TZ_OFFSET_MINUTES);
-  const startsAt = localToMs(b.date, b.start_min, offset);
-  if (b.status !== 'CONFIRMED') throw conflict('INVALID_STATUS', 'Only confirmed bookings can be cancelled here.');
-  if (now >= startsAt - settings.cancelCutoffHours * 3_600_000) {
-    throw unprocessable('CANCEL_WINDOW_CLOSED', `Bookings can be cancelled up to ${settings.cancelCutoffHours} hours before they start. Message staff in the booking chat for help.`);
-  }
-  const where = `${b.resource_name} · ${dateLabel(b.date)} · ${minutesLabel(b.start_min)}`;
-  const g = changedAt(bookingId, 'cancelled_at', now);
-  const stmts: D1PreparedStatement[] = [
-    db
-      .prepare(
-        `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = ?3, updated_at = ?1
-          WHERE id = ?4 AND user_id = ?2 AND status = 'CONFIRMED'`,
-      )
-      .bind(now, user.id, reason ?? 'Cancelled by player', bookingId),
-    eventStmt(db, bookingId, 'cancelled', user.id, 'player', reason, now, g),
-    systemMessageStmt(db, bookingId, 'Booking cancelled by the player', now, g),
-    userNoticeStmt(db, user.id, { type: 'booking_cancelled', title: 'Booking cancelled', body: `${where} · staff will follow up about your ${peso(b.amount_due)} in the booking chat`, link: `/bookings/${bookingId}`, bookingId }, now, g),
-    staffNoticeStmt(db, { type: 'booking_cancelled', title: 'Booking cancelled by player', body: `${b.user_name} · ${where}${reason ? ` · ${reason}` : ''}`, link: `/admin/bookings/${bookingId}`, bookingId }, now, g),
-  ];
-  for (const email of settings.staffAlertEmails) {
-    stmts.push(
-      outboxStmt(db, 'email', email, 'Le Spinners — Booking cancelled',
-        `${b.user_name} cancelled ${b.ref}.\n\n${where}\nAmount paid: ${peso(b.amount_due)}\nReason: ${reason ?? 'not given'}\n\nFollow up about a refund or credit in the booking chat:\n${env.APP_ORIGIN}/admin/messages/${bookingId}`,
-        bookingId, now, g),
-    );
-  }
-  const [update] = await db.batch(stmts);
-  if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking changed. Refresh and try again.');
+  throw conflict('NOT_CANCELLABLE', "Booked and paid bookings can't be cancelled. Message staff in the booking chat if your plans change.");
 }
 
 // ── Timeline ───────────────────────────────────────────────────────────────
 
 const EVENT_LABELS: Record<string, string> = {
   created: 'Temporary booking created',
+  console_booked: 'Booked on site · confirmed',
   proof_submitted: 'Payment proof submitted',
   approved: 'Payment verified · booking confirmed',
   rejected: 'Payment proof rejected',

@@ -2,7 +2,8 @@ import { api } from '../../core/api.js';
 import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon, courtArt, tableArt, resourceGlyph } from '../../core/icons.js';
 import {
-  activityLabel, activityNoun, dateLabel, dayMonth, hourLabel, longDate, minutesLabel, peso, rangeLabel, rangeLabelFull, shortDate,
+  activityLabel, activityNoun, dateLabel, dayMonth, durationLabel, hourLabel, longDate, mergeStarts, minutesLabel, peso, rangeLabel, rangeLabelFull,
+  shortDate,
 } from './util.js';
 import { errorState, memberTag, openModal, poll, skeletonRows, toast } from '../../core/ui.js';
 import { navigate, show, state, wizardHeader } from '../shell.js';
@@ -79,11 +80,18 @@ function dayCard(activity, day) {
   const wd = new Date(`${day.date}T00:00:00Z`).getUTCDay();
   const hours = state.facility.hours.find((h) => h.weekday === wd);
   const res = resourcesOn(activity, day.date);
-  const open = res.filter((r) => !r.maint).map((r) => r.name);
+  const open = res.filter((r) => !r.maint && r.status !== 'open_play').map((r) => r.name);
   const maint = res.filter((r) => r.maint).map((r) => r.name);
-  const detail = [open.length ? joinNames(open) : '', maint.length ? `${joinNames(maint)} in maintenance` : ''].filter(Boolean).join(' · ');
+  const openPlay = res.filter((r) => !r.maint && r.status === 'open_play').map((r) => r.name);
+  const detail = [
+    open.length ? joinNames(open) : '',
+    openPlay.length ? `${joinNames(openPlay)} open play` : '',
+    maint.length ? `${joinNames(maint)} in maintenance` : '',
+  ].filter(Boolean).join(' · ');
   let box;
-  if (day.load === 'closed') {
+  if (openPlayOnly(day)) {
+    box = html`<div class="count-box"><span>${icon('users', 22)}</span><div><div class="strong">Open play · free for all</div><div class="small">${joinNames(openPlay)} ${openPlay.length === 1 ? 'is' : 'are'} open to everyone. No booking needed.</div></div></div>`;
+  } else if (day.load === 'closed') {
     box = html`<div class="count-box closed"><span>${icon('circle-slash', 22)}</span><div><div class="strong">${day.closedReason || 'Closed'}</div><div class="small">No bookable times on this day</div></div></div>`;
   } else if (day.load === 'full') {
     box = html`<div class="count-box full"><span class="mono">0</span><div><div class="strong">Fully booked</div><div class="small">Every ${activityNoun(activity)} is booked or on hold this day</div></div></div>`;
@@ -98,11 +106,17 @@ function dayCard(activity, day) {
   </section>`;
 }
 
+/** Nothing to book that day, but some courts or tables are open play: players can still look. */
+function openPlayOnly(day) {
+  return day.load === 'closed' && day.openPlay > 0;
+}
+
 function dayButton(d, selected) {
   const top = d.isToday ? 'Today' : d.weekday;
-  const label = `${dayMonth(d.date)}, ${LOAD_TEXT[d.load]}${d.isToday ? ', today' : ''}`;
+  const sub = openPlayOnly(d) ? 'Open play' : LOAD_TEXT[d.load];
+  const label = `${dayMonth(d.date)}, ${sub}${d.isToday ? ', today' : ''}`;
   return html`<button type="button" class="day load-${d.load}${d.isToday ? ' today' : ''}" data-date="${d.date}" aria-pressed="${selected ? 'true' : 'false'}" aria-label="${label}">
-    <span class="d-top">${top}</span><span class="d-num">${d.day}</span><span class="d-sub">${LOAD_TEXT[d.load]}</span>
+    <span class="d-top">${top}</span><span class="d-num">${d.day}</span><span class="d-sub">${sub}</span>
   </button>`;
 }
 
@@ -129,7 +143,7 @@ export function dateStep({ params, query }) {
     render(strip, days.map((d) => dayButton(d, d.date === selected)));
     const day = days.find((d) => d.date === selected);
     render(cardEl, day ? dayCard(activity, day) : '');
-    if (day && (day.load === 'open' || day.load === 'few')) {
+    if (day && (day.load === 'open' || day.load === 'few' || openPlayOnly(day))) {
       cta.disabled = false;
       cta.innerHTML = '';
       render(cta, html`Continue · ${dateLabel(day.date)} ${icon('arrow-right', 20, 2.4)}`);
@@ -270,6 +284,13 @@ function resourceCard(day, r, activity) {
       <p class="res-note">${r.maintenance?.note || 'Maintenance'}${r.maintenance?.untilLabel ? ` — back on ${r.maintenance.untilLabel}` : ''}. Can't be booked until then.</p>
     </button>`;
   }
+  if (r.status === 'open_play') {
+    return html`<div class="res-card open-play">
+      <div class="res-top"><span class="res-thumb">${icon('users', 24)}</span>
+        <div class="grow"><div class="res-name">${r.name}</div><div class="res-status open-play">Open play</div></div></div>
+      <p class="res-note">Open for all. Just come and play: this ${noun} can't be booked.</p>
+    </div>`;
+  }
   const c = slotCounts(r);
   if (c.open === 0) {
     return html`<div class="res-card full" aria-disabled="true">
@@ -317,7 +338,7 @@ export function resourceStep({ params }) {
     ${wizardHeader({ step: 3, label: noun === 'court' ? 'Court' : 'Table', sub: `${activityLabel(activity)} · ${dateLabel(date)}`, backHref: `/book/${activity}?date=${date}` })}
     <div class="stack stack-8"><h1 class="h1">Choose a ${noun}</h1><p class="row small" data-gap="8"><span class="live-dot"></span><span data-live>Live</span></p></div>
     <div class="res-list" data-list>${skeletonRows(3, 'sk-card')}</div>
-    <div class="legend"><span><i class="bar-open"></i>Open</span><span><i class="bar-held"></i>On hold</span><span><i class="bar-taken"></i>Taken or unavailable</span></div>
+    <div class="legend"><span><i class="bar-open"></i>Open</span><span><i class="bar-held"></i>On hold</span><span><i class="bar-open-play"></i>Open play</span><span><i class="bar-taken"></i>Taken or unavailable</span></div>
   </div>`);
   const list = $('[data-list]', root);
   let day = null;
@@ -326,11 +347,14 @@ export function resourceStep({ params }) {
     const live = $('[data-live]', root);
     if (day.hours) live.textContent = `Live · open ${day.hours.label}`;
     else live.textContent = day.closedReason ? `Closed · ${day.closedReason}` : 'Closed this day';
-    const bookable = day.resources.some((r) => r.status !== 'maintenance' && r.slots.some((s) => s.state === 'available'));
+    const bookable = day.resources.some((r) => r.status === 'active' && r.slots.some((s) => s.state === 'available'));
+    const openPlay = day.resources.filter((r) => r.status === 'open_play').map((r) => r.name);
     const mine = day.resources.flatMap((r) => r.slots.filter((s) => s.state === 'mine').map((s) => ({ r, s })));
     render(list, html`${!bookable ? html`<section class="card card-pad-lg stack stack-12">
         <h2 class="h2">No ${noun}s are available on ${dateLabel(date)}</h2>
-        <p class="body">${day.open ? `Every ${noun} is booked or on hold${day.hours ? ` from ${minutesLabel(day.hours.open)} to ${minutesLabel(day.hours.close)}` : ''}. Holds that aren't paid reopen, so a slot may still free up.` : 'The facility is closed this day.'}</p>
+        <p class="body">${!day.open ? 'The facility is closed this day.'
+          : openPlay.length && openPlay.length === day.resources.length ? `Every ${noun} is open play: free for all, no booking needed.`
+            : `Every ${noun} is booked, on hold${openPlay.length ? ' or open play' : ''}${day.hours ? ` from ${minutesLabel(day.hours.open)} to ${minutesLabel(day.hours.close)}` : ''}. Holds that aren't paid reopen, so a slot may still free up.`}</p>
         ${mine.length ? html`<a class="banner warn compact" href="/bookings/${mine[0].s.booking.id}">${icon('hourglass', 18, 2.2)}<span><b>One of them is yours:</b> ${mine[0].r.name} · ${mine[0].s.label}</span></a>` : ''}
         <a class="btn btn-primary btn-lg btn-block" href="/book/${activity}?date=${date}">Choose another date</a>
       </section>` : ''}
@@ -369,13 +393,25 @@ const LOCKED = {
   closed: { label: 'Closed', reason: 'Not open for booking', icon: 'circle-slash' },
   past: { label: 'Started', reason: 'This time has already started', icon: 'clock' },
   maintenance: { label: 'Maintenance', reason: 'Closed for maintenance', icon: 'wrench' },
+  open_play: { label: 'Open play', reason: 'Free for all, no booking needed', icon: 'users' },
 };
 
-function slotButton(s, selected, resourceName) {
+/** "960,1080" → [960, 1080] (unique, sorted). Anything malformed → []. */
+function parseStarts(raw) {
+  if (!raw || !/^\d{1,4}(,\d{1,4})*$/.test(raw)) return [];
+  return [...new Set(raw.split(',').map(Number))].filter((n) => n < 1440).sort((a, b) => a - b);
+}
+
+/** "4:00 – 6:00 PM, 7:00 – 8:00 PM" for slot starts (merged where back to back). */
+function timesLabel(starts, slotMinutes, { full = false } = {}) {
+  return mergeStarts(starts, slotMinutes).map((s) => (full ? rangeLabelFull(s.start, s.end) : rangeLabel(s.start, s.end))).join(', ');
+}
+
+function slotButton(s, picked) {
   const range = rangeLabel(s.start, s.end);
   if (s.state === 'available') {
-    const on = selected === s.start;
-    return html`<button type="button" class="slot available" role="radio" aria-checked="${on ? 'true' : 'false'}" tabindex="${on ? '0' : '-1'}" data-start="${s.start}" aria-label="${range}, available">
+    const on = picked.has(s.start);
+    return html`<button type="button" class="slot available" role="checkbox" aria-checked="${on ? 'true' : 'false'}" data-start="${s.start}" aria-label="${range}, ${on ? 'selected' : 'available'}">
       <span class="s-time">${range}</span>
       ${on ? html`<span class="s-state"><span class="s-check">${icon('check', 14, 3)}</span>Selected</span>` : html`<span class="s-state"><span class="s-dot"></span>Available</span>`}
     </button>`;
@@ -387,25 +423,30 @@ function slotButton(s, selected, resourceName) {
     </a>`;
   }
   const l = LOCKED[s.state] || LOCKED.unavailable;
-  return html`<div class="slot locked ${s.state}" role="radio" aria-checked="false" aria-disabled="true" aria-label="${range}, ${l.label.toLowerCase()}">
+  return html`<div class="slot locked ${s.state}" role="checkbox" aria-checked="false" aria-disabled="true" aria-label="${range}, ${l.label.toLowerCase()}">
     <span><span class="s-time">${range}</span><span class="s-reason">${l.reason}</span></span>
     <span class="s-state">${icon(l.icon, 15, 2.4)}${l.label}</span>
   </div>`;
 }
 
+/**
+ * Pick any number of open slots on this court or table, back to back or not. They all
+ * go into one booking: one hold, one payment (rate × slots), one reference.
+ */
 export function timeStep({ params, query }) {
   const { activity, date, resourceId } = params;
   if (badActivity(activity)) return;
   if (!isDate(date)) return navigate(`/book/${activity}`, { replace: true });
   const user = state.user;
-  let selected = Number(query.get('start')) || null;
+  const picked = new Set(parseStarts(query.get('start')));
   let day = null;
   let resource = null;
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 4, label: 'Time', sub: `${dateLabel(date)}`, backHref: `/book/${activity}/${date}` })}
-    <div class="page-title-row"><h1 class="h1">Choose a time</h1><span class="small">1-hour slots</span></div>
+    <div class="page-title-row"><div><h1 class="h1">Choose your times</h1><p class="small">Tap as many open times as you like. They don't have to be back to back.</p></div>
+      <button type="button" class="btn btn-text btn-sm" data-act="clear" hidden>Clear</button></div>
     <div class="legend legend-pills"><span class="lp available">Available</span><span class="lp held">On hold</span><span class="lp booked">Booked</span><span class="lp unavailable">Unavailable</span></div>
-    <div class="slots" role="radiogroup" data-slots>${skeletonRows(6)}</div>
+    <div class="slots" role="group" data-slots>${skeletonRows(6)}</div>
     <p class="banner white compact">${icon('info', 18, 2.2)}<span>"On hold" means another player is paying right now. If they don't finish within ${state.facility.rules.holdMinutes} minutes, the slot opens again.</span></p>
   </div>
   <div class="sticky-bar"><div class="sticky-inner">
@@ -415,12 +456,27 @@ export function timeStep({ params, query }) {
   const slotsEl = $('[data-slots]', root);
   const summary = $('[data-summary]', root);
   const cta = $('[data-act="continue"]', root);
+  const clearBtn = $('[data-act="clear"]', root);
+  const slotMin = () => (day ? day.slotMinutes : state.facility.rules.slotMinutes);
+  const sorted = () => [...picked].sort((a, b) => a - b);
+
+  function syncUrl() {
+    const starts = sorted();
+    history.replaceState(history.state, '', `/book/${activity}/${date}/${resourceId}${starts.length ? `?start=${starts.join(',')}` : ''}`);
+  }
 
   function paintSummary() {
     const price = resource ? resource.price : null;
-    render(summary, html`<div><div class="s1">${resource ? resource.name : '…'} · ${dateLabel(date)}</div><div class="s2">${selected != null && resource ? `${rangeLabel(selected, selected + day.slotMinutes)} · 1 hour` : 'Pick a time'}</div></div>
-      <div class="price"><div class="s1">${rateLabel(user)}</div><div class="mono">${price != null ? peso(price) : ''}</div></div>`);
-    cta.disabled = selected == null;
+    const starts = sorted();
+    const n = starts.length;
+    const ranges = mergeStarts(starts, slotMin());
+    const when = !n ? 'Pick one or more times'
+      : ranges.length <= 2 ? `${timesLabel(starts, slotMin())} · ${durationLabel(n * slotMin())}`
+        : `${n} times · ${durationLabel(n * slotMin())}`;
+    render(summary, html`<div><div class="s1">${resource ? resource.name : '…'} · ${dateLabel(date)}</div><div class="s2">${when}</div></div>
+      <div class="price"><div class="s1">${n > 1 && price != null ? `${peso(price)} × ${n}` : rateLabel(user)}</div><div class="mono">${price != null ? peso(price * Math.max(n, 1)) : ''}</div></div>`);
+    cta.disabled = !n;
+    clearBtn.hidden = !n;
   }
 
   function paint() {
@@ -433,47 +489,66 @@ export function timeStep({ params, query }) {
     }
     if (resource.status === 'maintenance') {
       render(slotsEl, html`<div class="slot locked maintenance"><span><span class="s-time">${resource.name} · all day</span><span class="s-reason">${resource.maintenance?.note || 'Maintenance'}${resource.maintenance?.untilLabel ? ` · back ${resource.maintenance.untilLabel}` : ''}</span></span><span class="s-state">${icon('wrench', 15, 2.4)}Maintenance</span></div>`);
-      selected = null;
+      picked.clear();
+      paintSummary();
+      return;
+    }
+    if (resource.status === 'open_play') {
+      render(slotsEl, html`<div class="slot locked open_play" aria-disabled="true"><span><span class="s-time">${resource.name} · all day</span><span class="s-reason">Open for all. Just come and play: no booking needed.</span></span><span class="s-state">${icon('users', 15, 2.4)}Open play</span></div>`);
+      picked.clear();
       paintSummary();
       return;
     }
     if (!resource.slots.length) {
       render(slotsEl, html`<div class="empty"><p class="empty-title">Closed on ${dateLabel(date)}</p><a class="btn btn-primary btn-md" href="/book/${activity}?date=${date}">Pick another date</a></div>`);
     } else {
-      render(slotsEl, resource.slots.map((s) => slotButton(s, selected, resource.name)));
-      if (!slotsEl.querySelector('[tabindex="0"]')) slotsEl.querySelector('.slot.available')?.setAttribute('tabindex', '0');
+      render(slotsEl, resource.slots.map((s) => slotButton(s, picked)));
     }
     paintSummary();
   }
 
   on(slotsEl, 'click', '.slot.available', (_e, btn) => {
-    selected = Number(btn.dataset.start);
-    history.replaceState(history.state, '', `/book/${activity}/${date}/${resourceId}?start=${selected}`);
+    const start = Number(btn.dataset.start);
+    if (picked.has(start)) picked.delete(start);
+    else picked.add(start);
+    syncUrl();
     paint();
-    slotsEl.querySelector(`[data-start="${selected}"]`)?.focus();
+    slotsEl.querySelector(`[data-start="${start}"]`)?.focus();
   });
+  clearBtn.addEventListener('click', () => {
+    picked.clear();
+    syncUrl();
+    paint();
+  });
+  // Arrow keys move between open times; Space or Enter picks one.
   slotsEl.addEventListener('keydown', (e) => {
     if (!['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
     const items = $$('.slot.available', slotsEl);
     const i = items.indexOf(document.activeElement);
     if (i < 0) return;
     e.preventDefault();
-    const next = items[(i + (e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : -1) + items.length) % items.length];
-    next.click();
+    items[(i + (e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : -1) + items.length) % items.length].focus();
   });
   cta.addEventListener('click', () => {
-    if (selected != null) navigate(`/book/${activity}/${date}/${resourceId}/${selected}`);
+    if (picked.size) navigate(`/book/${activity}/${date}/${resourceId}/${sorted().join(',')}`);
   });
 
   async function load(initial = false) {
     try {
       day = await api.get(`/api/availability?activity=${activity}&date=${date}`);
       resource = day.resources.find((r) => r.id === resourceId) || null;
-      if (selected != null && resource) {
-        const s = resource.slots.find((x) => x.start === selected);
-        if (!s || s.state !== 'available') {
-          if (!initial && s) toast('That time was just taken', { type: 'warn', sub: 'Pick another time.' });
-          selected = null;
+      if (resource && picked.size) {
+        // Drop picked times someone else took meanwhile.
+        const lost = sorted().filter((s) => resource.slots.find((x) => x.start === s)?.state !== 'available');
+        if (lost.length) {
+          for (const s of lost) picked.delete(s);
+          syncUrl();
+          if (!initial) {
+            toast(lost.length === 1 ? `${minutesLabel(lost[0])} was just taken` : `${lost.length} of your times were just taken`, {
+              type: 'warn',
+              sub: picked.size ? 'They were removed from your selection.' : 'Pick another time.',
+            });
+          }
         }
       }
       paint();
@@ -501,6 +576,7 @@ const INVALID = {
   OVERLAP_OWN: { title: 'You already play at this time', row: 'time', cta: 'See my bookings', to: 'bookings' },
   TOO_MANY_HOLDS: { title: 'You have unpaid holds', row: null, cta: 'See my bookings', to: 'bookings' },
   MAINTENANCE: { title: 'This is under maintenance', row: 'resource', cta: 'Choose another', to: 'resource' },
+  OPEN_PLAY: { title: 'This is open play: free for all', row: 'resource', cta: 'Choose another', to: 'resource' },
   CLOSED: { title: 'That time is closed', row: 'time', cta: 'Pick another time', to: 'time' },
   RESOURCE_UNAVAILABLE: { title: "That isn't available", row: 'resource', cta: 'Choose another', to: 'resource' },
   INVALID_SLOT: { title: "That time isn't bookable", row: 'time', cta: 'Pick a listed time', to: 'time' },
@@ -508,16 +584,19 @@ const INVALID = {
 
 export function reviewStep({ params }) {
   const { activity, date, resourceId } = params;
-  const start = Number(params.start);
+  const starts = parseStarts(params.start);
   if (badActivity(activity)) return;
-  if (!isDate(date) || !Number.isInteger(start)) return navigate(`/book/${activity}`, { replace: true });
+  if (!isDate(date) || !starts.length) return navigate(`/book/${activity}`, { replace: true });
   const user = state.user;
   const res = state.facility.resources.find((r) => r.id === resourceId);
   if (!res) return navigate(`/book/${activity}/${date}`, { replace: true });
   const slotMin = state.facility.rules.slotMinutes;
-  const amount = user.membership === 'member' ? res.priceMember : res.priceNonMember;
+  const n = starts.length;
+  const ranges = mergeStarts(starts, slotMin);
+  const rate = user.membership === 'member' ? res.priceMember : res.priceNonMember;
+  const amount = rate * n;
   const holdMin = state.facility.rules.holdMinutes;
-  const timeHref = `/book/${activity}/${date}/${resourceId}?start=${start}`;
+  const timeHref = `/book/${activity}/${date}/${resourceId}?start=${starts.join(',')}`;
 
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 5, label: 'Review', sub: 'Almost there', backHref: timeHref, closeable: false })}
@@ -528,11 +607,12 @@ export function reviewStep({ params }) {
         <div><dt>Activity</dt><dd>${activityLabel(activity)}</dd></div>
         <div data-row="resource"><dt>${activityNoun(activity) === 'court' ? 'Court' : 'Table'}</dt><dd>${res.name}</dd></div>
         <div data-row="date"><dt>Date</dt><dd>${longDate(date)}</dd></div>
-        <div data-row="time"><dt>Time</dt><dd>${rangeLabelFull(start, start + slotMin)}</dd></div>
+        <div data-row="time"><dt>${ranges.length > 1 ? 'Times' : 'Time'}</dt><dd>${ranges.map((s, i) => html`${i ? html`<br>` : ''}${rangeLabelFull(s.start, s.end)}`)}</dd></div>
+        <div><dt>Duration</dt><dd>${durationLabel(n * slotMin)}${ranges.length > 1 ? ` · ${n} slots` : ''}</dd></div>
         <div><dt>Customer</dt><dd>${user.name}</dd></div>
         <div><dt>Type</dt><dd>${memberTag(user.membership)}</dd></div>
       </dl>
-      <div class="summary-foot"><div><div class="strong">Total to pay</div><div class="small">1 hour × ${user.membership === 'member' ? 'member' : 'non-member'} rate</div></div><span class="mono">${peso(amount)}</span></div>
+      <div class="summary-foot"><div><div class="strong">Total to pay</div><div class="small">${n > 1 ? `${n} × ${peso(rate)}` : `${durationLabel(slotMin)} ×`} ${user.membership === 'member' ? 'member' : 'non-member'} rate</div></div><span class="mono">${peso(amount)}</span></div>
     </section>
     <section class="section">
       <h2 class="h3">What happens next</h2>
@@ -552,24 +632,24 @@ export function reviewStep({ params }) {
   reserve.addEventListener('click', async () => {
     setBusy(reserve, true, 'Reserving…');
     try {
-      const created = await api.post('/api/bookings', { resourceId, date, start });
+      const created = await api.post('/api/bookings', { resourceId, date, starts });
       navigate(`/bookings/${created.booking.id}/held`, { replace: true });
     } catch (err) {
       setBusy(reserve, false);
-      if (err.code === 'SLOT_TAKEN') return openConflict(err, { activity, date, resourceId, start, resName: res.name });
+      if (err.code === 'SLOT_TAKEN') return openConflict(err, { activity, date, resourceId, starts, resName: res.name });
       const kind = INVALID[err.code];
       if (!kind) {
         toast(err.message, { type: 'error' });
         return;
       }
-      showInvalid(root, err, kind, { activity, date, resourceId, start });
+      showInvalid(root, err, kind, { activity, date, resourceId, starts });
     }
   });
 }
 
-function showInvalid(root, err, kind, { activity, date, resourceId, start }) {
+function showInvalid(root, err, kind, { activity, date, resourceId, starts }) {
   const target = {
-    time: `/book/${activity}/${date}/${resourceId}`,
+    time: `/book/${activity}/${date}/${resourceId}?start=${starts.join(',')}`,
     date: `/book/${activity}`,
     resource: `/book/${activity}/${date}`,
     bookings: err.details && err.details.bookingId ? `/bookings/${err.details.bookingId}` : '/bookings',
@@ -581,29 +661,37 @@ function showInvalid(root, err, kind, { activity, date, resourceId, start }) {
   root.querySelector('[role="alert"]').scrollIntoView({ block: 'center' });
 }
 
-function openConflict(err, { activity, date, resourceId, start, resName }) {
-  const alts = (err.details && err.details.alternatives) || [];
+function openConflict(err, { activity, date, resourceId, starts, resName }) {
+  const slotMin = state.facility.rules.slotMinutes;
+  const noun = activityNoun(activity);
+  const multi = starts.length > 1;
+  const when = (list) => (list.length === 1 ? minutesLabel(list[0]) : timesLabel(list, slotMin));
+  const alts = ((err.details && err.details.alternatives) || []).map((a) => ({ ...a, starts: a.starts && a.starts.length ? a.starts : [a.start] }));
   let pick = alts[0] || null;
   const describe = (a) => {
-    if (a.resourceId === resourceId) {
-      const diff = (a.start - start) / 60;
-      return `Same ${activityNoun(activity)}, ${Math.abs(diff)} hour${Math.abs(diff) === 1 ? '' : 's'} ${diff > 0 ? 'later' : 'earlier'}`;
+    if (multi) {
+      return a.resourceId === resourceId ? `Keep the ${a.starts.length} of your ${starts.length} times still open` : `Same times, another ${noun}`;
     }
-    if (a.start === start) return `Same time, another ${activityNoun(activity)}`;
-    return `Another ${activityNoun(activity)}, ${minutesLabel(a.start)}`;
+    if (a.resourceId === resourceId) {
+      const diff = a.start - starts[0];
+      return `Same ${noun}, ${durationLabel(Math.abs(diff))} ${diff > 0 ? 'later' : 'earlier'}`;
+    }
+    if (a.start === starts[0]) return `Same time, another ${noun}`;
+    return `Another ${noun}, ${minutesLabel(a.start)}`;
   };
+  const title = multi ? 'Some of your times were just taken' : 'This slot was just taken';
   const m = openModal({
     sheet: true,
     role: 'alertdialog',
-    label: 'This slot was just taken',
-    content: () => html`<div class="row" data-gap="12"><span class="tile red">${icon('alert', 24)}</span><h2 class="h2">This slot was just taken</h2></div>
-      <p class="body">Another player reserved <b>${resName} · ${dateLabel(date)} · ${minutesLabel(start)}</b> a moment before you. Nothing was held or charged.</p>
-      ${alts.length ? html`<p class="overline">Open times nearby</p>
-        <div class="alt-list" role="radiogroup" aria-label="Open times nearby">${alts.map((a, i) => html`<button type="button" class="alt-option" role="radio" aria-checked="${pick === a ? 'true' : 'false'}" data-alt="${i}">
-          <span class="radio"></span><span class="grow"><span class="row-title">${a.resourceName} · ${minutesLabel(a.start)}</span><br><span class="row-meta">${describe(a)}</span></span><span class="pill green sm">Available</span></button>`)}</div>
-        <button type="button" class="btn btn-primary btn-lg btn-block" data-act="alt">Continue with ${pick ? `${pick.resourceName} · ${minutesLabel(pick.start)}` : ''}</button>`
+    label: title,
+    content: () => html`<div class="row" data-gap="12"><span class="tile red">${icon('alert', 24)}</span><h2 class="h2">${title}</h2></div>
+      <p class="body">Another player reserved ${multi ? 'part of ' : ''}<b>${resName} · ${dateLabel(date)} · ${when(starts)}</b> a moment before you. Nothing was held or charged.</p>
+      ${alts.length ? html`<p class="overline">${multi ? 'Other options' : 'Open times nearby'}</p>
+        <div class="alt-list" role="radiogroup" aria-label="${multi ? 'Other options' : 'Open times nearby'}">${alts.map((a, i) => html`<button type="button" class="alt-option" role="radio" aria-checked="${pick === a ? 'true' : 'false'}" data-alt="${i}">
+          <span class="radio"></span><span class="grow"><span class="row-title">${a.resourceName} · ${when(a.starts)}</span><br><span class="row-meta">${describe(a)}</span></span><span class="pill green sm">Available</span></button>`)}</div>
+        <button type="button" class="btn btn-primary btn-lg btn-block" data-act="alt">Continue with ${pick ? `${pick.resourceName} · ${when(pick.starts)}` : ''}</button>`
       : html`<p class="banner neutral compact">${icon('info', 18, 2.2)}<span>No other open times this day. Try another date.</span></p>`}
-      <a class="btn btn-text btn-block" href="/book/${activity}/${date}/${resourceId}" data-close>See all times</a>`,
+      <a class="btn btn-text btn-block" href="/book/${activity}/${date}/${resourceId}?start=${starts.join(',')}" data-close>See all times</a>`,
     onOpen: (panel) => {
       on(panel, 'click', '[data-alt]', (_e, b) => {
         pick = alts[Number(b.dataset.alt)];
@@ -613,9 +701,8 @@ function openConflict(err, { activity, date, resourceId, start, resName }) {
       on(panel, 'click', '[data-act="alt"]', () => {
         if (!pick) return;
         m.close();
-        navigate(`/book/${activity}/${date}/${pick.resourceId}/${pick.start}`, { replace: true });
+        navigate(`/book/${activity}/${date}/${pick.resourceId}/${pick.starts.join(',')}`, { replace: true });
       });
     },
   });
 }
-

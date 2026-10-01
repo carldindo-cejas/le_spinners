@@ -4,8 +4,9 @@ import { icon } from '../../core/icons.js';
 import { addDays, firstName, hourLabel, isoDate, longDate, mmss } from '../../core/format.js';
 import { errorState, poll, skeletonRows } from '../../core/ui.js';
 import { frame } from '../shell.js';
+import { API, BASE } from '../console.js';
 
-const LABEL = { available: 'Available', booked: 'Booked', unavailable: 'Verifying', held: 'Held', closed: 'Closed', past: 'Past', maintenance: 'Maintenance' };
+const LABEL = { available: 'Available', booked: 'Booked', unavailable: 'Verifying', held: 'Held', closed: 'Closed', past: 'Past', maintenance: 'Maintenance', open_play: 'Open play' };
 
 function shortName(name) {
   const parts = String(name || '').trim().split(/\s+/);
@@ -17,10 +18,11 @@ function cell(s, r, now) {
   const b = s.booking;
   if (b) {
     const extra = s.state === 'held' && b.holdExpiresAt ? ` · ${mmss(b.holdExpiresAt - now)}` : '';
-    const href = s.state === 'unavailable' ? `/admin/verify/${b.id}` : `/admin/bookings/${b.id}`;
+    const href = s.state === 'unavailable' ? `${BASE}/verify/${b.id}` : `${BASE}/bookings/${b.id}`;
     return html`<a class="cell ${s.state}" href="${href}" aria-label="${r.name} ${s.label}: ${LABEL[s.state]}, ${b.userName}"><b>${LABEL[s.state]}${extra}</b><span>${shortName(b.userName)}</span></a>`;
   }
   if (s.state === 'maintenance') return html`<span class="cell maintenance"><b>Maint.</b><span>${r.maintenance?.note || ''}</span></span>`;
+  if (s.state === 'open_play') return html`<span class="cell open_play"><b>Open play</b><span>Free for all</span></span>`;
   return html`<span class="cell ${s.state}"><b>${LABEL[s.state] || s.state}</b><span>${s.state === 'available' ? 'Open' : ''}</span></span>`;
 }
 
@@ -42,17 +44,17 @@ export function calendarView({ query }) {
       </div>
       <p class="h3" data-title>${longDate(date)}</p>
       <div data-grid>${skeletonRows(6)}</div>
-      <div class="legend"><span><i class="bar-open"></i>Available</span><span><i class="bar-held"></i>Held</span><span><i class="lg-violet"></i>Verifying</span><span><i class="bar-taken"></i>Booked</span><span><i class="lg-hatch"></i>Maintenance / closed</span></div>
+      <div class="legend"><span><i class="bar-open"></i>Available</span><span><i class="bar-held"></i>Held</span><span><i class="lg-violet"></i>Verifying</span><span><i class="bar-taken"></i>Booked</span><span><i class="lg-open-play"></i>Open play</span><span><i class="lg-hatch"></i>Maintenance / closed</span></div>
     </div>`,
   });
   $('[data-activity]', root).value = activity;
   const grid = $('[data-grid]', root);
 
   async function load() {
-    history.replaceState(history.state, '', `/admin/calendar?date=${date}${activity ? `&activity=${activity}` : ''}`);
+    history.replaceState(history.state, '', `${BASE}/calendar?date=${date}${activity ? `&activity=${activity}` : ''}`);
     $('[data-title]', root).textContent = longDate(date);
     try {
-      const d = await api.get(`/api/admin/schedule?date=${date}${activity ? `&activity=${activity}` : ''}`);
+      const d = await api.get(`${API}/schedule?date=${date}${activity ? `&activity=${activity}` : ''}`);
       if (!d.resources.length || !d.resources[0].slots.length) {
         render(grid, html`<div class="empty"><p class="empty-title">${d.closedReason || 'Closed this day'}</p><p class="empty-body">No bookable hours on ${longDate(date)}.</p></div>`);
         return;

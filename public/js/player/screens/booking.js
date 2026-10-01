@@ -1,7 +1,7 @@
 import { api } from '../../core/api.js';
 import { $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon, courtArt } from '../../core/icons.js';
-import { clock, dateLabel, dayClock, initials, isoDate, longDate, minutesLabel, peso, rangeLabel, rangeLabelFull, shortDate } from './util.js';
+import { bookingTime, clock, dateLabel, dayClock, initials, isoDate, longDate, peso, shortDate } from './util.js';
 import { copyText, errorState, memberTag, openModal, poll, ringSvg, skeletonRows, startCountdown, statusPill, toast } from '../../core/ui.js';
 import { navigate, show, state, subHeader } from '../shell.js';
 import { lockLine } from '../components.js';
@@ -60,7 +60,7 @@ function progress(d) {
 function bookingSummaryCard(b) {
   return html`<section class="card card-pad row" data-gap="14">
     <span class="tile blue lg">${icon(b.activity === 'table_tennis' ? 'pingpong' : 'paddle', 24)}</span>
-    <div class="grow"><p class="h3">${b.resource.name} · ${b.activityLabel}</p><p class="small">${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</p></div>
+    <div class="grow"><p class="h3">${b.resource.name} · ${b.activityLabel}</p><p class="small">${dateLabel(b.date)} · ${bookingTime(b)}</p></div>
     <span class="mono">${b.amountLabel}</span>
   </section>`;
 }
@@ -120,7 +120,7 @@ function verifyingView(d) {
     ${progress(d)}
     ${proofCard(d)}
     ${chatPreview(d)}
-    <p class="small center">Need to change or cancel while we verify? Ask in the booking chat.</p>
+    <p class="small center">Once payment proof is submitted, the booking can't be cancelled. Questions? Ask in the booking chat.</p>
   </div>`;
 }
 
@@ -162,7 +162,7 @@ function expiredView(d) {
     </div>
     <section class="card card-pad stack stack-8">
       <div class="card-head"><span class="overline">${b.activityLabel}</span>${statusPill('EXPIRED', { small: true })}</div>
-      <p class="h3">${b.resource.name} · ${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</p>
+      <p class="h3">${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</p>
       <p class="small">${afterReject ? `Proof rejected: "${b.rejectReason}"` : `Held ${created ? clock(created.at) : ''}${created ? ` – ${clock(created.at + state.facility.rules.holdMinutes * 60_000)}` : ''} · no payment proof received`}</p>
     </section>
     <p class="banner success compact">${icon('check-circle', 18, 2.2)}<span>The slot is open to everyone again. If it's still free, you can book it now.</span></p>
@@ -184,7 +184,7 @@ function confirmedDetails(d) {
       <div class="ht-top">
         <div class="card-head"><span class="overline ht-over">${b.activityLabel}</span>${statusPill(b.status, { small: true, onBlue: true })}</div>
         <p class="ht-name">${b.resource.name}</p>
-        <p class="ht-when">${longDate(b.date)} · ${rangeLabel(b.start, b.end)}</p>
+        <p class="ht-when">${longDate(b.date)} · ${bookingTime(b)}</p>
       </div>
       <div class="ht-strip"><span class="mono">${b.ref}</span><span>Show at the front desk</span></div>
     </section>
@@ -195,7 +195,7 @@ function confirmedDetails(d) {
         <div><dt>Activity</dt><dd>${b.activityLabel}</dd></div>
         <div><dt>${b.activity === 'table_tennis' ? 'Table' : 'Court'}</dt><dd>${b.resource.name}</dd></div>
         <div><dt>Date</dt><dd>${longDate(b.date)}</dd></div>
-        <div><dt>Time</dt><dd>${rangeLabelFull(b.start, b.end)}</dd></div>
+        <div><dt>Time</dt><dd>${bookingTime(b, { full: true })}</dd></div>
         <div><dt>Status</dt><dd class="${b.status === 'CONFIRMED' ? 'green-text' : ''}">${b.status === 'COMPLETED' ? 'Completed' : 'Confirmed'}</dd></div>
         <div><dt>Payment</dt><dd>${b.amountLabel} · GCash · verified</dd></div>
       </dl>
@@ -206,11 +206,7 @@ function confirmedDetails(d) {
         <div class="grow"><p class="strong">${u.name}</p><p class="small">${[u.phone, u.email].filter(Boolean).join(' · ')}</p></div>${memberTag(u.membership, { small: true })}</div>
     </section>
     ${chatPreview(d)}
-    ${b.canCancel ? html`<section class="cancel-box stack stack-8">
-      <p class="strong">Need to cancel?</p>
-      <p class="small">You can cancel until <b>${dateLabel(isoDate(b.cancelDeadline))} · ${clock(b.cancelDeadline)}</b> (${state.facility.rules.cancelCutoffHours} hours before). Refunds are arranged with staff in the booking chat.</p>
-      <button type="button" class="btn btn-danger-outline btn-block" data-act="cancel">Cancel booking</button>
-    </section>` : b.status === 'CONFIRMED' ? html`<p class="small center">It's less than ${state.facility.rules.cancelCutoffHours} hours before your booking, so it can't be cancelled here. Message staff in the booking chat if something came up.</p>` : ''}
+    ${b.status === 'CONFIRMED' ? html`<p class="small center">Confirmed bookings can't be cancelled. If something comes up, message staff in the booking chat.</p>` : ''}
   </div>`;
 }
 
@@ -224,7 +220,7 @@ function cancelledDetails(d) {
     <section class="card card-pad-lg stack stack-12">
       <div class="card-head"><span class="mono">${b.ref}</span>${statusPill('CANCELLED', { small: true })}</div>
       <dl class="kv">
-        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</dd></div>
+        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</dd></div>
         <div><dt>${ev && ev.type === 'released' ? 'Released' : 'Cancelled'}</dt><dd>${byYou ? 'By you' : 'By Le Spinners'}${b.cancelledAt ? ` · ${dayClock(b.cancelledAt)}` : ''}</dd></div>
         ${b.cancelReason && b.cancelReason !== 'Released by player' ? html`<div><dt>Reason</dt><dd>${b.cancelReason}</dd></div>` : ''}
       </dl>
@@ -249,7 +245,7 @@ function openCancel(d) {
     locked: () => busy,
     content: () => html`<span class="tile red lg">${icon('circle-slash', 26)}</span>
       <h2 class="h2">Cancel this booking?</h2>
-      <p class="body"><b>${b.resource.name} · ${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</b> will be released to other players. This can't be undone.</p>
+      <p class="body"><b>${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</b> will be released to other players. This can't be undone.</p>
       <p class="label">Reason (optional, helps staff)</p>
       <div class="chip-row wrap" role="group" aria-label="Reason">${reasons.map((r) => html`<button type="button" class="chip" data-reason="${r}" aria-pressed="${reason === r ? 'true' : 'false'}">${r}</button>`)}</div>
       <p class="banner neutral compact">${icon('info', 18, 2.2)}<span>Your ${b.amountLabel} payment isn't refunded automatically — staff will follow up in the booking chat.</span></p>
@@ -367,7 +363,7 @@ export async function confirmedView({ params }) {
       <div class="tk-top">
         <div class="card-head"><span class="overline ht-over">${b.activityLabel}</span>${statusPill(b.status, { small: true, onBlue: true })}</div>
         <p class="tk-name">${b.resource.name}</p>
-        <p class="tk-when">${longDate(b.date)}<br>${rangeLabelFull(b.start, b.end)}</p>
+        <p class="tk-when">${longDate(b.date)}<br>${bookingTime(b, { full: true })}</p>
       </div>
       <div class="tk-perf" aria-hidden="true"></div>
       <div class="tk-bottom">
@@ -405,12 +401,12 @@ export async function cancelledView({ params }) {
     <div class="done-ring neutral" aria-hidden="true"><span>${icon('circle-slash', 38)}</span></div>
     <div class="stack stack-8 center">
       <h1 class="h1">Booking cancelled</h1>
-      <p class="body">${b.resource.name} on ${dateLabel(b.date)} at ${minutesLabel(b.start)} is open again for other players.</p>
+      <p class="body">${b.resource.name} on ${dateLabel(b.date)} · ${bookingTime(b)} is open again for other players.</p>
     </div>
     <section class="card card-pad-lg stack stack-12">
       <div class="card-head"><span class="mono">${b.ref}</span>${statusPill('CANCELLED', { small: true })}</div>
       <dl class="kv">
-        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</dd></div>
+        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${shortDate(b.date)} · ${bookingTime(b)}</dd></div>
         <div><dt>Cancelled</dt><dd>By you${b.cancelledAt ? ` · ${dayClock(b.cancelledAt)}` : ''}</dd></div>
         ${b.cancelReason ? html`<div><dt>Reason</dt><dd>${b.cancelReason}</dd></div>` : ''}
       </dl>

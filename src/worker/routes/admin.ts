@@ -1,9 +1,12 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
-import type { AppContext, AppEnv, BookingStatus } from '../types';
+import type { AppContext, AppEnv, BookingStatus, ResourceRow } from '../types';
 import { dayAvailability } from '../lib/availability';
 import { audit, requireStaff } from '../lib/auth';
-import { BOOKING_SELECT, bookingDTO, effectiveStatus, getBooking, listEvents, slotLabel, sweepExpired, type BookingJoin } from '../lib/bookings';
+import {
+  BOOKING_SELECT, bookingDTO, createConsoleBooking, effectiveStatus, getBooking, PICK_A_TIME, hasSlotPick, listEvents, requestedStarts, slotLabel, sweepExpired,
+  isOpenPlay, underMaintenance, zSlotPick, type BookingJoin,
+} from '../lib/bookings';
 import { MESSAGE_MAX_CHARS, listMessages, markRead, postMessage, staffConversations, staffUnreadChats } from '../lib/chat';
 import { notFound, unprocessable } from '../lib/errors';
 import { lazyMaintenance } from '../lib/maintenance';
@@ -11,12 +14,21 @@ import { approvePayment, listProofs, proofLink, rejectPayment, staffCancel } fro
 import { loadSettings } from '../lib/settings';
 import { dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso } from '../lib/time';
 import { jsonBody, parse, query, zActivity, zDate, zId } from '../lib/validate';
+import { facilityAdminRoutes } from './facilities';
 import { notificationDTO, readSchema } from './notifications';
 
-export const adminRoutes = new Hono<AppEnv>();
+/**
+ * Day-to-day operations: dashboard, payment verification, bookings, chat, staff
+ * notifications, the schedule grid, and courts/hours/closures.
+ *
+ * One router, mounted twice (src/worker/index.ts):
+ *   /api/staff/*  staff and admins  (the staff console)
+ *   /api/admin/*  admins only       (the admin console)
+ * The namespace guard runs first; requireStaff here is the floor for both.
+ */
+export const operationsRoutes = new Hono<AppEnv>();
 
-// Every /api/admin route is staff-only. Settings writes additionally need the admin role.
-adminRoutes.use('*', async (c, next) => {
+operationsRoutes.use('*', async (c, next) => {
   requireStaff(c);
   await next();
 });
@@ -73,20 +85,23 @@ function proofSummary(b: BookingJoin, p: ProofSummaryRow | undefined, link?: { u
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
-adminRoutes.get('/summary', async (c) => {
+async function summary(c: AppContext) {
   const db = c.env.DB;
   const now = Date.now();
   await sweepExpired(c.env, now);
   const { settings, offset } = await staffContext(c);
   const local = localNow(offset, now);
-  const [pending, holds, today, notif] = await db.batch([
+  const [pending, holds, today, notif, upcoming, facility] = await db.batch([
     db.prepare(`${BOOKING_SELECT} WHERE b.status = 'PAYMENT_SUBMITTED' ORDER BY b.submitted_at ASC LIMIT 50`),
     db.prepare(`${BOOKING_SELECT} WHERE b.status IN ('TEMPORARY', 'REJECTED') AND b.hold_expires_at > ? ORDER BY b.hold_expires_at ASC LIMIT 50`).bind(now),
     db
       .prepare(`${BOOKING_SELECT} WHERE b.date = ? AND b.status IN ('TEMPORARY', 'PAYMENT_SUBMITTED', 'CONFIRMED', 'REJECTED', 'COMPLETED') ORDER BY b.start_min, r.activity, r.sort_order`)
       .bind(local.date),
     db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE audience = 'staff' AND resolved_at IS NULL`),
+    db.prepare(`SELECT COUNT(*) AS n FROM bookings WHERE status = 'CONFIRMED' AND (date > ?1 OR (date = ?1 AND end_min > ?2))`).bind(local.date, local.minutes),
+    db.prepare(`SELECT id, name, activity, status, open_play, maintenance_note, maintenance_until FROM resources ORDER BY activity, sort_order, name`),
   ]);
+  const resources = (facility?.results ?? []) as Pick<ResourceRow, 'id' | 'name' | 'activity' | 'status' | 'open_play' | 'maintenance_note' | 'maintenance_until'>[];
   const pendingRows = (pending?.results ?? []) as BookingJoin[];
   const holdRows = (holds?.results ?? []) as BookingJoin[];
   const todayRows = (today?.results ?? []) as BookingJoin[];
@@ -104,15 +119,52 @@ adminRoutes.get('/summary', async (c) => {
       confirmedToday: confirmedToday.length,
       unresolved: ((notif?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0,
       unreadChats: await staffUnreadChats(db),
+      upcomingConfirmed: ((upcoming?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0,
+    },
+    // Disabled courts are retired, not out of service: they count in neither number.
+    facility: {
+      inService: resources.filter((r) => r.status !== 'disabled' && !underMaintenance(r, local.date)).length,
+      total: resources.filter((r) => r.status !== 'disabled').length,
+      maintenance: resources
+        .filter((r) => underMaintenance(r, local.date))
+        .map((r) => ({ id: r.id, name: r.name, activity: r.activity, note: r.maintenance_note, untilLabel: r.maintenance_until ? dateLabel(r.maintenance_until) : null })),
+      // In service, but free for all: not bookable.
+      openPlay: resources.filter((r) => isOpenPlay(r)).map((r) => ({ id: r.id, name: r.name, activity: r.activity })),
     },
     verifiedRevenueToday: confirmedToday.reduce((sum, b) => sum + b.amount_due, 0),
     verification: pendingRows.map((b) => ({ ...dto(b), proof: proofSummary(b, proofs.get(b.id), links.get(b.id)) })),
     holds: holdRows.map(dto),
     todaySchedule: todayRows.map(dto),
   });
+}
+
+operationsRoutes.get('/summary', summary);
+operationsRoutes.get('/dashboard', summary);
+
+/**
+ * What staff need while verifying: booking rules and the GCash account players pay
+ * (both already shown to players), plus how many alert recipients are set up.
+ * Recipient addresses and the rest of Settings stay admin-only.
+ */
+operationsRoutes.get('/rules', async (c) => {
+  const s = await loadSettings(c.env.DB);
+  return c.json({
+    settings: {
+      holdMinutes: s.holdMinutes,
+      warnMinutes: s.warnMinutes,
+      resubmitMinutes: s.resubmitMinutes,
+      cancelCutoffHours: s.cancelCutoffHours,
+      bookingWindowDays: s.bookingWindowDays,
+      slotMinutes: s.slotMinutes,
+      gcashName: s.gcashName,
+      gcashNumber: s.gcashNumber,
+    },
+    alerts: { emailRecipients: s.staffAlertEmails.length, smsRecipients: s.staffAlertSms.length },
+    delivery: { email: c.env.RESEND_API_KEY && c.env.EMAIL_FROM ? 'resend' : 'queued', sms: 'queued' },
+  });
 });
 
-adminRoutes.get('/badges', async (c) => {
+operationsRoutes.get('/badges', async (c) => {
   const db = c.env.DB;
   const now = Date.now();
   c.executionCtx.waitUntil(lazyMaintenance(c.env, now));
@@ -138,7 +190,7 @@ adminRoutes.get('/badges', async (c) => {
 
 // ── Verification queue ────────────────────────────────────────────────────
 
-adminRoutes.get('/verifications', async (c) => {
+operationsRoutes.get('/verifications', async (c) => {
   const db = c.env.DB;
   const now = Date.now();
   const q = query(c, z.object({ tab: z.enum(['pending', 'approved', 'rejected']).optional() }));
@@ -203,7 +255,7 @@ const listSchema = z.object({
   scope: z.enum(['upcoming', 'past', 'all']).optional(),
 });
 
-adminRoutes.get('/bookings', async (c) => {
+operationsRoutes.get('/bookings', async (c) => {
   const db = c.env.DB;
   const now = Date.now();
   await sweepExpired(c.env, now);
@@ -291,20 +343,49 @@ async function staffDetail(c: AppContext, bookingId: string, now: number) {
     actions: {
       canApprove: booking.status === 'PAYMENT_SUBMITTED',
       canReject: booking.status === 'PAYMENT_SUBMITTED',
-      canCancel: ['TEMPORARY', 'PAYMENT_SUBMITTED', 'CONFIRMED', 'REJECTED'].includes(booking.status),
+      canCancel: ['TEMPORARY', 'REJECTED'].includes(booking.status), // paid or confirmed: never
     },
   };
 }
 
-adminRoutes.get('/bookings/:id', async (c) => {
+/** A personal booking made on site by the signed-in staff member or admin: confirmed at once. */
+const consoleBookingSchema = z
+  .object({
+    resourceId: zId,
+    date: zDate,
+    ...zSlotPick,
+    rate: z.enum(['member', 'non_member']),
+    payment: z.enum(['on_site', 'none']),
+  })
+  .refine(hasSlotPick, PICK_A_TIME);
+
+operationsRoutes.post('/bookings', async (c) => {
+  const staff = requireStaff(c);
+  const body = await jsonBody(c, consoleBookingSchema);
+  const { settings } = await staffContext(c);
+  const starts = requestedStarts(body, settings.slotMinutes);
+  const now = Date.now();
+  const b = await createConsoleBooking(c.env, settings, staff, { resourceId: body.resourceId, date: body.date, starts, rate: body.rate, payment: body.payment }, now);
+  c.executionCtx.waitUntil(audit(c, staff.id, 'booking_created_on_site', 'booking', b.id, JSON.stringify({ payment: body.payment, slots: starts.length })));
+  return c.json(await staffDetail(c, b.id, now), 201);
+});
+
+operationsRoutes.get('/bookings/:id', async (c) => {
   const id = parse(zId, c.req.param('id'));
   return c.json(await staffDetail(c, id, Date.now()));
 });
 
-adminRoutes.post('/bookings/:id/approve', async (c) => {
+operationsRoutes.post('/bookings/:id/approve', async (c) => {
   const staff = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
-  const body = await jsonBody(c, z.object({ message: z.string().trim().max(MESSAGE_MAX_CHARS).optional() }));
+  const body = await jsonBody(
+    c,
+    z.object({
+      message: z.string().trim().max(MESSAGE_MAX_CHARS).optional(),
+      // The "Before you approve" checklist: every item has to be ticked.
+      checklist: z.literal(true, { error: 'Tick every item on the "Before you approve" checklist first.' }),
+    }),
+  );
   const now = Date.now();
   await approvePayment(c.env, staff, id, now, body.message || null);
   c.executionCtx.waitUntil(audit(c, staff.id, 'payment_approved', 'booking', id));
@@ -317,7 +398,7 @@ const rejectSchema = z.object({
   keepHold: z.boolean().default(true),
 });
 
-adminRoutes.post('/bookings/:id/reject', async (c) => {
+operationsRoutes.post('/bookings/:id/reject', async (c) => {
   const staff = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
   const body = await jsonBody(c, rejectSchema);
@@ -328,7 +409,7 @@ adminRoutes.post('/bookings/:id/reject', async (c) => {
   return c.json(await staffDetail(c, id, now));
 });
 
-adminRoutes.post('/bookings/:id/cancel', async (c) => {
+operationsRoutes.post('/bookings/:id/cancel', async (c) => {
   const staff = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
   const body = await jsonBody(c, z.object({ reason: z.string().trim().min(3, 'Give a reason for the player.').max(300) }));
@@ -340,7 +421,7 @@ adminRoutes.post('/bookings/:id/cancel', async (c) => {
 
 // ── Schedule grid (with names — staff only) ────────────────────────────────
 
-adminRoutes.get('/schedule', async (c) => {
+operationsRoutes.get('/schedule', async (c) => {
   const q = query(c, z.object({ date: zDate.optional(), activity: zActivity.optional() }));
   const { settings, offset } = await staffContext(c);
   const now = Date.now();
@@ -351,7 +432,7 @@ adminRoutes.get('/schedule', async (c) => {
 
 // ── Booking chat (staff side) ──────────────────────────────────────────────
 
-adminRoutes.get('/messages', async (c) => {
+operationsRoutes.get('/messages', async (c) => {
   const now = Date.now();
   const rows = await staffConversations(c.env.DB);
   return c.json({
@@ -376,7 +457,7 @@ adminRoutes.get('/messages', async (c) => {
   });
 });
 
-adminRoutes.get('/bookings/:id/messages', async (c) => {
+operationsRoutes.get('/bookings/:id/messages', async (c) => {
   const staff = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
   const now = Date.now();
@@ -387,7 +468,7 @@ adminRoutes.get('/bookings/:id/messages', async (c) => {
   return c.json({ now, booking: bookingDTO(b, now, settings, offset, true), messages });
 });
 
-adminRoutes.post('/bookings/:id/messages', async (c) => {
+operationsRoutes.post('/bookings/:id/messages', async (c) => {
   const staff = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
   const body = await jsonBody(
@@ -402,7 +483,7 @@ adminRoutes.post('/bookings/:id/messages', async (c) => {
 
 // ── Staff notification center ──────────────────────────────────────────────
 
-adminRoutes.get('/notifications', async (c) => {
+operationsRoutes.get('/notifications', async (c) => {
   const db = c.env.DB;
   const q = query(c, z.object({ filter: z.enum(['unresolved', 'all']).optional() }));
   const [list, counts] = await db.batch([
@@ -425,7 +506,7 @@ adminRoutes.get('/notifications', async (c) => {
   });
 });
 
-adminRoutes.post('/notifications/read', async (c) => {
+operationsRoutes.post('/notifications/read', async (c) => {
   const body = await jsonBody(c, readSchema);
   const now = Date.now();
   if (body.all) {
@@ -438,7 +519,7 @@ adminRoutes.post('/notifications/read', async (c) => {
   return c.json({ ok: true });
 });
 
-adminRoutes.post('/notifications/:id/resolve', async (c) => {
+operationsRoutes.post('/notifications/:id/resolve', async (c) => {
   const id = parse(zId, c.req.param('id'));
   const now = Date.now();
   const res = await c.env.DB.prepare(
@@ -449,3 +530,7 @@ adminRoutes.post('/notifications/:id/resolve', async (c) => {
   if (!res.meta.changes) throw notFound('Notification not found.');
   return c.json({ ok: true });
 });
+
+// ── Courts and tables, weekly hours, closures ─────────────────────────────
+
+operationsRoutes.route('/', facilityAdminRoutes);

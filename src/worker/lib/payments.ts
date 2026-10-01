@@ -223,7 +223,7 @@ export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: 
     db
       .prepare(
         `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = ?3, hold_expires_at = NULL, updated_at = ?1
-          WHERE id = ?4 AND status IN ('TEMPORARY', 'PAYMENT_SUBMITTED', 'CONFIRMED', 'REJECTED')`,
+          WHERE id = ?4 AND status IN ('TEMPORARY', 'REJECTED')`,
       )
       .bind(now, staff.id, reason, bookingId),
     eventStmt(db, bookingId, 'cancelled', staff.id, 'staff', reason, now, g),
@@ -234,7 +234,7 @@ export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: 
       `Hi ${b.user_name},\n\nYour booking ${b.ref} (${where}) was cancelled by Le Spinners.\nReason: ${reason}\n\nQuestions? Reply in the booking chat: ${env.APP_ORIGIN}/bookings/${bookingId}/chat\n\nLe Spinners Recreational Hub`,
       bookingId, now, g),
   ]);
-  if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is already closed.');
+  if (!update?.meta.changes) throw conflict('NOT_CANCELLABLE', 'Only unpaid holds can be cancelled. Bookings with a submitted payment or a confirmation stay as they are.');
 }
 
 // ── Private proof images ───────────────────────────────────────────────────

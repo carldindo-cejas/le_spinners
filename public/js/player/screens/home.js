@@ -1,7 +1,7 @@
 import { api } from '../../core/api.js';
 import { html, render } from '../../core/dom.js';
 import { icon, logo, courtArt } from '../../core/icons.js';
-import { dateLabel, dayMonth, greeting, initials, rangeLabel, firstName } from './util.js';
+import { bookingTime, dateLabel, dayMonth, firstName, greeting, initials } from './util.js';
 import { errorState, memberTag, poll, skeletonRows, statusPill } from '../../core/ui.js';
 import { bellButton, show, state } from '../shell.js';
 import { ACTIVE, bookingCard, bookingHref, resourceTile, startCardCountdowns } from '../components.js';
@@ -33,6 +33,10 @@ function availableToday(days, now) {
     if (r.status === 'maintenance') {
       return html`<div class="t-row"><div class="row row-between"><span class="t-name">${r.name}<small>${type}</small></span><span class="pill hatch sm">${icon('wrench', 12, 2.4)}Maintenance</span></div>
         <p class="t-none">${r.maintenance?.note || 'Maintenance'}${r.maintenance?.untilLabel ? ` · back ${r.maintenance.untilLabel}` : ''}</p></div>`;
+    }
+    if (r.status === 'open_play') {
+      return html`<div class="t-row"><div class="row row-between"><span class="t-name">${r.name}<small>${type}</small></span><span class="pill blue sm">${icon('users', 12, 2.4)}Open play</span></div>
+        <p class="t-none">Free for all · no booking needed</p></div>`;
     }
     const chips = [
       ...open.map((s) => ({ s, kind: 'open' })),
@@ -67,7 +71,7 @@ function upcomingBlock(bookings) {
   const when = days === 0 ? 'TODAY' : days === 1 ? 'TOMORROW' : `IN ${days} DAYS`;
   return html`<article class="card booking-mini">
     <div class="card-head"><span class="overline blue">${next.activityLabel} · ${when}</span>${statusPill(next.status, { small: true })}</div>
-    <div class="bm-main">${resourceTile(next.activity)}<div><div class="bm-name">${next.resource.name}</div><div class="small">${dateLabel(next.date)}, ${next.date.slice(0, 4)}</div><div class="small strong ink">${rangeLabel(next.start, next.end)}</div></div></div>
+    <div class="bm-main">${resourceTile(next.activity)}<div><div class="bm-name">${next.resource.name}</div><div class="small">${dateLabel(next.date)}, ${next.date.slice(0, 4)}</div><div class="small strong ink">${bookingTime(next)}</div></div></div>
     <div class="bm-foot"><a class="btn btn-secondary btn-sm" href="${bookingHref(next)}">View booking</a><a class="btn btn-tonal btn-sm" href="/bookings/${next.id}/chat">${icon('chat', 18)}Chat</a></div>
   </article>`;
 }
@@ -79,7 +83,7 @@ function recentBlock(bookings) {
     <div class="section-head"><h2 class="h2">Recent</h2><a href="/bookings?tab=past">History</a></div>
     <div class="card">${past.map((b) => html`<a class="list-row" href="/bookings/${b.id}">
       <span class="row-tile">${icon(b.activity === 'table_tennis' ? 'pingpong' : 'paddle', 20)}</span>
-      <span class="grow"><span class="row-title">${b.resource.name} · ${b.activity === 'table_tennis' ? 'Table tennis' : 'Pickleball'}</span><br><span class="row-meta">${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</span></span>
+      <span class="grow"><span class="row-title">${b.resource.name} · ${b.activity === 'table_tennis' ? 'Table tennis' : 'Pickleball'}</span><br><span class="row-meta">${dateLabel(b.date)} · ${bookingTime(b)}</span></span>
       ${statusPill(b.status, { small: true, noIcon: true })}
     </a>`)}</div>
   </section>`;

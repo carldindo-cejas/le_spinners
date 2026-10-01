@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Le Spinners · Staff console</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0D1626">
+<link rel="manifest" href="/staff/manifest.webmanifest">
+<link rel="icon" href="/icons/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/staff-icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..800&family=JetBrains+Mono:wght@500;700&display=swap">
+<link rel="stylesheet" href="/css/app.css">
+<link rel="stylesheet" href="/css/player.css">
+<link rel="stylesheet" href="/css/admin.css">
+<script type="module" src="/js/admin/app.js"></script>
+</head>
+<body class="staff">
+<a class="skip-link" href="#main">Skip to content</a>
+<div id="offline-strip" class="offline-strip" role="status" hidden></div>
+<div class="staff-app" id="staff-app">
+  <aside id="sidebar" class="sidebar" aria-label="Staff navigation"></aside>
+  <div class="staff-main">
+    <header id="topbar" class="topbar"></header>
+    <main id="main" tabindex="-1"><div class="page"><div class="loading-line"><span class="spinner dark"></span>Loading the staff console…</div></div></main>
+  </div>
+</div>
+<nav id="tabbar" class="staff-tabbar" aria-label="Staff" hidden></nav>
+<noscript><p class="noscript">The staff console needs JavaScript turned on.</p></noscript>
+</body>
+</html>

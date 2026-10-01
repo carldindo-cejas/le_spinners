@@ -3,19 +3,20 @@ import { bodyLimit } from 'hono/body-limit';
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AppEnv, Bindings } from './types';
-import { loadSession } from './lib/auth';
+import { loadSession, requireAdmin, requireStaff, roleGuard } from './lib/auth';
 import { ApiError, notFound } from './lib/errors';
 import { runMaintenance } from './lib/maintenance';
 import { MAX_UPLOAD_BYTES } from './lib/images';
-import { adminRoutes } from './routes/admin';
+import { operationsRoutes } from './routes/admin';
 import { adminSettingsRoutes } from './routes/admin-settings';
 import { authRoutes, meRoutes } from './routes/auth';
 import { bookingRoutes } from './routes/bookings';
 import { facilityRoutes } from './routes/facility';
 import { fileRoutes, notificationRoutes } from './routes/notifications';
+import { revenueRoutes } from './routes/revenue';
 
 /**
- * Page security headers for responses the Worker itself serves (the staff shell).
+ * Page security headers for responses the Worker itself serves (the console shells).
  * Keep in sync with public/_headers, which covers files served straight from assets.
  */
 const PAGE_CSP = [
@@ -105,27 +106,47 @@ app.route('/api', facilityRoutes);
 app.route('/api/bookings', bookingRoutes);
 app.route('/api/notifications', notificationRoutes);
 app.route('/api/files', fileRoutes);
+// Role namespaces. The guard runs before any handler; handlers check again.
+//   /api/bookings, /api/notifications, /api/availability*  players (routes call requirePlayer)
+//   /api/staff/*   staff and admins: operations (verification, bookings, chat, facility)
+//   /api/admin/*   admins only: the same operations plus settings, prices, the outbox and revenue
+//   /api/me, /api/files, /api/facility*  shared, checked per route
+app.use('/api/staff/*', roleGuard(requireStaff));
+app.use('/api/admin/*', roleGuard(requireAdmin));
+app.route('/api/staff', operationsRoutes);
 app.route('/api/admin', adminSettingsRoutes);
-app.route('/api/admin', adminRoutes);
+app.route('/api/admin/revenue', revenueRoutes);
+app.route('/api/admin', operationsRoutes);
 app.all('/api/*', () => {
   throw notFound('No such endpoint.');
 });
 
-// ── Staff shell (/admin/…) — its own HTML entry so staff screens stay separate ──
+// ── Console shells (/admin/…, /staff/…, /revenue/) — their own HTML entries, separate from the player app ──
+// The shells hold no data; every screen loads through the role-guarded API above.
 
-async function serveAdminShell(c: Context<AppEnv>) {
-  const url = new URL(c.req.url);
-  const isFile = /\/[^/]+\.[a-z0-9]{1,8}$/i.test(url.pathname);
-  const req = isFile ? c.req.raw : new Request(new URL('/admin/', url).toString(), { method: 'GET', headers: c.req.raw.headers });
-  const res = await c.env.ASSETS.fetch(req);
-  const out = new Response(res.body, res);
-  for (const [k, v] of Object.entries(PAGE_HEADERS)) out.headers.set(k, v);
-  return out;
+function consoleShell(base: '/admin/' | '/staff/') {
+  return async (c: Context<AppEnv>) => {
+    const url = new URL(c.req.url);
+    // Up to 12 characters so manifest.webmanifest is served as a file, not the shell.
+    const isFile = /\/[^/]+\.[a-z0-9]{1,12}$/i.test(url.pathname);
+    const req = isFile ? c.req.raw : new Request(new URL(base, url).toString(), { method: 'GET', headers: c.req.raw.headers });
+    const res = await c.env.ASSETS.fetch(req);
+    const out = new Response(res.body, res);
+    for (const [k, v] of Object.entries(PAGE_HEADERS)) out.headers.set(k, v);
+    return out;
+  };
 }
 
 app.get('/admin', (c) => c.redirect('/admin/', 301));
-app.get('/admin/', serveAdminShell);
-app.get('/admin/*', serveAdminShell);
+app.get('/admin/', consoleShell('/admin/'));
+app.get('/admin/*', consoleShell('/admin/'));
+app.get('/staff', (c) => c.redirect('/staff/', 301));
+app.get('/staff/', consoleShell('/staff/'));
+app.get('/staff/*', consoleShell('/staff/'));
+// The revenue page is an admin console screen at its own address; it runs the admin shell.
+app.get('/revenue', (c) => c.redirect('/revenue/', 301));
+app.get('/revenue/', consoleShell('/admin/'));
+app.get('/revenue/*', consoleShell('/admin/'));
 
 // Anything else the Worker sees goes to static assets (SPA fallback for the player app).
 app.all('*', (c) => c.env.ASSETS.fetch(c.req.raw));

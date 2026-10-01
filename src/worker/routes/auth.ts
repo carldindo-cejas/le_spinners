@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
-import type { AppEnv, UserRow } from '../types';
-import { audit, clientIp, createSession, destroySession, enforceRateLimit, hitRateLimit, passwordPepper, requireUser, userDTO } from '../lib/auth';
+import type { AppContext, AppEnv, UserRow } from '../types';
+import {
+  audit, clientIp, createSession, destroySession, enforceRateLimit, hitRateLimit, homeFor, passwordPepper, PORTAL_ROLE, requireUser, userDTO,
+  type Portal,
+} from '../lib/auth';
 import { fakePasswordSalt, newId, PASSWORD_ITERATIONS, PASSWORD_SCHEME, pepperHash, verifyClientHash } from '../lib/crypto';
 import { ApiError, conflict, forbidden, tooMany } from '../lib/errors';
 import { jsonBody } from '../lib/validate';
@@ -119,34 +122,54 @@ authRoutes.post('/register', async (c) => {
   return c.json({ user: user ? userDTO(user) : null }, 201);
 });
 
-authRoutes.post('/login', async (c) => {
-  const db = c.env.DB;
-  const pepper = passwordPepper(c);
-  const body = await jsonBody(c, loginSchema);
-  const ip = clientIp(c);
-  const ipOk = await hitRateLimit(db, `login:ip:${ip}`, 30, 15 * MINUTE);
-  const emailOk = await hitRateLimit(db, `login:email:${body.email}`, 8, 15 * MINUTE);
-  if (!ipOk || !emailOk) {
-    c.executionCtx.waitUntil(audit(c, null, 'login_throttled', 'email', body.email));
-    throw tooMany('Too many sign-in attempts. Please wait 15 minutes and try again.');
-  }
+/**
+ * Sign-in for one portal. The account's role is read from D1 and must match the
+ * portal; a wrong-portal attempt gets exactly the same 401 as a wrong password
+ * (after the same HMAC work), counts against the same rate limits, and never
+ * creates or replaces a session.
+ */
+function portalLogin(portal: Portal) {
+  return async (c: AppContext) => {
+    const db = c.env.DB;
+    const pepper = passwordPepper(c);
+    const body = await jsonBody(c, loginSchema);
+    const ip = clientIp(c);
+    const ipOk = await hitRateLimit(db, `login:ip:${ip}`, 30, 15 * MINUTE);
+    const emailOk = await hitRateLimit(db, `login:email:${body.email}`, 8, 15 * MINUTE);
+    if (!ipOk || !emailOk) {
+      c.executionCtx.waitUntil(audit(c, null, 'login_throttled', 'email', body.email, portal));
+      throw tooMany('Too many sign-in attempts. Please wait 15 minutes and try again.');
+    }
 
-  const found = await db.prepare('SELECT * FROM users WHERE email = ?').bind(body.email).first<UserRow>();
-  const user = usable(found) ? found : null;
-  // Unknown accounts run the same HMAC + comparison, so timing doesn't reveal them.
-  const valid = await verifyClientHash(pepper, body.clientHash, user?.password_hash ?? null);
-  if (!user || !valid) {
-    c.executionCtx.waitUntil(audit(c, user?.id ?? null, 'login_failed', 'email', body.email));
-    throw new ApiError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.');
-  }
-  if (user.status !== 'active') throw forbidden('This account is disabled. Please contact Le Spinners.');
+    const found = await db.prepare('SELECT * FROM users WHERE email = ?').bind(body.email).first<UserRow>();
+    const user = usable(found) ? found : null;
+    // Unknown accounts run the same HMAC + comparison, so timing doesn't reveal them.
+    const valid = await verifyClientHash(pepper, body.clientHash, user?.password_hash ?? null);
+    if (!user || !valid) {
+      c.executionCtx.waitUntil(audit(c, user?.id ?? null, 'login_failed', 'email', body.email, portal));
+      throw invalidCredentials();
+    }
+    if (user.role !== PORTAL_ROLE[portal]) {
+      c.executionCtx.waitUntil(audit(c, user.id, 'login_wrong_portal', 'user', user.id, `${portal} (role ${user.role})`));
+      throw invalidCredentials();
+    }
+    if (user.status !== 'active') throw forbidden('This account is disabled. Please contact Le Spinners.');
 
-  if (c.get('user')) await destroySession(c); // never reuse a previous session
-  await createSession(c, user, body.remember ?? true);
-  await db.prepare('DELETE FROM rate_limits WHERE key = ?').bind(`login:email:${body.email}`).run();
-  c.executionCtx.waitUntil(audit(c, user.id, 'login', 'user', user.id));
-  return c.json({ user: userDTO(user) });
-});
+    if (c.get('user')) await destroySession(c); // never reuse a previous session
+    await createSession(c, user, body.remember ?? true);
+    await db.prepare('DELETE FROM rate_limits WHERE key = ?').bind(`login:email:${body.email}`).run();
+    c.executionCtx.waitUntil(audit(c, user.id, 'login', 'user', user.id, portal));
+    return c.json({ user: userDTO(user), home: homeFor(user.role) });
+  };
+}
+
+const invalidCredentials = () => new ApiError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.');
+
+authRoutes.post('/user/login', portalLogin('user'));
+authRoutes.post('/staff/login', portalLogin('staff'));
+authRoutes.post('/admin/login', portalLogin('admin'));
+// The original endpoint, kept for existing player clients. Player accounts only.
+authRoutes.post('/login', portalLogin('user'));
 
 authRoutes.post('/logout', async (c) => {
   const user = c.get('user');
@@ -155,10 +178,14 @@ authRoutes.post('/logout', async (c) => {
   return c.json({ ok: true });
 });
 
-authRoutes.get('/me', (c) => {
+/** The signed-in account (or null) and the dashboard its role belongs to. */
+function sessionInfo(c: AppContext) {
   const user = c.get('user');
-  return c.json({ user: user ? userDTO(user) : null });
-});
+  return c.json({ user: user ? userDTO(user) : null, home: user ? homeFor(user.role) : null });
+}
+
+authRoutes.get('/session', sessionInfo);
+authRoutes.get('/me', sessionInfo);
 
 // ── Profile (/api/me) ───────────────────────────────────────────────────────
 

@@ -1,27 +1,29 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppEnv, ResourceRow } from '../types';
-import { audit, requireAdmin, requireStaff } from '../lib/auth';
-import type { HoursRow } from '../lib/bookings';
+import { audit, requireAdmin } from '../lib/auth';
+import { resourceStatus, type HoursRow } from '../lib/bookings';
 import { newId } from '../lib/crypto';
-import { ApiError, badRequest, notFound, unprocessable } from '../lib/errors';
+import { ApiError, badRequest, unprocessable } from '../lib/errors';
 import { sniffImage, stripMetadata } from '../lib/images';
 import { invalidateSettings, loadSettings } from '../lib/settings';
 import { dateLabel, hoursLabel, peso } from '../lib/time';
-import { jsonBody, parse, zDate, zId } from '../lib/validate';
+import { resourceUpdateSchema, updateResource } from '../lib/facility';
+import { jsonBody, parse, zId } from '../lib/validate';
 import { zEmail } from './auth';
 
 export const adminSettingsRoutes = new Hono<AppEnv>();
 
+// Global configuration (GCash, prices, alert recipients, booking rules) and the outbox: admins only.
 adminSettingsRoutes.use('*', async (c, next) => {
-  requireStaff(c);
+  requireAdmin(c);
   await next();
 });
 
 const QR_MAX_BYTES = 5 * 1024 * 1024;
 
 adminSettingsRoutes.get('/settings', async (c) => {
-  const user = requireStaff(c);
+  const user = requireAdmin(c);
   const db = c.env.DB;
   const s = await loadSettings(db);
   const [resources, hours] = await db.batch([
@@ -54,7 +56,7 @@ adminSettingsRoutes.get('/settings', async (c) => {
       id: r.id,
       activity: r.activity,
       name: r.name,
-      status: r.status,
+      status: resourceStatus(r),
       maintenanceNote: r.maintenance_note,
       maintenanceUntil: r.maintenance_until,
       maintenanceUntilLabel: r.maintenance_until ? dateLabel(r.maintenance_until) : null,
@@ -171,44 +173,12 @@ adminSettingsRoutes.delete('/settings/gcash-qr', async (c) => {
   return c.json({ ok: true });
 });
 
-const resourceSchema = z.object({
-  name: z.string().trim().min(2).max(40).optional(),
-  priceMember: z.number().int().min(0).max(10_000_000).optional(),
-  priceNonMember: z.number().int().min(0).max(10_000_000).optional(),
-  status: z.enum(['active', 'maintenance', 'disabled']).optional(),
-  maintenanceNote: z.string().trim().max(120).nullable().optional(),
-  maintenanceUntil: zDate.nullable().optional(),
-});
-
-/** Prices (centavos) and maintenance status of one court or table. */
+/** Prices (centavos) and status of one court or table. Same rules as /api/staff/facilities/:id. */
 adminSettingsRoutes.patch('/resources/:id', async (c) => {
   const admin = requireAdmin(c);
   const id = parse(zId, c.req.param('id'));
-  const body = await jsonBody(c, resourceSchema);
-  const db = c.env.DB;
-  const current = await db.prepare('SELECT * FROM resources WHERE id = ?').bind(id).first<ResourceRow>();
-  if (!current) throw notFound('Court or table not found.');
-  const next = {
-    name: body.name ?? current.name,
-    price_member: body.priceMember ?? current.price_member,
-    price_non_member: body.priceNonMember ?? current.price_non_member,
-    status: body.status ?? current.status,
-    maintenance_note: body.maintenanceNote === undefined ? current.maintenance_note : body.maintenanceNote || null,
-    maintenance_until: body.maintenanceUntil === undefined ? current.maintenance_until : body.maintenanceUntil,
-  };
-  if (next.status !== 'maintenance') {
-    next.maintenance_note = null;
-    next.maintenance_until = null;
-  }
-  await db
-    .prepare(
-      `UPDATE resources SET name = ?, price_member = ?, price_non_member = ?, status = ?, maintenance_note = ?, maintenance_until = ?, updated_at = ?
-        WHERE id = ?`,
-    )
-    .bind(next.name, next.price_member, next.price_non_member, next.status, next.maintenance_note, next.maintenance_until, Date.now(), id)
-    .run();
-  c.executionCtx.waitUntil(audit(c, admin.id, 'resource_updated', 'resource', id, Object.keys(body).join(',')));
-  return c.json({ ok: true });
+  const body = await jsonBody(c, resourceUpdateSchema);
+  return c.json({ ok: true, ...(await updateResource(c, admin, id, body)) });
 });
 
 /** Recent email/SMS notifications, so staff can see what was queued or sent. */

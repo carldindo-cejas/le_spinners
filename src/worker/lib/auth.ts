@@ -107,19 +107,50 @@ export function isStaff(role: Role): boolean {
   return role === 'staff' || role === 'admin';
 }
 
-export function requireStaff(c: AppContext): SessionUser {
+/**
+ * Each role has its own sign-in page and dashboard. Users (players) book at /,
+ * staff run day-to-day operations at /staff/, admins use /admin/.
+ * The role always comes from the users table, never from the request.
+ */
+export type Portal = 'user' | 'staff' | 'admin';
+export const PORTAL_ROLE: Record<Portal, Role> = { user: 'player', staff: 'staff', admin: 'admin' };
+const HOME: Record<Role, string> = { player: '/', staff: '/staff/', admin: '/admin/' };
+
+export function homeFor(role: Role): string {
+  return HOME[role];
+}
+
+/** 401 without a session, 403 (logged) when the signed-in role isn't one of `roles`. */
+export function requireRole(c: AppContext, roles: readonly Role[], message: string): SessionUser {
   const user = requireUser(c);
-  if (!isStaff(user.role)) {
-    c.executionCtx.waitUntil(audit(c, user.id, 'forbidden_admin_access', 'route', c.req.path));
-    throw forbidden('Staff only.');
+  if (!roles.includes(user.role)) {
+    c.executionCtx.waitUntil(audit(c, user.id, 'forbidden_access', 'route', `${c.req.method} ${c.req.path}`, user.role));
+    throw forbidden(message);
   }
   return user;
 }
 
+/** Player-only: booking, paying, the player's inbox and booking chat. */
+export function requirePlayer(c: AppContext): SessionUser {
+  return requireRole(c, ['player'], 'This is a staff account. Sign in with a player account to book.');
+}
+
+/** Operations (bookings, payment verification, chat, facility, availability): staff and admins. */
+export function requireStaff(c: AppContext): SessionUser {
+  return requireRole(c, ['staff', 'admin'], 'Staff only.');
+}
+
+/** Admin-only: global settings, GCash, prices, alert recipients, the outbox. */
 export function requireAdmin(c: AppContext): SessionUser {
-  const user = requireStaff(c);
-  if (user.role !== 'admin') throw forbidden('Only administrators can change this.');
-  return user;
+  return requireRole(c, ['admin'], 'Only administrators can do this.');
+}
+
+/** Hono middleware form of requireRole, for whole route namespaces. */
+export function roleGuard(check: (c: AppContext) => SessionUser): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    check(c);
+    await next();
+  };
 }
 
 /** Fixed-window counter. Returns false when the limit is exceeded. */

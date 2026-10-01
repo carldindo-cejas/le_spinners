@@ -6,14 +6,15 @@
   "observability": { "enabled": true },
 
   // The PWA lives in public/. The Worker runs first for the API and for the
-  // staff console so it can add security headers and serve /admin/index.html
-  // for deep links like /admin/verify/abc. Everything else falls back to the
-  // player shell (/index.html).
+  // admin and staff consoles so it can add security headers and serve
+  // /admin/index.html or /staff/index.html for deep links like /staff/verify/abc.
+  // /revenue/ is an admin console page with its own address (served the admin shell).
+  // Everything else falls back to the player shell (/index.html).
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/admin", "/admin/*"]
+    "run_worker_first": ["/api/*", "/admin", "/admin/*", "/staff", "/staff/*", "/revenue", "/revenue/*"]
   },
 
   // Create with: npx wrangler d1 create le-spinners  → paste the id below.

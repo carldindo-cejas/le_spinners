@@ -1,9 +1,9 @@
 import { api } from '../../core/api.js';
-import { newPasswordCredentials, passwordProof } from '../../core/credentials.js';
-import { $, html, on, setBusy } from '../../core/dom.js';
+import { openChangePassword, openEditProfile } from '../../core/account.js';
+import { html, on, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { initials, monthDayYear } from './util.js';
-import { clearFieldErrors, memberTag, openModal, showFieldErrors, toast } from '../../core/ui.js';
+import { memberTag, openModal } from '../../core/ui.js';
 import { navigate, show, state, stopBadgePolling } from '../shell.js';
 
 let installEvent = null;
@@ -36,80 +36,16 @@ function membershipCard(u) {
 }
 
 function editProfile() {
-  const u = state.user;
-  const digits = (u.phone || '').replace(/\D/g, '').replace(/^63(?=9\d{9}$)/, '').replace(/^0/, '');
-  const m = openModal({
-    sheet: true,
-    label: 'Personal information',
-    content: () => html`<div class="sheet-head"><h2 class="h3">Personal information</h2><button type="button" class="icon-btn sm flat" data-close aria-label="Close">${icon('x', 18, 2.2)}</button></div>
-      <form class="stack stack-16" novalidate data-form>
-        <div class="field"><label class="label" for="p-name">Full name</label><input class="input" id="p-name" name="name" value="${u.name}" maxlength="80" autocomplete="name"></div>
-        <div class="field"><label class="label" for="p-phone">Mobile number</label><div class="input-group"><span class="prefix">+63</span><input class="input" id="p-phone" name="phone" type="tel" inputmode="tel" value="${digits}" maxlength="14" autocomplete="tel-national" placeholder="917 123 4567"></div><p class="help">For booking updates. Never shown to other players.</p></div>
-        <div class="field"><span class="label">Email</span><p class="body">${u.email}</p></div>
-        <button type="submit" class="btn btn-primary btn-lg btn-block">Save changes</button>
-      </form>`,
-    onOpen: (panel) => {
-      const form = $('[data-form]', panel);
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        clearFieldErrors(form);
-        const name = form.elements.namedItem('name').value.trim();
-        const d = form.elements.namedItem('phone').value.replace(/\D/g, '').replace(/^63(?=9\d{9}$)/, '').replace(/^0/, '');
-        const errors = {};
-        if (name.length < 2) errors.name = ['Enter your full name.'];
-        if (d && !/^9\d{9}$/.test(d)) errors.phone = ['Enter a 10-digit mobile number, like 917 123 4567.'];
-        if (Object.keys(errors).length) return showFieldErrors(form, errors);
-        const btn = form.querySelector('[type="submit"]');
-        setBusy(btn, true, 'Saving…');
-        try {
-          const res = await api.patch('/api/me', { name, phone: d ? `+63 ${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : '' });
-          state.user = res.user;
-          m.close();
-          toast('Profile updated');
-          profileView();
-        } catch (err) {
-          setBusy(btn, false);
-          if (!showFieldErrors(form, err.details)) toast(err.message, { type: 'error' });
-        }
-      });
+  openEditProfile(state.user, {
+    onSaved: (user) => {
+      state.user = user;
+      profileView();
     },
   });
 }
 
 function changePassword() {
-  const m = openModal({
-    sheet: true,
-    label: 'Change password',
-    content: () => html`<div class="sheet-head"><h2 class="h3">Change password</h2><button type="button" class="icon-btn sm flat" data-close aria-label="Close">${icon('x', 18, 2.2)}</button></div>
-      <form class="stack stack-16" novalidate data-form>
-        <div class="field"><label class="label" for="pw-cur">Current password</label><input class="input" id="pw-cur" name="currentPassword" type="password" autocomplete="current-password" maxlength="128"></div>
-        <div class="field"><label class="label" for="pw-new">New password</label><input class="input" id="pw-new" name="newPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128"><p class="help">At least 8 characters. You'll stay signed in here; other devices are signed out.</p></div>
-        <button type="submit" class="btn btn-primary btn-lg btn-block">Change password</button>
-      </form>`,
-    onOpen: (panel) => {
-      const form = $('[data-form]', panel);
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        clearFieldErrors(form);
-        const currentPassword = form.elements.namedItem('currentPassword').value;
-        const newPassword = form.elements.namedItem('newPassword').value;
-        if (!currentPassword) return showFieldErrors(form, { currentPassword: ['Enter your current password.'] });
-        if (newPassword.length < 8) return showFieldErrors(form, { newPassword: ['Use at least 8 characters.'] });
-        const btn = form.querySelector('[type="submit"]');
-        setBusy(btn, true, 'Saving…');
-        try {
-          // Both derivations run on this device; only their outputs are sent.
-          const [currentClientHash, credentials] = await Promise.all([passwordProof(state.user.email, currentPassword), newPasswordCredentials(newPassword)]);
-          await api.post('/api/me/password', { currentClientHash, newPassword: credentials });
-          m.close();
-          toast('Password changed', { sub: 'Other devices were signed out.' });
-        } catch (err) {
-          setBusy(btn, false);
-          if (!showFieldErrors(form, err.details)) toast(err.message, { type: 'error' });
-        }
-      });
-    },
-  });
+  openChangePassword(state.user.email);
 }
 
 function installHelp() {

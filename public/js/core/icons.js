@@ -68,6 +68,12 @@ const PATHS = {
   'zoom-out': 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-3.9-3.9M8 11h6',
   qr: 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2M14 18h2v2M18 18h2v2',
   install: 'M12 3.5V14M7.5 9.5L12 14l4.5-4.5M5 17.5h14M7 21h10',
+  banknote: 'M4 6h16a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 20 18H4a1.5 1.5 0 0 1-1.5-1.5v-9A1.5 1.5 0 0 1 4 6zM12 14.8a2.8 2.8 0 1 0 0-5.6 2.8 2.8 0 0 0 0 5.6zM6 9.5v.01M18 14.5v.01',
+  'trending-up': 'M3.5 17l6-6 4 4 7-7.5M15 7.5h5.5V13',
+  'trending-down': 'M3.5 7l6 6 4-4 7 7.5M15 16.5h5.5V11',
+  'arrow-up': 'M12 19V5M5.5 11.5L12 5l6.5 6.5',
+  'arrow-down': 'M12 5v14M5.5 12.5L12 19l6.5-6.5',
+  'sort': 'M8 9.5l4-4 4 4M8 14.5l4 4 4-4',
 };
 
 /** Returns trusted SVG markup for an icon. */

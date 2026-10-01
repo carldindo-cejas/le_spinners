@@ -1,7 +1,7 @@
 import { api } from '../../core/api.js';
 import { $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
-import { bytes, clock, dateLabel, monthDayYear, peso, rangeLabel, rangeLabelFull, shortDate } from './util.js';
+import { bookingTime, bytes, clock, dateLabel, monthDayYear, peso, shortDate } from './util.js';
 import {
   announce, countdownPanel, copyText, errorState, openModal, ringSvg, skeletonRows, startCountdown, statusPill, syncWarnLine, toast,
 } from '../../core/ui.js';
@@ -55,7 +55,7 @@ export async function heldView({ params }) {
       <div class="card-head card-pad"><span class="mono">${b.ref}</span>${statusPill(b.status, { small: true })}</div>
       <dl class="kv summary-card">
         <div><dt>${b.activity === 'table_tennis' ? 'Table' : 'Court'}</dt><dd>${b.activityLabel} · ${b.resource.name}</dd></div>
-        <div><dt>When</dt><dd>${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</dd></div>
+        <div><dt>When</dt><dd>${dateLabel(b.date)} · ${bookingTime(b)}</dd></div>
         <div><dt>To pay</dt><dd class="mono">${b.amountLabel}</dd></div>
         <div><dt>Hold ends</dt><dd class="amber-strong">${clock(b.holdExpiresAt)}</dd></div>
       </dl>
@@ -96,7 +96,7 @@ function confirmRelease(b, trigger) {
     label: 'Release this slot?',
     content: (close) => html`<span class="tile neutral">${icon('circle-slash', 24)}</span>
       <h2 class="dialog-title">Release this slot?</h2>
-      <p class="body"><b>${b.resource.name} · ${dateLabel(b.date)} · ${rangeLabel(b.start, b.end)}</b> opens for other players right away. Nothing was paid, so nothing is refunded.</p>
+      <p class="body"><b>${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</b> opens for other players right away. Nothing was paid, so nothing is refunded.</p>
       <div class="dialog-actions">
         <button type="button" class="btn btn-danger btn-block" data-act="confirm">Release slot</button>
         <button type="button" class="btn btn-secondary btn-block" data-close>Keep my hold</button>
@@ -202,9 +202,9 @@ export async function payView({ params, query }) {
     <section class="card amount-card">
       <div class="card-head"><span class="overline">Payment required</span>${statusPill(b.status, { small: true })}</div>
       <p class="amount mono">${b.amountLabel}</p>
-      <p class="small">${b.rate === 'member' ? 'Member rate' : 'Non-member rate'} · 1 hour</p>
+      <p class="small">${b.rate === 'member' ? 'Member rate' : 'Non-member rate'} · ${b.durationLabel}</p>
       <p class="strong">${b.activityLabel} · ${b.resource.name}</p>
-      <p class="small">${monthDayYear(b.date)} · ${rangeLabelFull(b.start, b.end)}</p>
+      <p class="small">${monthDayYear(b.date)} · ${bookingTime(b, { full: true })}</p>
     </section>
     <section class="section">
       <h2 class="h3">How to pay</h2>
@@ -487,7 +487,7 @@ export async function submittedView({ params }) {
     <section class="card card-pad stack stack-8">
       <div class="card-head"><span class="overline">Your booking is now</span>${statusPill(b.status, { small: true })}</div>
       <p class="h3">${b.activityLabel} · ${b.resource.name}</p>
-      <div class="row row-between"><span class="small">${shortDate(b.date)} · ${rangeLabelFull(b.start, b.end)}</span><span class="mono">${b.amountLabel}</span></div>
+      <div class="row row-between"><span class="small">${shortDate(b.date)} · ${bookingTime(b, { full: true })}</span><span class="mono">${b.amountLabel}</span></div>
     </section>
     <p class="banner violet compact">${icon('shield-clock', 18, 2.2)}<span>The ${state.facility.rules.holdMinutes}-minute timer has stopped. ${b.resource.name} stays reserved for you while staff verify.</span></p>
     <div class="stack stack-8">

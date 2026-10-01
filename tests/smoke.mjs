@@ -108,8 +108,9 @@ class Client {
     return deriveClientHash(password, s.data.salt, s.data.iterations);
   }
 
-  async login(email, password = PASSWORD) {
-    const r = await this.post('/api/auth/login', { email, clientHash: await this.proof(email, password) });
+  /** portal: 'user' (players), 'staff' or 'admin'. Each account signs in only through its own portal. */
+  async login(email, password = PASSWORD, portal = 'user') {
+    const r = await this.post(`/api/auth/${portal}/login`, { email, clientHash: await this.proof(email, password) });
     if (r.status !== 200) throw new Error(`login failed for ${email}: ${r.status} ${JSON.stringify(r.data)}`);
     this.user = r.data.user;
     return r;
@@ -138,9 +139,25 @@ function sql(statement) {
   return JSON.parse(r.stdout.slice(start));
 }
 
+/**
+ * Every request here comes from one IP, so sign-in-heavy sections would trip the
+ * real per-IP limits (30 sign-ins / 60 salt lookups per 15 minutes). Clear them first.
+ */
+function resetSignInLimits() {
+  sql(`DELETE FROM rate_limits WHERE key LIKE 'login:%' OR key LIKE 'salt:%';`);
+}
+
 /** Triggers the Worker's scheduled() handler (needs `wrangler dev --test-scheduled`). */
 async function runCron() {
-  const res = await fetch(`${BASE}/cdn-cgi/handler/scheduled?cron=*+*+*+*+*`);
+  const url = `${BASE}/cdn-cgi/handler/scheduled?cron=*+*+*+*+*`;
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (err) {
+    // Same stale keep-alive socket case as Client.req: it follows a blocking sql() call.
+    if (err?.cause?.code !== 'ECONNRESET') throw err;
+    res = await fetch(url);
+  }
   await res.arrayBuffer();
   await new Promise((r) => setTimeout(r, 400)); // the handler finishes in waitUntil
   return res.status;
@@ -262,7 +279,8 @@ const juan = new Client('juan');
 const pedro = new Client('pedro');
 const maria = new Client('maria');
 const kim = new Client('kim');
-const ana = new Client('ana');
+const ana = new Client('ana'); // admin
+const rhea = new Client('rhea'); // staff
 const anon = new Client('anon');
 
 section('Health');
@@ -378,8 +396,10 @@ section('Seeded accounts');
   await pedro.login('pedro.cruz@example.com');
   await maria.login('maria.santos@example.com');
   await kim.login('kim.aquino@example.com');
-  const a = await ana.login('ana.reyes@lespinners.example');
-  check('staff can sign in', a.data.user.role === 'admin');
+  const a = await ana.login('ana.reyes@lespinners.example', PASSWORD, 'admin');
+  check('admin can sign in at the admin portal', a.data.user.role === 'admin' && a.data.home === '/admin/');
+  const r = await rhea.login('rhea.lim@lespinners.example', PASSWORD, 'staff');
+  check('staff can sign in at the staff portal', r.data.user.role === 'staff' && r.data.home === '/staff/');
   check('session cookie is HttpOnly + SameSite=Lax', /HttpOnly/i.test(a.headers.get('set-cookie') ?? '') && /SameSite=Lax/i.test(a.headers.get('set-cookie') ?? ''));
   check('seeded admin signs in with the demo password', a.status === 200);
 
@@ -397,6 +417,97 @@ section('Seeded accounts');
   check('player on an admin endpoint → 403', playerAdmin.status === 403);
   const playerSettings = await juan.put('/api/admin/settings', { gcashNumber: '0917 000 0000' });
   check('player cannot change settings → 403', playerSettings.status === 403);
+}
+
+section('Role-based sign-in (each account only through its own portal)');
+{
+  resetSignInLimits();
+  const accounts = {
+    user: 'juan.delacruz@example.com',
+    staff: 'rhea.lim@lespinners.example',
+    admin: 'ana.reyes@lespinners.example',
+  };
+  for (const [role, email] of Object.entries(accounts)) {
+    for (const portal of ['user', 'staff', 'admin']) {
+      const c = new Client(`matrix-${role}-${portal}`);
+      const res = await c.post(`/api/auth/${portal}/login`, { email, clientHash: await c.proof(email) });
+      const cookie = res.headers.get('set-cookie') ?? '';
+      if (role === portal) {
+        check(`${role} account → ${portal} portal: allowed`, res.status === 200 && res.data.user.email === email && /ls_session=[^;]+/.test(cookie), res.data);
+      } else {
+        check(`${role} account → ${portal} portal: denied, no session`, res.status === 401 && res.data.error.code === 'INVALID_CREDENTIALS' && !/ls_session=[^;]+/.test(cookie), res.data);
+        const me = await c.get('/api/auth/session');
+        check('  …and the browser stays signed out', me.data.user === null);
+      }
+    }
+  }
+  // A wrong-portal attempt looks exactly like a wrong password.
+  const wrongPw = await anon.post('/api/auth/staff/login', { email: accounts.staff, clientHash: await anon.proof(accounts.staff, 'not-the-password') });
+  const wrongPortal = await anon.post('/api/auth/staff/login', { email: accounts.admin, clientHash: await anon.proof(accounts.admin) });
+  check('wrong portal and wrong password give the same status, code and message',
+    wrongPw.status === wrongPortal.status && wrongPw.data.error.code === wrongPortal.data.error.code && wrongPw.data.error.message === wrongPortal.data.error.message);
+  const legacy = await anon.post('/api/auth/login', { email: accounts.admin, clientHash: await anon.proof(accounts.admin) });
+  check('the original /api/auth/login is the player portal (admin denied)', legacy.status === 401);
+  const legacyPlayer = await new Client('legacy').post('/api/auth/login', { email: accounts.user, clientHash: await anon.proof(accounts.user) });
+  check('the original /api/auth/login still signs players in', legacyPlayer.status === 200);
+  const forged = await anon.post('/api/auth/user/login', { email: accounts.admin, clientHash: await anon.proof(accounts.admin), role: 'player' });
+  check('a role in the request body is ignored', forged.status === 401);
+
+  // A denied attempt never replaces the session already in the browser.
+  const keep = new Client('keep');
+  await keep.login(accounts.user);
+  const denied = await keep.post('/api/auth/admin/login', { email: accounts.staff, clientHash: await keep.proof(accounts.staff) });
+  const still = await keep.get('/api/auth/session');
+  check('denied sign-in keeps the existing player session', denied.status === 401 && still.data.user?.email === accounts.user, still.data);
+
+  const sess = await rhea.get('/api/auth/session');
+  check('session reports the role and its dashboard', sess.data.user?.role === 'staff' && sess.data.home === '/staff/', sess.data);
+}
+
+section('API authorization by role');
+{
+  const expect = async (name, client, method, path, status, json) => {
+    const res = await client.req(method, path, json !== undefined ? { json } : {});
+    check(`${name} → ${status}`, res.status === status, `${res.status} ${JSON.stringify(res.data).slice(0, 200)}`);
+    return res;
+  };
+  // No session
+  await expect('anonymous on /api/staff/summary', anon, 'GET', '/api/staff/summary', 401);
+  await expect('anonymous on /api/admin/summary', anon, 'GET', '/api/admin/summary', 401);
+  // Players
+  await expect('player on /api/staff/dashboard', juan, 'GET', '/api/staff/dashboard', 403);
+  await expect('player on /api/staff/bookings', juan, 'GET', '/api/staff/bookings', 403);
+  await expect('player approving through /api/staff', juan, 'POST', '/api/staff/bookings/b_maria/approve', 403, {});
+  await expect('player rejecting through /api/staff', juan, 'POST', '/api/staff/bookings/b_maria/reject', 403, { reason: 'Nope nope' });
+  await expect('player adding a court', juan, 'POST', '/api/staff/facilities', 403, { activity: 'pickleball', name: 'Hacker Court' });
+  // Staff: operations yes, admin namespace no
+  await expect('staff on /api/staff/dashboard', rhea, 'GET', '/api/staff/dashboard', 200);
+  await expect('staff on /api/staff/bookings', rhea, 'GET', '/api/staff/bookings', 200);
+  await expect('staff on /api/staff/rules', rhea, 'GET', '/api/staff/rules', 200);
+  await expect('staff on /api/admin/summary', rhea, 'GET', '/api/admin/summary', 403);
+  await expect('staff reading /api/admin/settings', rhea, 'GET', '/api/admin/settings', 403);
+  await expect('staff changing settings', rhea, 'PUT', '/api/admin/settings', 403, { gcashNumber: '0917 000 0000' });
+  await expect('staff reading the outbox', rhea, 'GET', '/api/admin/outbox', 403);
+  await expect('staff changing prices (admin endpoint)', rhea, 'PATCH', '/api/admin/resources/court-1', 403, { priceMember: 1 });
+  await expect('staff changing prices (staff endpoint)', rhea, 'PATCH', '/api/staff/facilities/court-1', 403, { priceMember: 1 });
+  await expect('staff on player booking endpoints', rhea, 'GET', '/api/bookings', 403);
+  await expect('staff creating a hold', rhea, 'POST', '/api/bookings', 403, { resourceId: 'court-1', date: localDate(4), start: 1080 });
+  await expect('staff on the player inbox', rhea, 'GET', '/api/notifications', 403);
+  const rules = await rhea.get('/api/staff/rules');
+  check('staff rules carry no alert recipients', !JSON.stringify(rules.data).includes('@') && typeof rules.data.alerts.emailRecipients === 'number', rules.data);
+  // Admin keeps everything
+  await expect('admin on /api/staff/summary', ana, 'GET', '/api/staff/summary', 200);
+  await expect('admin on /api/admin/summary', ana, 'GET', '/api/admin/summary', 200);
+  await expect('admin on /api/admin/settings', ana, 'GET', '/api/admin/settings', 200);
+  await expect('admin on player booking endpoints', ana, 'GET', '/api/bookings', 403);
+  // Shared: own profile, no self-promotion
+  await expect('staff reads own profile', rhea, 'GET', '/api/me', 200);
+  const promote = await rhea.req('PATCH', '/api/me', { json: { name: 'Rhea Lim', role: 'admin' } });
+  check('profile update ignores a role field', promote.status === 200 && promote.data.user.role === 'staff', promote.data);
+  const after = sql(`SELECT role FROM users WHERE email = 'rhea.lim@lespinners.example';`)[0].results[0];
+  check('staff role unchanged in the database', after.role === 'staff', after);
+  const forbiddenLogged = sql(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'forbidden_access';`)[0].results[0];
+  check('forbidden attempts are audited', forbiddenLogged.n > 0, forbiddenLogged);
 }
 
 section('Facility and availability (privacy)');
@@ -473,6 +584,88 @@ let juanBooking;
   const wins = results.filter((x) => x.status === 201);
   check('race: exactly one player wins the slot', wins.length === 1, results.map((x) => x.status));
   for (const [i, x] of results.entries()) if (x.status === 201) await racers[i].post(`/api/bookings/${x.data.booking.id}/release`, {});
+}
+
+section('Several times in one booking (gaps allowed, no limit)');
+{
+  const MD = localDate(12);
+  const openOn = async (client, activity, id) => {
+    const res = await client.get(`/api/availability?activity=${activity}&date=${MD}`);
+    return res.data.resources.find((x) => x.id === id).slots.filter((s) => s.state === 'available').map((s) => s.start);
+  };
+  const open = await openOn(pedro, 'pickleball', 'court-1');
+  check('Court 1 has at least 4 open slots that day', open.length >= 4, open);
+  const [o0, o1, o2, o3] = open;
+  const facility = await pedro.get('/api/facility');
+  check('no "how long" limit in the rules any more', facility.data.rules && !('maxSlots' in facility.data.rules), facility.data.rules);
+
+  const empty = await pedro.post('/api/bookings', { resourceId: 'court-1', date: MD, starts: [] });
+  check('no times picked → 422', empty.status === 422, empty.data);
+  const offGrid = await pedro.post('/api/bookings', { resourceId: 'court-1', date: MD, starts: [o0, o0 + 30] });
+  check('a time off the slot grid → 422 INVALID_SLOT', offGrid.status === 422 && offGrid.data.error.code === 'INVALID_SLOT', offGrid.data);
+
+  // Two slots back to back, then a gap, then one more.
+  const gap = await pedro.post('/api/bookings', { resourceId: 'court-1', date: MD, starts: [o3, o0, o1] });
+  const g = gap.data.booking;
+  check('booking with a gap → 201 TEMPORARY', gap.status === 201 && g?.status === 'TEMPORARY', gap.data);
+  check('back-to-back slots merge, the gap stays out', JSON.stringify(g?.segments) === JSON.stringify([{ start: o0, end: o1 + 60 }, { start: o3, end: o3 + 60 }]), g?.segments);
+  check('span covers first start to last end', g?.start === o0 && g?.end === o3 + 60, { start: g?.start, end: g?.end });
+  check('price is per slot (3 × ₱600)', g?.amountDue === 180000, g?.amountDue);
+  check('duration counts booked time only (3 hours)', g?.durationMin === 180 && g?.durationLabel === '3 hours', { min: g?.durationMin, label: g?.durationLabel });
+  check('time label lists both ranges', (g?.timeLabel ?? '').includes(', '), g?.timeLabel);
+  const pn = await pedro.get('/api/notifications');
+  check('player notice lists every time', pn.data.notifications.some((n) => n.type === 'hold_created' && n.body.includes(', ')), pn.data.notifications.map((n) => n.body));
+
+  const mv = await openOn(maria, 'pickleball', 'court-1');
+  check('others no longer see the booked slots as open', ![o0, o1, o3].some((s) => mv.includes(s)), mv);
+  check('the gap stays open for others', mv.includes(o2), mv);
+  const mday = await maria.get(`/api/availability?activity=pickleball&date=${MD}`);
+  const ms = mday.data.resources.find((x) => x.id === 'court-1').slots;
+  check('others see the booked slots "held"', [o0, o1, o3].every((s) => ms.find((x) => x.start === s)?.state === 'held'), ms);
+
+  const sched = await ana.get(`/api/admin/schedule?date=${MD}&activity=pickleball`);
+  const ss = sched.data.resources.find((x) => x.id === 'court-1').slots;
+  check('staff grid shows the booking on its slots only', [o0, o1, o3].every((s) => ss.find((x) => x.start === s)?.booking?.id === g.id) && !ss.find((x) => x.start === o2)?.booking, ss.map((x) => [x.start, x.booking?.id ?? null]));
+
+  // A closure inside the gap doesn't touch the booking; one on a booked slot does.
+  const inGap = await rhea.post('/api/staff/availability/closures', { date: MD, resourceId: 'court-1', start: o2, end: o2 + 60, reason: 'Net repair' });
+  check('closing only the gap → 201, no affected bookings', inGap.status === 201 && inGap.data.affected?.length === 0, inGap.data);
+  if (inGap.status === 201) {
+    const del = await rhea.req('DELETE', `/api/staff/availability/closures/${inGap.data.id}`, { json: {} });
+    check('gap closure removed again', del.status === 200, del.data);
+  }
+  const onSlot = await rhea.post('/api/staff/availability/closures', { date: MD, resourceId: 'court-1', start: o3, end: o3 + 60, reason: 'Net repair' });
+  check('closing a booked slot → 409 lists the booking', onSlot.status === 409 && onSlot.data.error.details?.affected?.some((x) => x.id === g.id), onSlot.data);
+  check('affected list shows every booked range', onSlot.data.error?.details?.affected?.find((x) => x.id === g.id)?.timeLabel?.includes(', '), onSlot.data.error?.details?.affected);
+
+  // The gap can be booked by someone else; the booked slots can't.
+  const inTheGap = await maria.post('/api/bookings', { resourceId: 'court-1', date: MD, starts: [o2] });
+  check('another player can book the gap → 201', inTheGap.status === 201, inTheGap.data);
+  if (inTheGap.status === 201) await maria.post(`/api/bookings/${inTheGap.data.booking.id}/release`, {});
+  const taken = await maria.post('/api/bookings', { resourceId: 'court-1', date: MD, starts: [o2, o3] });
+  check('picking a booked slot among others → 409 SLOT_TAKEN', taken.status === 409 && taken.data.error.code === 'SLOT_TAKEN', taken.data);
+  const alts = taken.data.error?.details?.alternatives ?? [];
+  check('alternatives are full picks with every time', alts.length > 0 && alts.every((a) => Array.isArray(a.starts) && a.starts.length >= 1), alts);
+  check('offers the times still open on Court 1', alts.some((a) => a.resourceId === 'court-1' && JSON.stringify(a.starts) === JSON.stringify([o2])), alts);
+  check('alternatives never include a taken slot', alts.every((a) => a.resourceId !== 'court-1' || !a.starts.some((s) => [o0, o1, o3].includes(s))), alts);
+
+  // No limit on how many: every open slot on another court in one booking.
+  const all = await openOn(maria, 'pickleball', 'court-2');
+  const big = await maria.post('/api/bookings', { resourceId: 'court-2', date: MD, starts: all });
+  check(`all ${all.length} open slots in one booking → 201`, big.status === 201 && big.data.booking?.durationMin === all.length * 60, big.data);
+  check('price × every slot', big.data.booking?.amountDue === all.length * 50000, big.data.booking?.amountDue);
+  if (big.status === 201) await maria.post(`/api/bookings/${big.data.booking.id}/release`, {});
+
+  // Older clients send start + slots (in a row).
+  const t = await openOn(juan, 'table_tennis', 'table-1');
+  const legacy = await juan.post('/api/bookings', { resourceId: 'table-1', date: MD, start: t[0], slots: 2 });
+  check('start + slots still books slots in a row', legacy.status === 201 && legacy.data.booking?.end === t[0] + 120 && legacy.data.booking?.segments?.length === 1, legacy.data);
+  if (legacy.status === 201) await juan.post(`/api/bookings/${legacy.data.booking.id}/release`, {});
+
+  const rel = await pedro.post(`/api/bookings/${g.id}/release`, {});
+  check('a booking with gaps can be released', rel.status === 200 && rel.data.booking.status === 'CANCELLED', rel.data);
+  const after = await openOn(maria, 'pickleball', 'court-1');
+  check('releasing frees every booked slot', [o0, o1, o3].every((s) => after.includes(s)), after);
 }
 
 section('Other players cannot see or touch this booking');
@@ -602,10 +795,15 @@ section('Staff verification');
   const noReason = await ana.post(`/api/admin/bookings/${juanBooking.id}/reject`, { reason: '' });
   check('reject without a reason → 422', noReason.status === 422 && noReason.data.error.details?.reason, noReason.data);
 
-  const ok = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, {});
+  const unchecked = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, {});
+  check('approve without the checklist → 422', unchecked.status === 422 && unchecked.data.error.details?.checklist, unchecked.data);
+  const halfChecked = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: false });
+  check('approve with the checklist unticked → 422', halfChecked.status === 422, halfChecked.data);
+  const ok = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true });
   check('approve → CONFIRMED', ok.status === 200 && ok.data.booking.status === 'CONFIRMED', ok.data);
   check('records who approved', ok.data.booking.confirmedBy === 'Ana Reyes');
-  const twice = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, {});
+  check('online booking is marked "Online"', ok.data.booking.bookedBy?.source === 'online' && ok.data.booking.bookedBy?.name === null, ok.data.booking.bookedBy);
+  const twice = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true });
   check('approving twice → 409 INVALID_STATUS', twice.status === 409 && twice.data.error.code === 'INVALID_STATUS');
 
   const jb = await juan.get(`/api/bookings/${juanBooking.id}`);
@@ -625,8 +823,9 @@ section('Reject, resubmit, reject and release');
   const id = hold.data.booking.id;
   const png = readFileSync(join(ROOT, 'db/seed-proofs/pedro.png'));
   await pedro.req('POST', `/api/bookings/${id}/proof`, { form: proofForm(pngFile('p.png', png), { amountPesos: '250' }) });
-  const rej = await ana.post(`/api/admin/bookings/${id}/reject`, { reason: 'Amount does not match the booking total.', keepHold: true });
-  check('reject with resubmit window → REJECTED', rej.status === 200 && rej.data.booking.status === 'REJECTED', rej.data);
+  const rej = await rhea.post(`/api/staff/bookings/${id}/reject`, { reason: 'Amount does not match the booking total.', keepHold: true });
+  check('staff reject with resubmit window → REJECTED', rej.status === 200 && rej.data.booking.status === 'REJECTED', rej.data);
+  check('the rejection is recorded with the staff member', rej.data.booking.rejectedBy === 'Rhea Lim' && rej.data.timeline.some((e) => e.type === 'rejected' && e.actor === 'Rhea Lim'), rej.data.booking);
   const left = rej.data.booking.holdExpiresAt - rej.data.now;
   check('player gets 10 minutes to resubmit', left > 9.5 * 60_000 && left <= 10 * 60_000, left);
   const mine = await pedro.get(`/api/bookings/${id}`);
@@ -641,6 +840,14 @@ section('Reject, resubmit, reject and release');
 
   const again = await pedro.req('POST', `/api/bookings/${id}/proof`, { form: proofForm(pngFile('p2.png', png), { amountPesos: '300' }) });
   check('resubmitted proof → PAYMENT_SUBMITTED', again.status === 201 && again.data.booking.status === 'PAYMENT_SUBMITTED', again.data);
+  const noReason = await rhea.post(`/api/staff/bookings/${id}/reject`, { reason: '' });
+  check('staff reject without a reason → 422', noReason.status === 422, noReason.data);
+  const stillPending = await pedro.get(`/api/bookings/${id}`);
+  check('…and the booking is still waiting for verification', stillPending.data.booking.status === 'PAYMENT_SUBMITTED');
+  const staffProof = await rhea.get(stillPending.data.proofs[0].url);
+  check('staff can view the payment screenshot', staffProof.status === 200);
+  const otherPlayer = await juan.get(stillPending.data.proofs[0].url);
+  check("another player can't view it", otherPlayer.status === 404);
   const rej2 = await ana.post(`/api/admin/bookings/${id}/reject`, { reason: 'Screenshot is not readable.', keepHold: false });
   check('reject and release → EXPIRED', rej2.data.booking.status === 'EXPIRED', rej2.data);
   const free = await maria.get(`/api/availability?activity=table_tennis&date=${D}`);
@@ -707,20 +914,204 @@ section('Expiry, warnings and cron');
   await pedro.post(`/api/bookings/${again.data.booking.id}/release`, {});
 }
 
-section('Cancellation');
+section('No cancellation once booked or paid');
 {
-  const late = sql(`SELECT id FROM bookings WHERE ref LIKE '%-909';`)[0].results[0].id;
-  const soon = new Date(Date.now() + TZ_MS + 2 * 3_600_000);
-  const date = soon.toISOString().slice(0, 10);
-  const start = soon.getUTCHours() * 60;
-  sql(`UPDATE bookings SET date = '${date}', start_min = ${start}, end_min = ${start + 60} WHERE id = '${late}';`);
-  const tooLate = await kim.post(`/api/bookings/${late}/cancel`, {});
-  check('cancel within 24 h → 422 CANCEL_WINDOW_CLOSED', tooLate.status === 422 && tooLate.data.error.code === 'CANCEL_WINDOW_CLOSED', tooLate.data);
+  const confirmed = await juan.post(`/api/bookings/${juanBooking.id}/cancel`, { reason: 'Rain plans changed' });
+  check('player cancelling a confirmed booking → 409 NOT_CANCELLABLE', confirmed.status === 409 && confirmed.data.error.code === 'NOT_CANCELLABLE', confirmed.data);
+  const kept = await juan.get(`/api/bookings/${juanBooking.id}`);
+  check('…the booking stays CONFIRMED and offers no cancel', kept.data.booking.status === 'CONFIRMED' && kept.data.booking.canCancel === false, kept.data.booking);
+  const staffConfirmed = await ana.post(`/api/admin/bookings/${juanBooking.id}/cancel`, { reason: 'Testing the policy' });
+  check('staff cancelling a confirmed booking → 409 NOT_CANCELLABLE', staffConfirmed.status === 409 && staffConfirmed.data.error.code === 'NOT_CANCELLABLE', staffConfirmed.data);
+  const pending = await rhea.post('/api/staff/bookings/b_maria/cancel', { reason: 'Testing the policy' });
+  check('staff cancelling a booking with submitted payment → 409', pending.status === 409 && pending.data.error.code === 'NOT_CANCELLABLE', pending.data);
+  const detail = await ana.get(`/api/admin/bookings/${juanBooking.id}`);
+  check('staff detail offers no cancel for a confirmed booking', detail.data.actions.canCancel === false, detail.data.actions);
+  // A booking cancelled after payment before this policy (legacy data) is still reported apart in Revenue.
+  sql(`UPDATE bookings SET status = 'CANCELLED', cancelled_at = ${Date.now()}, cancel_reason = 'Legacy cancellation' WHERE id = '${juanBooking.id}';`);
+}
 
-  const ok = await juan.post(`/api/bookings/${juanBooking.id}/cancel`, { reason: 'Rain plans changed' });
-  check('cancel more than 24 h ahead → CANCELLED', ok.status === 200 && ok.data.booking.status === 'CANCELLED', ok.data);
-  const staffNotes = await ana.get('/api/admin/notifications?filter=unresolved');
-  check('staff notified of the cancellation', staffNotes.data.notifications.some((x) => x.type === 'booking_cancelled' && x.bookingId === juanBooking.id));
+section('Revenue (admin only)');
+{
+  const expect = async (name, client, path, status) => {
+    const res = await client.get(path);
+    check(`${name} → ${status}`, res.status === status, `${res.status} ${JSON.stringify(res.data).slice(0, 200)}`);
+    return res;
+  };
+  await expect('anonymous on revenue summary', anon, '/api/admin/revenue/summary', 401);
+  await expect('player on revenue summary', juan, '/api/admin/revenue/summary', 403);
+  await expect('staff on revenue summary', rhea, '/api/admin/revenue/summary', 403);
+  await expect('staff on the ledger', rhea, '/api/admin/revenue/ledger', 403);
+  await expect('staff on the CSV export', rhea, '/api/admin/revenue/export', 403);
+  await expect('no revenue under /api/staff', rhea, '/api/staff/revenue/summary', 404);
+
+  // Facility-time boundaries, computed independently of the Worker.
+  const today = localDate();
+  const dayMs = (d) => Date.parse(`${d}T00:00:00Z`) - TZ_MS;
+  const shift = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+  const monday = shift(today, -((new Date(`${today}T00:00:00Z`).getUTCDay() + 6) % 7));
+  const starts = { day: today, week: monday, month: `${today.slice(0, 7)}-01`, year: `${today.slice(0, 4)}-01-01` };
+  const sqlSum = (from, to, statuses = "'CONFIRMED','COMPLETED'") =>
+    sql(`SELECT COALESCE(SUM(amount_due),0) AS amt, COUNT(*) AS n FROM bookings WHERE status IN (${statuses}) AND payment_method != 'none' AND confirmed_at >= ${from} AND confirmed_at < ${to};`)[0].results[0];
+
+  // Kim's seeded payment moves to 23:59 yesterday (facility time): yesterday, not today.
+  const kimRow = sql(`SELECT confirmed_at, amount_due FROM bookings WHERE id = 'b_kim';`)[0].results[0];
+  sql(`UPDATE bookings SET confirmed_at = ${dayMs(today) - 60_000} WHERE id = 'b_kim';`);
+  const s = await expect('admin on revenue summary', ana, '/api/admin/revenue/summary', 200);
+  const per = Object.fromEntries((s.data.periods ?? []).map((p) => [p.key, p]));
+  check('four periods: day, week, month, year', ['day', 'week', 'month', 'year'].every((k) => per[k]), Object.keys(per));
+  for (const [k, from] of Object.entries(starts)) {
+    const want = sqlSum(dayMs(from), Date.now() + 60_000);
+    check(`${k} total matches verified payments since ${from}`, per[k]?.collected === want.amt && per[k]?.payments === want.n, { got: per[k]?.collected, want });
+  }
+  check('a payment verified at 23:59 yesterday is not today', per.day.previous.full >= kimRow.amount_due && sqlSum(dayMs(today), Date.now() + 60_000).amt === per.day.collected, per.day);
+  const weekStartsMonday = per.week.from === monday;
+  check('weeks start on Monday', weekStartsMonday, per.week.from);
+  const pendingSql = sql(`SELECT COALESCE(SUM(amount_due),0) AS amt, COUNT(*) AS n FROM bookings WHERE status = 'PAYMENT_SUBMITTED';`)[0].results[0];
+  check('pending proofs are reported apart, never as revenue', s.data.pendingVerification.amount === pendingSql.amt && s.data.pendingVerification.count === pendingSql.n, s.data.pendingVerification);
+  check('no NaN or Infinity in the comparisons', !/NaN|Infinity/.test(JSON.stringify(s.data)));
+  check('a zero baseline gives no percentage', s.data.periods.every((p) => (p.previous.toDate === 0 ? p.change.pct === null : typeof p.change.pct === 'number')), s.data.periods.map((p) => p.change));
+  check('a legacy cancelled-after-payment booking is not collected revenue', s.data.periods.find((p) => p.key === 'year').cancelledAfterPayment.count >= 1);
+  sql(`UPDATE bookings SET confirmed_at = ${kimRow.confirmed_at} WHERE id = 'b_kim';`);
+
+  // Reject → resubmit → approve: one booking, one payment, counted once.
+  const before = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
+  const pv = await pedro.get(`/api/availability?activity=table_tennis&date=${D}`);
+  const slot = findSlot(pv.data, 'table-2');
+  const hold = await pedro.post('/api/bookings', { resourceId: 'table-2', date: D, start: slot.start });
+  const bid = hold.data.booking.id;
+  const png = readFileSync(join(ROOT, 'db/seed-proofs/pedro.png'));
+  await pedro.req('POST', `/api/bookings/${bid}/proof`, { form: proofForm(pngFile('a.png', png), { amountPesos: '1' }) });
+  const mid = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
+  check('a proof waiting for verification adds nothing', mid.collected === before.collected);
+  await ana.post(`/api/admin/bookings/${bid}/reject`, { reason: 'Amount does not match.', keepHold: true });
+  const rej = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
+  check('a rejected proof adds nothing', rej.collected === before.collected);
+  await pedro.req('POST', `/api/bookings/${bid}/proof`, { form: proofForm(pngFile('b.png', png), { amountPesos: '300' }) });
+  const approved = await ana.post(`/api/admin/bookings/${bid}/approve`, { checklist: true });
+  const after = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
+  check('two proofs, one approval → counted once', approved.status === 200 && after.collected === before.collected + hold.data.booking.amountDue && after.payments === before.payments + 1, { before: before.collected, after: after.collected, due: hold.data.booking.amountDue });
+
+  // Ledger: rows, statuses, search, totals that agree with the cards.
+  const ref = hold.data.booking.ref;
+  const found = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&q=${encodeURIComponent(ref)}`);
+  check('search by reference finds the booking once', found.status === 200 && found.data.total === 1 && found.data.rows[0]?.payStatus === 'paid' && found.data.rows[0]?.countsAsRevenue === true, found.data);
+  check('ledger row shows method, verifier and the latest GCash ref field', found.data.rows[0]?.methodLabel === 'GCash' && found.data.rows[0]?.verifiedBy === 'Ana Reyes', found.data.rows[0]);
+  check('ledger exposes no storage keys or proof links', !/r2_key|proofs\/|\/api\/files/.test(JSON.stringify(found.data)));
+  const day = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&size=50`);
+  check('ledger "collected" for today equals the daily card', day.data.totals.collected === after.collected && day.data.totals.collectedCount === after.payments, { ledger: day.data.totals, card: after.collected });
+  const statuses = new Set(day.data.rows.map((r) => r.payStatus));
+  check('ledger lists pending and cancelled-after-payment rows too', statuses.has('pending') && statuses.has('cancelled_paid'), [...statuses]);
+  check('…but only "paid" rows count as revenue', day.data.rows.every((r) => r.countsAsRevenue === (r.payStatus === 'paid')));
+  const byEmail = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&q=maria.santos`);
+  check('search by customer email', byEmail.data.rows.length >= 1 && byEmail.data.rows.every((r) => r.user.email === 'maria.santos@example.com'), byEmail.data.rows.map((r) => r.user.email));
+  const onlyPaid = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&status=paid&type=table_tennis`);
+  check('status + type filters combine', onlyPaid.data.rows.length >= 1 && onlyPaid.data.rows.every((r) => r.payStatus === 'paid' && r.activity === 'table_tennis'), onlyPaid.data.rows);
+  const sortedAmt = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&sort=amount&dir=asc&size=50`);
+  const amts = sortedAmt.data.rows.map((r) => r.amount);
+  check('sorting by amount (server side)', amts.every((a, i) => i === 0 || amts[i - 1] <= a), amts);
+  const p1 = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&size=10&page=1`);
+  check('default page size 10, with total and page count', p1.data.size === 10 && p1.data.pages === Math.max(1, Math.ceil(p1.data.total / 10)) && p1.data.rows.length === Math.min(10, p1.data.total), p1.data);
+  const past = await ana.get(`/api/admin/revenue/ledger?from=${today}&to=${today}&page=999`);
+  check('a page past the end serves the last page', past.status === 200 && past.data.page === past.data.pages, past.data.page);
+  for (const [name, qs] of [
+    ['page size 7', 'size=7'],
+    ['unknown sort column', 'sort=password_hash'],
+    ['unknown payment status', 'status=refunded'],
+    ['unknown payment method', 'method=cash'],
+    ['start after end', `from=${today}&to=${shift(today, -1)}`],
+    ['impossible date', 'from=2026-02-30&to=2026-03-01'],
+    ['page 0', 'page=0'],
+    ['SQL in the sort direction', 'dir=desc;DROP%20TABLE%20bookings'],
+  ]) {
+    const r = await ana.get(`/api/admin/revenue/ledger?${qs}`);
+    check(`ledger rejects ${name} → 422`, r.status === 422, `${r.status} ${JSON.stringify(r.data).slice(0, 160)}`);
+  }
+  const empty = await ana.get('/api/admin/revenue/ledger?from=2001-01-01&to=2001-01-31');
+  check('a period with no payments → empty ledger, zero totals', empty.status === 200 && empty.data.total === 0 && empty.data.rows.length === 0 && empty.data.totals.collected === 0);
+
+  // CSV export: same rows and accounting, formulas defused, audited.
+  sql(`UPDATE users SET name = '=HYPERLINK("x")' WHERE id = 'u_maria';`);
+  const csv = await ana.get(`/api/admin/revenue/export?from=${today}&to=${today}`);
+  const text = new TextDecoder().decode(csv.data);
+  const lines = text.replace(/^\uFEFF/, '').trim().split('\r\n');
+  check('export is a CSV download', csv.status === 200 && /text\/csv/.test(csv.headers.get('content-type') ?? '') && /attachment; filename="le-spinners-revenue-/.test(csv.headers.get('content-disposition') ?? ''));
+  check('export has the same rows as the ledger', lines.length === day.data.total + 1, { lines: lines.length, ledger: day.data.total });
+  check('export reports its parts (1,000 rows each) and a version', csv.headers.get('x-export-rows') === String(day.data.total) && csv.headers.get('x-export-parts') === String(Math.max(1, Math.ceil(day.data.total / 1000))) && /^\d+-\d+$/.test(csv.headers.get('x-export-version') ?? ''), Object.fromEntries(csv.headers));
+  const beyond = await ana.get(`/api/admin/revenue/export?from=${today}&to=${today}&part=2`);
+  check('asking for a part past the end → 422', beyond.status === 422, beyond.status);
+  const v1 = csv.headers.get('x-export-version');
+  sql(`UPDATE bookings SET updated_at = updated_at + 1 WHERE id = '${bid}';`);
+  const again = await ana.get(`/api/admin/revenue/export?from=${today}&to=${today}`);
+  check('the export version changes when a listed booking changes', again.headers.get('x-export-version') !== v1, [v1, again.headers.get('x-export-version')]);
+  const paidAmt = lines.slice(1).filter((l) => l.includes('"Yes"')).reduce((sum, l) => sum + Math.round(Number(/"([\d.]+)","GCash"/.exec(l)?.[1] ?? 0) * 100), 0);
+  check('export "collected" total matches the ledger', paidAmt === day.data.totals.collected, { csv: paidAmt, ledger: day.data.totals.collected });
+  check('spreadsheet formulas in names are defused', text.includes(`"'=HYPERLINK(""x"")"`) && !text.includes('",=HYPERLINK'));
+  sql(`UPDATE users SET name = 'Maria Santos' WHERE id = 'u_maria';`);
+  const exported = sql(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'revenue_exported';`)[0].results[0];
+  check('exports are written to the audit log', exported.n >= 1);
+  const staffCsv = await rhea.get(`/api/admin/revenue/export?from=${today}&to=${today}`);
+  check('staff cannot export → 403 (no CSV)', staffCsv.status === 403 && !(staffCsv.headers.get('content-type') ?? '').includes('csv'));
+
+  // Page shell
+  const page = await fetch(`${BASE}/revenue/?range=30d`, { headers: { Accept: 'text/html' } });
+  const pageHtml = await page.text();
+  check('/revenue/ serves the admin console shell', page.status === 200 && /Admin console/.test(pageHtml) && pageHtml.includes('/js/admin/app.js'));
+  check('/revenue/ sends a CSP + frame protection', (page.headers.get('content-security-policy') ?? '').includes("frame-ancestors 'none'"));
+  const rr = await fetch(`${BASE}/revenue`, { redirect: 'manual' });
+  check('/revenue redirects to /revenue/', rr.status === 301 && rr.headers.get('location')?.endsWith('/revenue/'));
+}
+
+section('Console bookings (personal bookings on site)');
+{
+  const CD = localDate(13);
+  const day = await ana.get(`/api/admin/schedule?date=${CD}&activity=table_tennis`);
+  const t = day.data.resources.find((x) => x.id === 'table-1').slots;
+  const i = t.findIndex((s, k) => s.state === 'available' && t[k + 1]?.state === 'available');
+  const start = t[i].start;
+
+  const asPlayer = await juan.post('/api/staff/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'none' });
+  check('player cannot make a console booking → 403', asPlayer.status === 403, asPlayer.status);
+  const badPay = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'gcash' });
+  check('console booking must be paid on site or free → 422', badPay.status === 422, badPay.data);
+
+  const paid = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, starts: [start, start + 60], rate: 'non_member', payment: 'on_site' });
+  const b = paid.data.booking;
+  check('admin books on site → 201 CONFIRMED', paid.status === 201 && b?.status === 'CONFIRMED', paid.data);
+  check('booked under the admin\'s own account', b?.user?.name === 'Ana Reyes');
+  check('records the author: Admin · Ana Reyes', b?.bookedBy?.source === 'admin' && b.bookedBy.label === 'Admin' && b.bookedBy.name === 'Ana Reyes', b?.bookedBy);
+  check('paid on site, 2 × ₱300', b?.paymentMethod === 'on_site' && b?.amountDue === 60000, { m: b?.paymentMethod, a: b?.amountDue });
+  check('no approval step: confirmed by the author', b?.confirmedBy === 'Ana Reyes' && paid.data.actions?.canApprove === false);
+  check('timeline says "Booked on site"', paid.data.timeline?.some((e) => e.type === 'console_booked' && e.actor === 'Ana Reyes'), paid.data.timeline);
+
+  const pv = await pedro.get(`/api/availability?activity=table_tennis&date=${CD}`);
+  const ps = pv.data.resources.find((x) => x.id === 'table-1').slots;
+  check('players see both hours as booked, with no name', ps.find((s) => s.start === start)?.state === 'booked' && ps.find((s) => s.start === start + 60)?.state === 'booked' && !/Ana/.test(JSON.stringify(pv.data)));
+  const clash = await pedro.post('/api/bookings', { resourceId: 'table-1', date: CD, start: start + 60 });
+  check('players cannot book over it → 409', clash.status === 409, clash.data);
+
+  const dayCard = async () => (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
+  const beforeFree = await dayCard();
+  const staffFree = await rhea.post('/api/staff/bookings', { resourceId: 'table-2', date: CD, start, rate: 'member', payment: 'none' });
+  const afterFree = await dayCard();
+  check('a free console booking is not counted as a payment on the revenue cards', afterFree.payments === beforeFree.payments && afterFree.collected === beforeFree.collected, { before: beforeFree, after: afterFree });
+  const fb = staffFree.data.booking;
+  check('staff book on site free of charge → 201', staffFree.status === 201 && fb?.status === 'CONFIRMED' && fb?.amountDue === 0 && fb?.paymentMethod === 'none', staffFree.data);
+  check('records the author: Staff · name', fb?.bookedBy?.source === 'staff' && Boolean(fb.bookedBy.name), fb?.bookedBy);
+  const sameTime = await rhea.post('/api/staff/bookings', { resourceId: 'table-3', date: CD, start, rate: 'member', payment: 'none' });
+  check('staff cannot double-book themselves → 422 OVERLAP_OWN', sameTime.status === 422 && sameTime.data.error.code === 'OVERLAP_OWN', sameTime.data);
+
+  const ledger = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${b.ref}`);
+  const row = ledger.data.rows?.find((r) => r.id === b.id);
+  check('paid-on-site booking is revenue, method "Paid on site"', row?.payStatus === 'paid' && row?.methodLabel === 'Paid on site' && row?.amount === 60000, ledger.data);
+  const free = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${fb.ref}`);
+  check('free console booking is not in the ledger', !free.data.rows?.some((r) => r.id === fb.id), free.data.rows);
+  const onSite = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&method=on_site`);
+  check('ledger filters by method', onSite.status === 200 && onSite.data.rows.every((r) => r.method === 'on_site') && onSite.data.rows.some((r) => r.id === b.id), onSite.data);
+
+  const list = await ana.get(`/api/admin/bookings?date=${CD}`);
+  check('bookings list carries the author', list.data.bookings.some((x) => x.id === b.id && x.bookedBy?.label === 'Admin'));
+  const cancel = await ana.post(`/api/admin/bookings/${b.id}/cancel`, { reason: 'Testing cancel' });
+  check('confirmed console booking follows the no-cancel rule → 409', cancel.status === 409, cancel.data);
 }
 
 section('Email / SMS queue and settings');
@@ -738,6 +1129,136 @@ section('Email / SMS queue and settings');
   check('player cannot read staff settings → 403', kimAdmin.status === 403);
 }
 
+section('Facility management (staff)');
+{
+  const D3 = localDate(3);
+  const juanC2 = 'b_juan_c2'; // confirmed: Court 2, in 3 days, 6–7 PM
+  const list = await rhea.get('/api/staff/facilities');
+  check('staff list courts and tables', list.status === 200 && list.data.resources.length >= 6, list.data);
+  const c2 = list.data.resources.find((x) => x.id === 'court-2');
+  check('Court 2 shows its upcoming bookings', c2?.upcomingBookings >= 1, c2);
+
+  // Add a court: prices copy from the same activity; staff can't set them.
+  const name = `Court Smoke ${run}`.slice(0, 38);
+  const priced = await rhea.post('/api/staff/facilities', { activity: 'pickleball', name, priceMember: 100, priceNonMember: 100 });
+  check('staff adding a court with prices → 403', priced.status === 403, priced.data);
+  const created = await rhea.post('/api/staff/facilities', { activity: 'pickleball', name });
+  check('staff add a court → 201, prices copied', created.status === 201 && created.data.resource.priceMember === 50000 && created.data.resource.priceNonMember === 60000, created.data);
+  const dup = await rhea.post('/api/staff/facilities', { activity: 'pickleball', name: name.toUpperCase() });
+  check('duplicate name → 409 NAME_TAKEN', dup.status === 409 && dup.data.error.code === 'NAME_TAKEN', dup.data);
+  const newId = created.data.resource?.id;
+  const renamed = await rhea.req('PATCH', `/api/staff/facilities/${newId}`, { json: { name: `${name} B` } });
+  check('staff rename a court', renamed.status === 200 && renamed.data.resource.name === `${name} B`, renamed.data);
+  const off = await rhea.req('PATCH', `/api/staff/facilities/${newId}`, { json: { status: 'disabled' } });
+  check('disabling a court with no bookings needs no confirmation', off.status === 200 && off.data.affected.length === 0, off.data);
+
+  // Maintenance on Court 2 affects Juan's confirmed booking.
+  const maint = { status: 'maintenance', maintenanceNote: 'Net repair', maintenanceUntil: localDate(5) };
+  const ask = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: maint });
+  const affected = ask.data.error?.details?.affected ?? [];
+  check('maintenance over a booking → 409 AFFECTS_BOOKINGS', ask.status === 409 && ask.data.error.code === 'AFFECTS_BOOKINGS', ask.data);
+  check('the affected list names the confirmed booking', affected.some((b) => b.id === juanC2 && b.status === 'CONFIRMED'), affected);
+  const unchanged = await rhea.get('/api/staff/facilities');
+  check('nothing changed before confirmation', unchanged.data.resources.find((x) => x.id === 'court-2').status === 'active');
+  const partial = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { ...maint, confirmAffected: ['b_someone_else'] } });
+  check('confirming the wrong bookings → still 409', partial.status === 409, partial.data);
+  const ok = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { ...maint, confirmAffected: affected.map((b) => b.id) } });
+  check('confirmed → maintenance applied', ok.status === 200 && ok.data.resource.status === 'maintenance', ok.data);
+  const kept = await juan.get(`/api/bookings/${juanC2}`);
+  check('the confirmed booking is kept, not cancelled', kept.data.booking.status === 'CONFIRMED', kept.data.booking);
+  const blocked = await pedro.get(`/api/availability?activity=pickleball&date=${D3}`);
+  check('players see Court 2 in maintenance', blocked.data.resources.find((x) => x.id === 'court-2')?.status === 'maintenance');
+  const holdBlocked = await pedro.post('/api/bookings', { resourceId: 'court-2', date: D3, start: 1020 });
+  check('no new holds on a court in maintenance → 422', holdBlocked.status === 422 && holdBlocked.data.error.code === 'MAINTENANCE', holdBlocked.data);
+  const pastUntil = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { maintenanceUntil: localDate(0) } });
+  check('back-on date must be after today → 422', pastUntil.status === 422, pastUntil.data);
+  const back = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { status: 'active' } });
+  check('ending maintenance needs no confirmation', back.status === 200 && back.data.resource.status === 'active', back.data);
+  const audited = sql(`SELECT detail FROM audit_log WHERE action = 'resource_updated' AND entity_id = 'court-2' ORDER BY id DESC LIMIT 2;`)[0].results;
+  check('the change is audited with the affected booking', audited.some((a) => (a.detail ?? '').includes('affected')), audited);
+
+  // Open play on Court 2: free for all, shown to players, never bookable.
+  const opAsk = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { status: 'open_play' } });
+  const opAffected = opAsk.data.error?.details?.affected ?? [];
+  check('open play over a booking → 409 AFFECTS_BOOKINGS', opAsk.status === 409 && opAffected.some((b) => b.id === juanC2), opAsk.data);
+  const opOk = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { status: 'open_play', confirmAffected: opAffected.map((b) => b.id) } });
+  check('confirmed → open play applied', opOk.status === 200 && opOk.data.resource.status === 'open_play', opOk.data);
+  check('open play is stored as an active court with the flag', sql(`SELECT status, open_play FROM resources WHERE id = 'court-2';`)[0].results[0]?.open_play === 1);
+  const opDay = await pedro.get(`/api/availability?activity=pickleball&date=${D3}`);
+  const opCourt = opDay.data.resources.find((x) => x.id === 'court-2');
+  check('players see Court 2 as open play', opCourt?.status === 'open_play' && opCourt.slots.every((s) => s.state === 'open_play' || s.state === 'past'), opCourt);
+  const opFacility = await pedro.get('/api/facility');
+  check('the facility list marks it open play', opFacility.data.resources.find((x) => x.id === 'court-2')?.status === 'open_play');
+  const opHold = await pedro.post('/api/bookings', { resourceId: 'court-2', date: D3, start: 1020 });
+  check('no holds on an open play court → 422 OPEN_PLAY', opHold.status === 422 && opHold.data.error.code === 'OPEN_PLAY', opHold.data);
+  const opKept = await juan.get(`/api/bookings/${juanC2}`);
+  check('the booking on the open play court is kept', opKept.data.booking.status === 'CONFIRMED');
+  const opEnd = await rhea.req('PATCH', '/api/staff/facilities/court-2', { json: { status: 'active' } });
+  check('ending open play needs no confirmation', opEnd.status === 200 && opEnd.data.resource.status === 'active', opEnd.data);
+  check('ending open play clears the flag', sql(`SELECT open_play FROM resources WHERE id = 'court-2';`)[0].results[0]?.open_play === 0);
+
+  // Closures
+  const avail = await rhea.get('/api/staff/availability');
+  check('staff read weekly hours and closures', avail.status === 200 && avail.data.hours.length === 7, avail.data);
+  const past = await rhea.post('/api/staff/availability/closures', { date: localDate(-1), reason: 'Too late' });
+  check('closure in the past → 422', past.status === 422, past.data);
+  const badRange = await rhea.post('/api/staff/availability/closures', { date: D3, start: 1080, end: 1020, reason: 'Backwards' });
+  check('closure ending before it starts → 422', badRange.status === 422, badRange.data);
+  const cl = { date: D3, resourceId: 'court-2', start: 1020, end: 1200, reason: 'Private event' };
+  const clAsk = await rhea.post('/api/staff/availability/closures', cl);
+  const clAffected = clAsk.data.error?.details?.affected ?? [];
+  check('closure over a booking → 409 AFFECTS_BOOKINGS', clAsk.status === 409 && clAffected.some((b) => b.id === juanC2), clAsk.data);
+  const clOk = await rhea.post('/api/staff/availability/closures', { ...cl, confirmAffected: clAffected.map((b) => b.id) });
+  check('confirmed closure → 201', clOk.status === 201 && clOk.data.affected.length >= 1, clOk.data);
+  const closedSlot = await pedro.get(`/api/availability?activity=pickleball&date=${D3}`);
+  check('players see the closed slot', closedSlot.data.resources.find((x) => x.id === 'court-2').slots.find((x) => x.start === 1020)?.state === 'closed');
+  const kept2 = await juan.get(`/api/bookings/${juanC2}`);
+  check('the booking under the closure is kept', kept2.data.booking.status === 'CONFIRMED');
+  const otherCourt = await rhea.post('/api/staff/availability/closures', { date: D3, resourceId: 'court-3', start: 1080, end: 1140, reason: 'Coaching clinic' });
+  check('closure with no bookings needs no confirmation', otherCourt.status === 201 && otherCourt.data.affected.length === 0, otherCourt.data);
+  for (const id of [clOk.data.id, otherCourt.data.id]) {
+    const del = await rhea.req('DELETE', `/api/staff/availability/closures/${id}`, { json: {} });
+    check('staff remove an upcoming closure', del.status === 200, del.data);
+  }
+
+  // Weekly hours: closing earlier on Juan's weekday affects his 6 PM booking.
+  const weekday = new Date(`${D3}T00:00:00Z`).getUTCDay();
+  const day = avail.data.hours[weekday];
+  const early = { isOpen: true, open: day.open, close: 1080 };
+  const hAsk = await rhea.put(`/api/staff/availability/hours/${weekday}`, early);
+  const hAffected = hAsk.data.error?.details?.affected ?? [];
+  check('earlier closing over a booking → 409 AFFECTS_BOOKINGS', hAsk.status === 409 && hAffected.some((b) => b.id === juanC2), hAsk.data);
+  const odd = await rhea.put(`/api/staff/availability/hours/${weekday}`, { isOpen: true, open: 965, close: 1320 });
+  check('hours off the half-hour → 422', odd.status === 422, odd.data);
+  const inverted = await rhea.put(`/api/staff/availability/hours/${weekday}`, { isOpen: true, open: 1320, close: 960 });
+  check('closing before opening → 422', inverted.status === 422, inverted.data);
+  const hOk = await rhea.put(`/api/staff/availability/hours/${weekday}`, { ...early, confirmAffected: hAffected.map((b) => b.id) });
+  check('confirmed hours change → 200', hOk.status === 200, hOk.data);
+  const restore = await rhea.put(`/api/staff/availability/hours/${weekday}`, { isOpen: day.isOpen, open: day.open, close: day.close });
+  check('hours restored', restore.status === 200, restore.data);
+  const kept3 = await juan.get(`/api/bookings/${juanC2}`);
+  check('the booking is still confirmed after the hours change', kept3.data.booking.status === 'CONFIRMED');
+}
+
+section('Logout and revoked sessions');
+{
+  resetSignInLimits();
+  const s = new Client('logout-staff');
+  await s.login('rhea.lim@lespinners.example', PASSWORD, 'staff');
+  const saved = s.cookie;
+  check('staff session works', (await s.get('/api/staff/badges')).status === 200);
+  const out = await s.post('/api/auth/logout', {});
+  check('logout → 200 and clears the cookie', out.status === 200 && s.cookie === '');
+  const replay = new Client('replay');
+  replay.cookie = saved;
+  check('the old cookie no longer works (401)', (await replay.get('/api/staff/badges')).status === 401);
+  check('…and the session reads as signed out', (await replay.get('/api/auth/session')).data.user === null);
+  const exp = new Client('expired-staff');
+  await exp.login('rhea.lim@lespinners.example', PASSWORD, 'staff');
+  sql(`UPDATE sessions SET expires_at = ${Date.now() - 1000} WHERE user_id = 'u_rhea' AND created_at = (SELECT MAX(created_at) FROM sessions WHERE user_id = 'u_rhea');`);
+  check('an expired staff session → 401', (await exp.get('/api/staff/badges')).status === 401);
+}
+
 section('Pages and headers');
 {
   const home = await fetch(`${BASE}/`, { headers: { 'Sec-Fetch-Mode': 'navigate', Accept: 'text/html' } });
@@ -745,8 +1266,31 @@ section('Pages and headers');
   check('player app sends a CSP', (home.headers.get('content-security-policy') ?? '').includes("script-src 'self'"), home.headers.get('content-security-policy'));
   const deep = await fetch(`${BASE}/admin/verify/some-id`, { headers: { Accept: 'text/html' } });
   const html = await deep.text();
-  check('staff deep link serves the staff shell', deep.status === 200 && /Staff/i.test(html));
-  check('staff shell sends a CSP + frame protection', (deep.headers.get('content-security-policy') ?? '').includes("frame-ancestors 'none'"));
+  check('admin deep link serves the admin shell', deep.status === 200 && /Admin console/.test(html));
+  check('admin shell sends a CSP + frame protection', (deep.headers.get('content-security-policy') ?? '').includes("frame-ancestors 'none'"));
+  const staffDeep = await fetch(`${BASE}/staff/verify/some-id`, { headers: { Accept: 'text/html' } });
+  const staffHtml = await staffDeep.text();
+  check('staff deep link serves the staff shell', staffDeep.status === 200 && /Staff console/.test(staffHtml) && staffHtml.includes('/staff/manifest.webmanifest'));
+  check('staff shell sends a CSP + frame protection', (staffDeep.headers.get('content-security-policy') ?? '').includes("frame-ancestors 'none'"));
+  const staffLogin = await fetch(`${BASE}/staff/login/`, { headers: { Accept: 'text/html' } });
+  check('/staff/login/ serves the staff shell', staffLogin.status === 200 && /Staff console/.test(await staffLogin.text()));
+  const adminLogin = await fetch(`${BASE}/admin/login/`, { headers: { Accept: 'text/html' } });
+  check('/admin/login/ serves the admin shell', adminLogin.status === 200 && /Admin console/.test(await adminLogin.text()));
+  const userLogin = await fetch(`${BASE}/login/`, { headers: { Accept: 'text/html', 'Sec-Fetch-Mode': 'navigate' } });
+  check('/login/ serves the player app', userLogin.status === 200 && (await userLogin.text()).includes('/js/player/app.js'));
+  for (const app of ['admin', 'staff']) {
+    const m = await fetch(`${BASE}/${app}/manifest.webmanifest`);
+    const body = await m.text();
+    let parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      /* served as HTML */
+    }
+    check(`/${app}/manifest.webmanifest is the JSON manifest, not the shell`, m.status === 200 && parsed?.start_url === `/${app}/`, body.slice(0, 80));
+  }
+  const staffRedirect = await fetch(`${BASE}/staff`, { redirect: 'manual' });
+  check('/staff redirects to /staff/', staffRedirect.status === 301 && staffRedirect.headers.get('location')?.endsWith('/staff/'));
   const redirect = await fetch(`${BASE}/admin`, { redirect: 'manual' });
   check('/admin redirects to /admin/', redirect.status === 301 && redirect.headers.get('location')?.endsWith('/admin/'));
   const missing = await anon.get('/api/nope');

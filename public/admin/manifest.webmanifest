@@ -1,7 +1,7 @@
 {
-  "name": "Le Spinners Staff Console",
-  "short_name": "LS Staff",
-  "description": "Verify GCash payments, manage bookings and answer players.",
+  "name": "Le Spinners Admin Console",
+  "short_name": "LS Admin",
+  "description": "Settings, GCash, prices and every staff operation for Le Spinners.",
   "id": "/admin/",
   "start_url": "/admin/",
   "scope": "/admin/",

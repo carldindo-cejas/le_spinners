@@ -4,6 +4,7 @@ import { icon } from '../../core/icons.js';
 import { relTime } from '../../core/format.js';
 import { errorState, poll, skeletonRows } from '../../core/ui.js';
 import { frame, navigate, refreshBadges, state } from '../shell.js';
+import { API, BASE, consoleLink, isAdminConsole } from '../console.js';
 
 const KIND = {
   proof_submitted: { label: 'Payment proof submitted', tile: 'violet', icon: 'shield-clock', action: 'Review payment', group: 'verification' },
@@ -21,29 +22,38 @@ const FILTERS = [
   { key: 'bookings', label: 'Bookings' },
 ];
 
-async function settings() {
-  if (!state.settings) {
+/**
+ * Alert setup for the side panel. Admins see the recipients (from Settings);
+ * staff see only how many are set up (from /rules).
+ */
+async function alertSetup() {
+  if (!state.alerts) {
     try {
-      const res = await api.get('/api/admin/settings');
-      state.settings = res.settings;
-      state.delivery = res.delivery;
+      if (isAdminConsole) {
+        const res = await api.get('/api/admin/settings');
+        const { staffAlertEmails: emails, staffAlertSms: sms } = res.settings;
+        state.alerts = { email: emails.length, sms: sms.length, emailTo: emails.join(', '), smsTo: sms.join(', '), delivery: res.delivery };
+      } else {
+        const res = await api.get(`${API}/rules`);
+        const n = (k, noun) => `${k} ${noun}${k === 1 ? '' : 's'} set up by an administrator`;
+        state.alerts = { email: res.alerts.emailRecipients, sms: res.alerts.smsRecipients, emailTo: n(res.alerts.emailRecipients, 'address'), smsTo: n(res.alerts.smsRecipients, 'number'), delivery: res.delivery };
+      }
     } catch {
-      state.settings = { staffAlertEmails: [], staffAlertSms: [] };
+      state.alerts = { email: 0, sms: 0, emailTo: '', smsTo: '', delivery: null };
     }
   }
-  return state.settings;
+  return state.alerts;
 }
 
-function channels(n, s) {
-  if (n.type === 'proof_submitted') {
-    return `In-app ✓ · Email ${s.staffAlertEmails?.length ? (state.delivery?.email === 'resend' ? '✓' : 'queued') : 'off'} · SMS ${s.staffAlertSms?.length ? 'queued' : 'off'}`;
-  }
-  if (n.type === 'booking_cancelled') return `In-app ✓ · Email ${s.staffAlertEmails?.length ? (state.delivery?.email === 'resend' ? '✓' : 'queued') : 'off'}`;
+function channels(n, a) {
+  const email = a.email ? (a.delivery?.email === 'resend' ? '✓' : 'queued') : 'off';
+  if (n.type === 'proof_submitted') return `In-app ✓ · Email ${email} · SMS ${a.sms ? 'queued' : 'off'}`;
+  if (n.type === 'booking_cancelled') return `In-app ✓ · Email ${email}`;
   return 'In-app ✓';
 }
 
 export async function notificationsView() {
-  const s = await settings();
+  const s = await alertSetup();
   let filter = 'unresolved';
   let data = null;
   const root = frame({
@@ -59,10 +69,10 @@ export async function notificationsView() {
       <aside class="stack stack-16">
         <section class="panel panel-body stack stack-12"><p class="eyebrow">How you're alerted</p>
           <div class="channel"><span class="tile sm blue">${icon('bell', 18)}</span><span><b>In-app</b><br><span class="small">Toasts, bell and sidebar badges for every event.</span></span><span class="pill green sm">On</span></div>
-          <div class="channel"><span class="tile sm blue">${icon('send', 18)}</span><span><b>Email</b><br><span class="small">${s.staffAlertEmails?.length ? s.staffAlertEmails.join(', ') : 'No recipients yet'}</span></span><span class="pill ${s.staffAlertEmails?.length ? 'green' : 'neutral'} sm">${s.staffAlertEmails?.length ? (state.delivery?.email === 'resend' ? 'On' : 'Queued') : 'Off'}</span></div>
-          <div class="channel"><span class="tile sm blue">${icon('phone', 18)}</span><span><b>SMS</b><br><span class="small">${s.staffAlertSms?.length ? s.staffAlertSms.join(', ') : 'No numbers yet'}</span></span><span class="pill amber sm">Queued</span></div>
-          <p class="small">SMS provider not connected yet. Messages are stored and will send once it's set up.${state.delivery?.email === 'resend' ? '' : ' Email sends once RESEND_API_KEY and EMAIL_FROM are set.'}</p>
-          <a class="link-sm" href="/admin/settings#alerts">Alert settings</a>
+          <div class="channel"><span class="tile sm blue">${icon('send', 18)}</span><span><b>Email</b><br><span class="small">${s.email ? s.emailTo : 'No recipients yet'}</span></span><span class="pill ${s.email ? 'green' : 'neutral'} sm">${s.email ? (s.delivery?.email === 'resend' ? 'On' : 'Queued') : 'Off'}</span></div>
+          <div class="channel"><span class="tile sm blue">${icon('phone', 18)}</span><span><b>SMS</b><br><span class="small">${s.sms ? s.smsTo : 'No numbers yet'}</span></span><span class="pill amber sm">Queued</span></div>
+          <p class="small">SMS provider not connected yet. Messages are stored and will send once it's set up.${s.delivery?.email === 'resend' ? '' : ' Email sends once RESEND_API_KEY and EMAIL_FROM are set.'}</p>
+          ${isAdminConsole ? html`<a class="link-sm" href="/admin/settings#alerts">Alert settings</a>` : html`<p class="small">Recipients are managed by an administrator.</p>`}
         </section>
       </aside>
     </div></div>`,
@@ -80,7 +90,7 @@ export async function notificationsView() {
     }
     render(list, items.map((n) => {
       const k = KIND[n.type] || { label: n.type.replace(/_/g, ' '), tile: 'blue', icon: 'bell', action: 'View booking' };
-      const href = n.type === 'proof_submitted' && n.bookingId ? `/admin/verify/${n.bookingId}` : safeUrl(n.link || '/admin/');
+      const href = n.type === 'proof_submitted' && n.bookingId ? `${BASE}/verify/${n.bookingId}` : safeUrl(consoleLink(n.link));
       return html`<article class="sn-row${n.read ? ' read' : ''}">
         <span class="tile ${k.tile}">${icon(k.icon, 20)}</span>
         <div class="stack stack-4">
@@ -103,13 +113,13 @@ export async function notificationsView() {
   });
   on(root, 'click', '[data-open]', (e, a) => {
     e.preventDefault();
-    api.post('/api/admin/notifications/read', { ids: [a.dataset.open] }).catch(() => {});
+    api.post(`${API}/notifications/read`, { ids: [a.dataset.open] }).catch(() => {});
     navigate(a.getAttribute('href'));
   });
   on(root, 'click', '[data-resolve]', async (_e, btn) => {
     btn.disabled = true;
     try {
-      await api.post(`/api/admin/notifications/${btn.dataset.resolve}/resolve`);
+      await api.post(`${API}/notifications/${btn.dataset.resolve}/resolve`);
       await load();
       refreshBadges();
     } catch {
@@ -117,7 +127,7 @@ export async function notificationsView() {
     }
   });
   const readAll = async () => {
-    await api.post('/api/admin/notifications/read', { all: true }).catch(() => {});
+    await api.post(`${API}/notifications/read`, { all: true }).catch(() => {});
     await load();
     refreshBadges();
   };
@@ -126,7 +136,7 @@ export async function notificationsView() {
 
   async function load() {
     try {
-      data = await api.get('/api/admin/notifications?filter=all');
+      data = await api.get(`${API}/notifications?filter=all`);
       paint();
     } catch (err) {
       if (!data) {

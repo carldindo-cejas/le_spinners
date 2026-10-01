@@ -69,8 +69,9 @@ wrangler(['d1', 'execute', 'DB', '--local', '--file=.wrangler/tmp/seed-proof-siz
 
 console.log(`
 Local database ready.
-  Start the app:   npm run dev   →  http://localhost:8787  (staff: /admin/)
+  Start the app:   npm run dev   →  http://localhost:8787
   Demo password:   demo-pass-2026
-  Player:          juan.delacruz@example.com (member)   pedro.cruz@example.com (non-member)
-  Staff (admin):   ana.reyes@lespinners.example
+  Player  (/login):        juan.delacruz@example.com (member)   pedro.cruz@example.com (non-member)
+  Staff   (/staff/login):  rhea.lim@lespinners.example
+  Admin   (/admin/login):  ana.reyes@lespinners.example
 `);

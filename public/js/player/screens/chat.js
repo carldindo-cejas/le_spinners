@@ -1,7 +1,7 @@
 import { api } from '../../core/api.js';
 import { $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
-import { rangeLabel, shortDate } from './util.js';
+import { bookingTime, shortDate } from './util.js';
 import { messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { refreshBadges, show } from '../shell.js';
@@ -34,7 +34,7 @@ export function chatView({ params }) {
     render(head, html`<div class="sub-head-inner">
       <a class="icon-btn flat" href="/bookings/${b.id}" data-back aria-label="Back to booking">${icon('chevron-left', 22, 2.2)}</a>
       <span class="avatar sm blue" aria-hidden="true">LS</span>
-      <div class="grow"><h1 class="t2">Booking chat</h1><div class="t1">${b.resource.name} · ${shortDate(b.date)} · ${rangeLabel(b.start, b.end)}</div></div>
+      <div class="grow"><h1 class="t2">Booking chat</h1><div class="t1">${b.resource.name} · ${shortDate(b.date)} · ${bookingTime(b)}</div></div>
       <a class="icon-btn flat" href="/bookings/${b.id}" aria-label="Booking details">${icon('info', 20)}</a>
     </div>
     <a class="chat-context" href="/bookings/${b.id}"><span class="mono">${b.ref}</span>${statusPill(b.status, { small: true })}</a>`);

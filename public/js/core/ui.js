@@ -35,14 +35,21 @@ export function toast(message, { type = 'success', sub = '', action = null, time
     toastHost.className = 'toast-host';
     document.body.append(toastHost);
   }
+  const ms = timeout ?? (type === 'error' ? 7000 : 4000);
+  // Toasts that stay until acted on can also be dismissed (✕, or a sideways swipe).
+  const dismissible = ms <= 0 || type === 'error';
   const iconName = { success: 'check', error: 'bang', info: 'shield-clock', warn: 'wifi-off' }[type] || 'check';
   const node = fragment(html`<div class="toast ${type}" role="${type === 'error' ? 'alert' : 'status'}">
     <span class="t-icon">${icon(iconName, 16, 2.6)}</span>
     <div class="t-body">${message}${sub ? html`<small>${sub}</small>` : ''}</div>
     ${action ? (action.href ? html`<a class="t-action" href="${action.href}">${action.label}</a>` : html`<button type="button" class="t-action">${action.label}</button>`) : ''}
+    ${dismissible ? html`<button type="button" class="t-close" aria-label="Dismiss">${icon('x', 16, 2.4)}</button>` : ''}
   </div>`).firstElementChild;
   toastHost.append(node);
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     node.classList.add('leaving');
     setTimeout(() => node.remove(), 220);
   };
@@ -51,9 +58,56 @@ export function toast(message, { type = 'success', sub = '', action = null, time
     if (action.onClick) action.onClick();
     close();
   });
-  const ms = timeout ?? (type === 'error' ? 7000 : 4000);
+  $('.t-close', node)?.addEventListener('click', close);
+  swipeToDismiss(node, close);
   if (ms > 0) setTimeout(close, ms);
   return close;
+}
+
+/** Drag a toast sideways (touch or pen) past a third of its width to dismiss it. */
+function swipeToDismiss(node, close) {
+  let startX = 0;
+  let startY = 0;
+  let dx = 0;
+  let id = null;
+  let swiping = false;
+  const reset = () => {
+    id = null;
+    swiping = false;
+    node.classList.remove('dragging');
+    node.style.removeProperty('--dx');
+  };
+  node.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || e.target.closest('button, a')) return;
+    id = e.pointerId;
+    startX = e.clientX;
+    startY = e.clientY;
+    dx = 0;
+  });
+  node.addEventListener('pointermove', (e) => {
+    if (e.pointerId !== id) return;
+    dx = e.clientX - startX;
+    if (!swiping) {
+      if (Math.abs(e.clientY - startY) > 12 && Math.abs(e.clientY - startY) > Math.abs(dx)) return reset();
+      if (Math.abs(dx) < 8) return;
+      swiping = true;
+      node.setPointerCapture(id);
+      node.classList.add('dragging');
+    }
+    node.style.setProperty('--dx', `${dx}px`);
+  });
+  const end = (e) => {
+    if (e.pointerId !== id) return;
+    const gone = swiping && Math.abs(dx) > Math.min(120, node.offsetWidth / 3);
+    if (gone) {
+      node.classList.add(dx > 0 ? 'swiped-right' : 'swiped-left');
+      node.classList.remove('dragging');
+      id = null;
+      close();
+    } else reset();
+  };
+  node.addEventListener('pointerup', end);
+  node.addEventListener('pointercancel', end);
 }
 
 // ── Dialogs and sheets ──────────────────────────────────────────────────────

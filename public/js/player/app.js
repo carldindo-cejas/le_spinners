@@ -14,7 +14,10 @@ import { chatView } from './screens/chat.js';
 import { notificationsView } from './screens/notifications.js';
 import { profileView } from './screens/profile.js';
 
-/** Views that need a signed-in player. */
+const HOME = { player: '/', staff: '/staff/', admin: '/admin/' };
+const isPlayer = (u) => Boolean(u) && u.role === 'player';
+
+/** Views that need a signed-in player. Staff and admin accounts can't book (the API refuses them too). */
 function guarded(view) {
   return (ctx) => {
     if (!state.user) {
@@ -22,18 +25,40 @@ function guarded(view) {
       state.router.navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
       return undefined;
     }
+    if (!isPlayer(state.user)) return wrongAccountView();
     return view(ctx);
   };
 }
 
+/** Sign-in pages: a signed-in account goes to its own dashboard instead. */
 function publicOnly(view) {
   return (ctx) => {
     if (state.user) {
-      state.router.navigate('/', { replace: true });
+      if (isPlayer(state.user)) state.router.navigate('/', { replace: true });
+      else location.replace(HOME[state.user.role] || '/');
       return undefined;
     }
     return view(ctx);
   };
+}
+
+function wrongAccountView() {
+  const u = state.user;
+  const consoleName = u.role === 'admin' ? 'admin console' : 'staff console';
+  const root = show(html`<div class="screen">
+    <div class="empty">
+      <span class="tile blue lg">${icon('lock', 26)}</span>
+      <p class="empty-title">You're signed in to the ${consoleName}</p>
+      <p class="empty-body">${u.email} is a ${u.role === 'admin' ? 'administrator' : 'staff'} account. Booking courts and tables needs a player account.</p>
+      <a class="btn btn-primary btn-md" href="${HOME[u.role]}" data-native>Open the ${consoleName}</a>
+      <button class="btn btn-secondary btn-md" type="button" data-act="switch">Sign out and use a player account</button>
+    </div>
+  </div>`);
+  root.querySelector('[data-act="switch"]').addEventListener('click', async () => {
+    await api.post('/api/auth/logout').catch(() => {});
+    state.user = null;
+    state.router.navigate('/login', { replace: true });
+  });
 }
 
 function notFoundView() {
@@ -126,7 +151,7 @@ async function boot() {
   watchConnection();
   try {
     const [me, facility] = await Promise.all([
-      api.get('/api/auth/me', { quiet401: true }),
+      api.get('/api/auth/session', { quiet401: true }),
       api.get('/api/facility'),
     ]);
     state.user = me.user;
@@ -140,8 +165,8 @@ async function boot() {
       return;
     }
   }
-  state.router = createRouter({ routes, notFound: notFoundView, ignore: ['/admin', '/api/'] });
-  if (state.user) startBadges();
+  state.router = createRouter({ routes, notFound: notFoundView, ignore: ['/admin', '/staff', '/api/'] });
+  if (isPlayer(state.user)) startBadges();
   await state.router.resolve();
   registerServiceWorker();
 }

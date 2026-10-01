@@ -2,8 +2,10 @@ import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppContext, AppEnv, SessionUser } from '../types';
 import { alternativesFor } from '../lib/availability';
-import { enforceRateLimit, requireUser } from '../lib/auth';
-import { BOOKING_SELECT, bookingDTO, cancelByPlayer, createHold, listEvents, releaseHold, type BookingJoin } from '../lib/bookings';
+import { enforceRateLimit, requirePlayer } from '../lib/auth';
+import {
+  BOOKING_SELECT, bookingDTO, cancelByPlayer, createHold, PICK_A_TIME, hasSlotPick, listEvents, releaseHold, requestedStarts, zSlotPick, type BookingJoin,
+} from '../lib/bookings';
 import { MESSAGE_MAX_CHARS, listMessages, markRead, playerUnreadChats, postMessage } from '../lib/chat';
 import { ApiError, badRequest, conflict, notFound, unprocessable } from '../lib/errors';
 import { listProofs, proofLink, submitProof } from '../lib/payments';
@@ -64,7 +66,7 @@ async function playerDetail(c: AppContext, b: BookingJoin, now: number) {
 }
 
 bookingRoutes.get('/', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const now = Date.now();
   const settings = await loadSettings(c.env.DB);
   const offset = offsetMinutes(c.env.TZ_OFFSET_MINUTES);
@@ -78,25 +80,23 @@ bookingRoutes.get('/', async (c) => {
   });
 });
 
-const holdSchema = z.object({
-  resourceId: zId,
-  date: zDate,
-  start: z.number().int().min(0).max(1439),
-});
+/** Any number of slots on one court or table on one day, gaps allowed; the price is per slot. */
+const holdSchema = z.object({ resourceId: zId, date: zDate, ...zSlotPick }).refine(hasSlotPick, PICK_A_TIME);
 
-/** Reserve & pay: creates a TEMPORARY booking that holds the slot. */
+/** Reserve & pay: creates a TEMPORARY booking that holds the chosen slots. */
 bookingRoutes.post('/', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const body = await jsonBody(c, holdSchema);
   await enforceRateLimit(c.env.DB, `hold:user:${user.id}`, 20, 60 * MINUTE);
   const settings = await loadSettings(c.env.DB);
+  const input = { resourceId: body.resourceId, date: body.date, starts: requestedStarts(body, settings.slotMinutes) };
   const now = Date.now();
   try {
-    const b = await createHold(c.env, settings, user, body, now);
+    const b = await createHold(c.env, settings, user, input, now);
     return c.json(await playerDetail(c, b, now), 201);
   } catch (err) {
     if (err instanceof ApiError && err.code === 'SLOT_TAKEN') {
-      const alternatives = await alternativesFor(c.env, settings, { userId: user.id, membership: user.membership }, body, now).catch(() => []);
+      const alternatives = await alternativesFor(c.env, settings, { userId: user.id, membership: user.membership }, input, now).catch(() => []);
       throw conflict('SLOT_TAKEN', err.message, { alternatives });
     }
     throw err;
@@ -104,7 +104,7 @@ bookingRoutes.post('/', async (c) => {
 });
 
 bookingRoutes.get('/:id', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   return c.json(await playerDetail(c, b, Date.now()));
 });
@@ -128,7 +128,7 @@ const zGcashRef = z
 
 /** Upload a GCash screenshot (multipart: file, gcashRef?, amountPesos?). */
 bookingRoutes.post('/:id/proof', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   await enforceRateLimit(c.env.DB, `proof:user:${user.id}`, 12, 10 * MINUTE);
   let form: FormData;
@@ -150,28 +150,24 @@ bookingRoutes.post('/:id/proof', async (c) => {
 
 /** Give up an unpaid hold so others can book the slot. */
 bookingRoutes.post('/:id/release', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   const now = Date.now();
   await releaseHold(c.env, user, b.id, now);
   return c.json(await playerDetail(c, await ownBooking(c, user), now));
 });
 
-/** Cancel a confirmed booking (only up to the cutoff before it starts). */
+/** Booked and paid bookings can't be cancelled; this always answers 409 NOT_CANCELLABLE. */
 bookingRoutes.post('/:id/cancel', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
-  const body = await jsonBody(c, z.object({ reason: z.string().trim().max(300).optional() }));
-  const settings = await loadSettings(c.env.DB);
-  const now = Date.now();
-  await cancelByPlayer(c.env, settings, user, b.id, body.reason || null, now);
-  return c.json(await playerDetail(c, await ownBooking(c, user), now));
+  return cancelByPlayer(c.env, user, b.id);
 });
 
 // ── Booking chat (player side) ─────────────────────────────────────────────
 
 bookingRoutes.get('/:id/messages', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   const now = Date.now();
   const messages = await listMessages(c.env, b.id, { side: 'player', userId: user.id }, now);
@@ -181,7 +177,7 @@ bookingRoutes.get('/:id/messages', async (c) => {
 });
 
 bookingRoutes.post('/:id/messages', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   const body = await jsonBody(
     c,

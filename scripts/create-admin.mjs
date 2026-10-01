@@ -4,7 +4,7 @@
  *
  *   npm run create-admin                       → local dev database
  *   npm run create-admin -- --remote           → your deployed D1 database
- *   npm run create-admin -- --role staff       → front-desk staff (can verify payments, can't change settings)
+ *   npm run create-admin -- --role staff       → front-desk staff: the staff console (/staff/), no settings or prices
  *
  * You'll be asked for the email, name, password and PASSWORD_PEPPER (hidden input;
  * the pepper is never accepted as a command-line argument). Like the browser, this
@@ -110,4 +110,4 @@ try {
   rmSync(join(root, rel), { force: true });
 }
 if (result.status !== 0) process.exit(result.status ?? 1);
-console.log(`\n${role === 'admin' ? 'Admin' : 'Staff'} account ready for ${email} (${remote ? 'deployed' : 'local'} database). Sign in at /admin/.`);
+console.log(`\n${role === 'admin' ? 'Admin' : 'Staff'} account ready for ${email} (${remote ? 'deployed' : 'local'} database). Sign in at /${role}/login.`);

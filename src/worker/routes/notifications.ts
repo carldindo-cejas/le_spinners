@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppEnv } from '../types';
-import { audit, isStaff, requireUser } from '../lib/auth';
+import { audit, isStaff, requirePlayer, requireUser } from '../lib/auth';
 import { playerUnreadChats } from '../lib/chat';
 import { ApiError, notFound } from '../lib/errors';
 import { lazyMaintenance } from '../lib/maintenance';
@@ -43,7 +43,7 @@ export const readSchema = z
 export const notificationRoutes = new Hono<AppEnv>();
 
 notificationRoutes.get('/', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const db = c.env.DB;
   const [list, count] = await db.batch([
     db
@@ -60,7 +60,7 @@ notificationRoutes.get('/', async (c) => {
 });
 
 notificationRoutes.post('/read', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const body = await jsonBody(c, readSchema);
   const now = Date.now();
   if (body.all) {
@@ -77,7 +77,7 @@ notificationRoutes.post('/read', async (c) => {
 
 /** Small payload the app polls: unread counts and running holds (for the countdown banner). */
 notificationRoutes.get('/badges', async (c) => {
-  const user = requireUser(c);
+  const user = requirePlayer(c);
   const now = Date.now();
   c.executionCtx.waitUntil(lazyMaintenance(c.env, now));
   const db = c.env.DB;

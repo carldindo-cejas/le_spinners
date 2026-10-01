@@ -187,6 +187,7 @@
 .legend i.today { border-radius: 3px; border: 1.5px solid var(--blue-600); }
 .legend i.bar-open { width: 14px; height: 8px; border-radius: 3px; background: var(--volt-400); }
 .legend i.bar-held { width: 14px; height: 8px; border-radius: 3px; background: var(--amber-200); }
+.legend i.bar-open-play { width: 14px; height: 8px; border-radius: 3px; background: var(--blue-50); border: 1px dashed var(--blue-600); }
 .legend i.bar-taken { width: 14px; height: 8px; border-radius: 3px; background: var(--taken); }
 
 .res-list { display: flex; flex-direction: column; gap: 12px; }
@@ -199,6 +200,7 @@
 .res-status { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--volt-800); margin-top: 2px; }
 .res-status.few { color: var(--amber-800); }
 .res-status.full, .res-status.maint { color: var(--neutral-text); }
+.res-status.open-play { color: var(--blue-700); }
 .res-note { font-size: 13.5px; color: var(--ink-700); }
 .minibar { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; }
 .minibar i { height: 10px; border-radius: 3px; background: var(--taken); display: block; }
@@ -209,6 +211,9 @@
 .res-card.maintenance { background: repeating-linear-gradient(135deg, var(--chalk-2) 0 8px, var(--chalk) 8px 16px); border-color: var(--chalk-3); }
 .res-card.maintenance .res-thumb, .res-card.full .res-thumb { background: #fff; }
 .res-card.full { background: var(--chalk); }
+/* Open play: free for all, shown but not bookable. Blue info tint + dashed edge + people icon. */
+.res-card.open-play { background: var(--blue-50); border: 1.5px dashed var(--blue-200); cursor: default; }
+.res-card.open-play .res-thumb { background: #fff; color: var(--blue-700); }
 .res-card[aria-disabled="true"] { cursor: pointer; }
 
 .slots { display: flex; flex-direction: column; gap: 8px; }
@@ -224,12 +229,14 @@
 .slot[aria-checked="true"]:hover { background: var(--blue-600); }
 .slot[aria-checked="true"] .s-state { color: #fff; }
 .slot .s-check { width: 24px; height: 24px; border-radius: 50%; background: var(--volt-400); color: var(--ink-900); display: grid; place-items: center; animation: ls-check-pop .18s ease-out; }
+.seg button:disabled { color: var(--ink-400); text-decoration: line-through; cursor: not-allowed; }
 .slot.locked { cursor: not-allowed; }
 .slot.locked .s-time { font-weight: 700; }
 .slot.held { background: var(--amber-50); border: 1px solid var(--amber-200); color: var(--amber-800); }
 .slot.booked { background: var(--booked); border: 1px solid var(--booked); color: var(--ink-700); }
 .slot.unavailable, .slot.closed, .slot.past { background: var(--chalk); border: 1.5px dashed var(--line-strong); color: var(--ink-500); }
 .slot.maintenance { background: repeating-linear-gradient(135deg, var(--chalk-2) 0 7px, var(--hatch-light) 7px 14px); border: 1px solid var(--chalk-3); color: var(--neutral-text); }
+.slot.open_play { background: var(--blue-50); border: 1.5px dashed var(--blue-200); color: var(--blue-800); }
 .slot.mine { background: var(--blue-50); border: 1.5px solid var(--blue-200); color: var(--blue-800); cursor: pointer; }
 .slot.mine:hover { border-color: var(--blue-600); }
 

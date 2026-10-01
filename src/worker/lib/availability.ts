@@ -1,5 +1,5 @@
 import type { Activity, Bindings, BookingStatus, Membership, ResourceRow } from '../types';
-import { OCCUPYING, closureCovers, underMaintenance, type ClosureRow, type HoursRow } from './bookings';
+import { OCCUPYING, closureCovers, isOpenPlay, underMaintenance, type ClosureRow, type HoursRow } from './bookings';
 import type { Settings } from './settings';
 import { addDays, dateLabel, dateParts, daysBetween, hoursLabel, localNow, minutesLabel, offsetMinutes, peso, weekdayOf, type LocalNow } from './time';
 
@@ -9,8 +9,9 @@ import { addDays, dateLabel, dateParts, daysBetween, hoursLabel, localNow, minut
  *   unavailable → payment proof is being verified
  *   booked      → confirmed
  *   mine        → the signed-in player's own booking
+ *   open_play   → the court or table is free for all: shown, never bookable
  */
-export type SlotState = 'available' | 'held' | 'unavailable' | 'booked' | 'maintenance' | 'closed' | 'past' | 'mine';
+export type SlotState = 'available' | 'held' | 'unavailable' | 'booked' | 'maintenance' | 'open_play' | 'closed' | 'past' | 'mine';
 
 type OccupyingRow = {
   id: string;
@@ -54,12 +55,13 @@ async function loadCtx(db: D1Database, activity: Activity | null, from: string, 
     resourceStmt,
     db.prepare('SELECT * FROM opening_hours'),
     db.prepare('SELECT * FROM closures WHERE date BETWEEN ? AND ?').bind(from, to),
+    // One row per booked stretch of time: a booking with gaps occupies only its own slots.
     db
       .prepare(
-        `SELECT b.id, b.ref, b.user_id, b.resource_id, b.date, b.start_min, b.end_min, b.status, b.hold_expires_at,
+        `SELECT b.id, b.ref, b.user_id, t.resource_id, t.date, t.start_min, t.end_min, b.status, b.hold_expires_at,
                 u.name AS user_name, u.membership AS user_membership
-           FROM bookings b JOIN users u ON u.id = b.user_id
-          WHERE b.date BETWEEN ?1 AND ?2 AND ${OCCUPYING('b', '?3')}`,
+           FROM booking_times t JOIN bookings b ON b.id = t.booking_id JOIN users u ON u.id = b.user_id
+          WHERE t.date BETWEEN ?1 AND ?2 AND ${OCCUPYING('b', '?3')}`,
       )
       .bind(from, to, now),
   ]);
@@ -95,6 +97,7 @@ function buildDay(ctx: Ctx, date: string, local: LocalNow, settings: Settings, v
 
   const resources = ctx.resources.map((r) => {
     const maintenance = underMaintenance(r, date);
+    const openPlay = isOpenPlay(r);
     const slots = starts.map((start) => {
       const end = start + settings.slotMinutes;
       const booking = dayBookings.find((b) => b.resource_id === r.id && b.start_min < end && b.end_min > start);
@@ -104,6 +107,7 @@ function buildDay(ctx: Ctx, date: string, local: LocalNow, settings: Settings, v
       else if (past) state = 'past';
       else if (dayClosures.some((c) => closureCovers(c, r.id, start, end))) state = 'closed';
       else if (maintenance) state = 'maintenance';
+      else if (openPlay) state = 'open_play';
       else if (booking) state = booking.user_id === (viewer.staff ? null : viewer.userId) ? 'mine' : occupiedState(booking.status);
       else state = inWindow ? 'available' : 'closed';
 
@@ -131,7 +135,7 @@ function buildDay(ctx: Ctx, date: string, local: LocalNow, settings: Settings, v
       id: r.id,
       name: r.name,
       activity: r.activity,
-      status: maintenance ? ('maintenance' as const) : ('active' as const),
+      status: maintenance ? ('maintenance' as const) : openPlay ? ('open_play' as const) : ('active' as const),
       maintenance: maintenance
         ? { note: r.maintenance_note, until: r.maintenance_until, untilLabel: r.maintenance_until ? dateLabel(r.maintenance_until) : null }
         : null,
@@ -208,36 +212,55 @@ export async function daysSummary(
       isToday: i === 0,
       load,
       available,
+      // Courts or tables in open play that day: nothing to book, but players can still look.
+      openPlay: day.open ? day.resources.filter((r) => r.status === 'open_play').length : 0,
       closedReason: day.closedReason,
     });
   }
   return { now, today: local.date, activity, days };
 }
 
-/** Nearby free slots to offer when the chosen one was just taken. */
+/**
+ * Open times to offer when the chosen ones were just taken.
+ *   one slot      → nearby free slots: the same time elsewhere first, then the closest times
+ *   several slots → the same times on another court or table where all are free, then the
+ *                   ones still free on the chosen court
+ * Each option is a full pick: `starts` (and `start`, the first of them).
+ */
 export async function alternativesFor(
   env: Bindings,
   settings: Settings,
   viewer: { userId: string; membership: Membership },
-  input: { resourceId: string; date: string; start: number },
+  input: { resourceId: string; date: string; starts: number[] },
   now = Date.now(),
 ) {
+  const wanted = [...new Set(input.starts)].sort((a, b) => a - b);
+  if (!wanted.length) return [];
   const resource = await env.DB.prepare('SELECT activity FROM resources WHERE id = ?').bind(input.resourceId).first<{ activity: Activity }>();
   if (!resource) return [];
   const day = await dayAvailability(env, settings, { activity: resource.activity, date: input.date }, { staff: false, ...viewer }, now);
-  const options: { resourceId: string; resourceName: string; date: string; start: number; label: string; score: number }[] = [];
-  for (const r of day.resources) {
-    for (const s of r.slots) {
-      if (s.state !== 'available') continue;
-      options.push({
-        resourceId: r.id,
-        resourceName: r.name,
-        date: input.date,
-        start: s.start,
-        label: `${r.name} · ${minutesLabel(s.start)}`,
-        // Same time elsewhere first, then the closest times on the same court or table.
-        score: Math.abs(s.start - input.start) * 2 + (r.id === input.resourceId ? 0 : 1),
-      });
+  type Option = { resourceId: string; resourceName: string; date: string; start: number; starts: number[]; label: string; score: number };
+  const options: Option[] = [];
+  const option = (r: { id: string; name: string }, starts: number[], label: string, score: number): Option =>
+    ({ resourceId: r.id, resourceName: r.name, date: input.date, start: starts[0]!, starts, label, score });
+
+  if (wanted.length === 1) {
+    const want = wanted[0]!;
+    for (const r of day.resources) {
+      for (const s of r.slots) {
+        if (s.state !== 'available') continue;
+        options.push(option(r, [s.start], `${r.name} · ${minutesLabel(s.start)}`, Math.abs(s.start - want) * 2 + (r.id === input.resourceId ? 0 : 1)));
+      }
+    }
+  } else {
+    for (const r of day.resources) {
+      const open = new Set(r.slots.filter((s) => s.state === 'available').map((s) => s.start));
+      if (r.id !== input.resourceId) {
+        if (wanted.every((s) => open.has(s))) options.push(option(r, wanted, `${r.name} · same times`, 0));
+      } else {
+        const still = wanted.filter((s) => open.has(s));
+        if (still.length) options.push(option(r, still, `${r.name} · the ${still.length} times still open`, 1));
+      }
     }
   }
   options.sort((a, b) => a.score - b.score || a.start - b.start);

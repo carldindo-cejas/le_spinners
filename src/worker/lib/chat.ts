@@ -1,5 +1,5 @@
 import type { Bindings, SessionUser } from '../types';
-import type { BookingJoin } from './bookings';
+import { SEGMENTS_SQL, type BookingJoin } from './bookings';
 import { newId } from './crypto';
 import { resolveStaffStmt } from './notify';
 import { proofLink } from './payments';
@@ -200,6 +200,7 @@ type ConversationRow = {
   date: string;
   start_min: number;
   end_min: number;
+  segments_json: string | null;
   resource_name: string;
   activity: string;
   user_name: string;
@@ -214,7 +215,7 @@ type ConversationRow = {
 export async function staffConversations(db: D1Database) {
   const { results } = await db
     .prepare(
-      `SELECT b.id, b.ref, b.status, b.hold_expires_at, b.date, b.start_min, b.end_min,
+      `SELECT b.id, b.ref, b.status, b.hold_expires_at, b.date, b.start_min, b.end_min, ${SEGMENTS_SQL('b')},
               r.name AS resource_name, r.activity, u.name AS user_name,
               lm.body AS last_body, lm.kind AS last_kind, lm.sender_role AS last_sender, lm.created_at AS last_at,
               (SELECT COUNT(*) FROM messages x

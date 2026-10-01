@@ -7,7 +7,7 @@ import { navigate, show, startBadges, state } from '../shell.js';
 
 function safeNext(query) {
   const next = query.get('next') || '/';
-  if (!next.startsWith('/') || next.startsWith('//') || next.startsWith('/admin') || next.startsWith('/login') || next.startsWith('/register')) return '/';
+  if (!next.startsWith('/') || next.startsWith('//') || next.startsWith('/admin') || next.startsWith('/staff') || next.startsWith('/login') || next.startsWith('/register')) return '/';
   return next;
 }
 
@@ -68,6 +68,7 @@ export function loginView({ query }) {
       <p class="or-divider">New to Le Spinners?</p>
       <a class="btn btn-secondary btn-block" href="/register${next !== '/' ? `?next=${encodeURIComponent(next)}` : ''}">Create an account</a>
       <p class="meta center">Members and non-members use the same app. Your membership shows on your profile once staff confirm it.</p>
+      <p class="meta center">Le Spinners team? <a href="/staff/login" data-native>Staff sign in</a> · <a href="/admin/login" data-native>Admin sign in</a></p>
     </div>
   </div>`);
   wirePasswordToggles(root);
@@ -88,7 +89,8 @@ export function loginView({ query }) {
     setBusy(btn, true, 'Logging in…');
     try {
       const clientHash = await passwordProof(email, password);
-      const res = await api.post('/api/auth/login', { email, clientHash, remember: data.get('remember') === 'on' }, { quiet401: true });
+      // Player accounts only: staff and admin accounts get the same error as a wrong password.
+      const res = await api.post('/api/auth/user/login', { email, clientHash, remember: data.get('remember') === 'on' }, { quiet401: true });
       await afterSignIn(res.user, next);
     } catch (err) {
       setBusy(btn, false);

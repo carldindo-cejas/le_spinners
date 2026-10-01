@@ -51,6 +51,25 @@ Recreational Hub PWA. The UI follows the design canvas (tokens, statuses, screen
 - Each booking has one private conversation between its player and staff.
 - Players get in-app notifications for their bookings; staff get a shared
   notification center with unresolved counts.
+- A staff toast that stays until acted on can be dismissed with its ✕ button or,
+  on touch screens, by swiping it sideways.
+
+**Revenue reporting (admins only, `/revenue/`)**
+
+- The system shall count a booking's `amount_due` as collected revenue only when
+  staff have verified its payment (`confirmed_at` set) and the booking is still
+  `CONFIRMED` or `COMPLETED`, dated by `confirmed_at` in facility time.
+- The system shall never count pending proofs (`PAYMENT_SUBMITTED`), rejected
+  proofs, holds, or expired or released bookings as revenue. Each booking is one
+  ledger row, so resubmitted proofs can't double count.
+- When a verified booking is cancelled, the system shall report it separately as
+  "cancelled after payment" and leave it out of collected revenue: refunds happen
+  outside the app and aren't recorded, so whether the money was returned is unknown.
+- The summary shall show today, this week (Monday–Sunday), this month and this year,
+  each compared with the previous period up to the same point, and no percentage when
+  that baseline is zero.
+- The booking ledger, its totals and the CSV export shall use the same filters,
+  sort and accounting, paginated and filtered in D1. Staff and players get 403.
 
 ## Architecture
 
@@ -58,7 +77,7 @@ One Cloudflare Worker serves both the static PWA and the API.
 
 | Layer | Choice |
 |---|---|
-| Static files | Workers static assets from `public/` (player shell at `/`, staff shell at `/admin/`) |
+| Static files | Workers static assets from `public/` (player shell at `/`, staff console shell at `/staff/`, admin console shell at `/admin/` and `/revenue/`) |
 | API | Hono (TypeScript) under `/api/*` |
 | Database | D1 (SQLite), migrations in `migrations/` |
 | Files | Private R2 bucket `PROOFS` (payment screenshots, GCash QR) |
@@ -119,14 +138,19 @@ Availability responses never include names, user ids, amounts or proofs.
   (600 000 iterations, 16-byte random salt) and sends the 32-byte `clientHash`. The Worker
   stores `HMAC-SHA256(PASSWORD_PEPPER, clientHash)` plus the salt, iterations and scheme.
   Sign-in is `POST /api/auth/salt` (a deterministic fake salt for unknown emails), then
-  `POST /api/auth/login`. Password change verifies the current clientHash and requires a
+  `POST /api/auth/{user,staff,admin}/login` (`/api/auth/login` is the player one). The
+  account's role must match the endpoint; otherwise it gets the same 401 as a wrong password
+  and no session is created. Password change verifies the current clientHash and requires a
   new salt. Sessions are random
   256-bit tokens; only their SHA-256 is stored. The cookie is `HttpOnly; Secure;
   SameSite=Lax`, 30-day sliding expiry.
 - **CSRF**: SameSite=Lax plus an `Origin` check on every non-GET request.
-- **Authorization**: every booking, proof, message and notification query is
-  scoped to the signed-in user unless the role is `staff` or `admin`. Admin
-  routes sit behind `requireStaff`; settings writes need `admin`.
+- **Authorization**: roles are `player`, `staff` and `admin` (membership is separate and
+  never grants access). Player routes (`requirePlayer`) are scoped to the signed-in
+  player's own rows. Operations live in one router served at `/api/staff/*` (staff and
+  admins) and `/api/admin/*` (admins only), each behind a namespace guard; settings,
+  prices, the outbox and revenue (`/api/admin/revenue/*`) are admin-only. Wrong-role
+  requests get 403 and are audited.
 - **Validation**: zod schemas on every body and query; the client validates too
   but is never trusted.
 - **Uploads**: type checked by magic bytes (not the file name), 10 MB cap. The
@@ -140,8 +164,9 @@ Availability responses never include names, user ids, amounts or proofs.
 - **Headers**: CSP (`script-src 'self'`), `X-Content-Type-Options`,
   `Referrer-Policy`, `frame-ancestors 'none'`, `no-store` on API responses.
 - **Rate limits**: sign-in and registration per IP and per email.
-- **Audit**: sign-ins, failed sign-ins, approvals, rejections, cancellations and
-  settings changes go to `audit_log` / `booking_events` with actor and time.
+- **Audit**: sign-ins, failed sign-ins, approvals, rejections, cancellations,
+  settings changes and revenue CSV exports go to `audit_log` / `booking_events`
+  with actor and time.
 - **Secrets**: `FILE_SIGNING_SECRET` via `wrangler secret put`; nothing secret is
   committed.
 
