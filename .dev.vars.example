@@ -1,0 +1,18 @@
+# Copy to .dev.vars for `npm run dev`. Never commit .dev.vars.
+# Used to sign short-lived links to payment screenshots. Any long random string.
+FILE_SIGNING_SECRET=change-me-to-a-long-random-string
+
+# HMAC key for password hashes: HMAC-SHA256(PASSWORD_PEPPER, clientHash).
+# DEVELOPMENT VALUE ONLY. It is committed on purpose so db/seed.dev.sql (demo accounts)
+# works out of the box; regenerate the seed with: npm run db:seed:generate
+# The Worker refuses any "dev-only-" pepper outside localhost. Production uses a
+# different random value set with: npx wrangler secret put PASSWORD_PEPPER
+PASSWORD_PEPPER=dev-only-PC7lWBGtJ1mbnsurMV_RX2-29gGyBiMn
+
+# Optional: Resend API key to actually send emails. Without it, emails and SMS
+# stay in the `outbox` table with status "queued".
+# RESEND_API_KEY=
+# EMAIL_FROM=Le Spinners <bookings@your-domain.ph>
+
+# Local origin for email links (overrides the deployed value in wrangler.jsonc).
+APP_ORIGIN=http://localhost:8787

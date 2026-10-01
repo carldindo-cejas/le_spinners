@@ -1,0 +1,32 @@
+{
+  "name": "le-spinners",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Le Spinners Recreational Hub — court and table booking PWA on Cloudflare Workers, Hono, D1 and R2",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:test": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "db:seed:local": "wrangler d1 execute DB --local --file=db/seed.dev.sql",
+    "db:reset:local": "node scripts/reset-local-db.mjs",
+    "create-admin": "node scripts/create-admin.mjs",
+    "test:smoke": "node tests/smoke.mjs",
+    "db:seed:generate": "node scripts/generate-seed-users.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.13.11",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.143.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

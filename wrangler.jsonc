@@ -1,0 +1,51 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "le-spinners",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+
+  // The PWA lives in public/. The Worker runs first for the API and for the
+  // staff console so it can add security headers and serve /admin/index.html
+  // for deep links like /admin/verify/abc. Everything else falls back to the
+  // player shell (/index.html).
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/admin", "/admin/*"]
+  },
+
+  // Create with: npx wrangler d1 create le-spinners  → paste the id below.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "le-spinners",
+      "database_id": "359085b7-5fbe-4d85-9db8-7ab2dc39ee57",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Private bucket for payment screenshots and the GCash QR image.
+  // Create with: npx wrangler r2 bucket create le-spinners-proofs
+  "r2_buckets": [
+    { "binding": "PROOFS", "bucket_name": "le-spinners-proofs" }
+  ],
+
+  // Every minute: expire unpaid holds, send 2-minute warnings, close rejected
+  // resubmit windows, mark finished bookings COMPLETED, flush the email/SMS outbox.
+  "triggers": { "crons": ["* * * * *"] },
+
+  "vars": {
+    // Minutes east of UTC for the facility (Asia/Manila = 480).
+    "TZ_OFFSET_MINUTES": "480",
+    // Public origin used in email links, e.g. https://book.lespinners.ph (no trailing slash).
+    "APP_ORIGIN": "https://le-spinners.cejascarldindo.workers.dev"
+  }
+
+  // Secrets (never committed):
+  //   npx wrangler secret put FILE_SIGNING_SECRET   (random 32+ characters)
+  //   npx wrangler secret put PASSWORD_PEPPER       (random 32+ characters; keep a copy, never the dev value)
+  //   npx wrangler secret put RESEND_API_KEY        (optional, sends staff/player email)
+  // For local dev put them in .dev.vars (see .dev.vars.example).
+}
