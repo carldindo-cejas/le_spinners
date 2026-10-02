@@ -1240,6 +1240,349 @@ section('Facility management (staff)');
   check('the booking is still confirmed after the hours change', kept3.data.booking.status === 'CONFIRMED');
 }
 
+// ── Disruptions: operator cancellations and booking credits (REBOOKING.md) ──
+
+const startsOpen = async (client, activity, date, resourceId) => {
+  const res = await client.get(`/api/availability?activity=${activity}&date=${date}`);
+  return res.data.resources.find((x) => x.id === resourceId).slots.filter((s) => s.state === 'available').map((s) => s.start);
+};
+const PAY_PNG = readFileSync(join(ROOT, 'db/seed-proofs/juan.png'));
+async function payAndConfirm(player, booking) {
+  const up = await player.req('POST', `/api/bookings/${booking.id}/proof`, { form: proofForm(pngFile('pay.png', PAY_PNG), { amountPesos: (booking.amountDue / 100).toFixed(2) }) });
+  if (up.status !== 201) throw new Error(`proof upload failed: ${up.status} ${JSON.stringify(up.data)}`);
+  const ok = await ana.post(`/api/admin/bookings/${booking.id}/approve`, { checklist: true });
+  if (ok.status !== 200) throw new Error(`approve failed: ${ok.status} ${JSON.stringify(ok.data)}`);
+  return ok.data;
+}
+async function confirmedBooking(player, resourceId, date, starts) {
+  const hold = await player.post('/api/bookings', { resourceId, date, starts });
+  if (hold.status !== 201) throw new Error(`hold failed: ${hold.status} ${JSON.stringify(hold.data)}`);
+  await payAndConfirm(player, hold.data.booking);
+  return (await player.get(`/api/bookings/${hold.data.booking.id}`)).data.booking;
+}
+let keyN = 0;
+const newKey = () => `smoke-${run}-${++keyN}`;
+const applyPreview = (client, p, ns = 'staff', key = newKey()) =>
+  client.req('POST', `/api/${ns}/disruptions`, { json: { ...p.input, previewToken: p.previewToken }, headers: { 'Idempotency-Key': key } });
+const resetBookingLimits = () => sql(`DELETE FROM rate_limits WHERE key LIKE 'proof:%' OR key LIKE 'hold:%';`);
+
+section('Cancel & credit: one booking');
+let juanCredit;
+let cancelledRef;
+{
+  resetBookingLimits();
+  const DA = localDate(8);
+  const open = await startsOpen(juan, 'pickleball', DA, 'court-1');
+  const b = await confirmedBooking(juan, 'court-1', DA, [open[0]]);
+  check('setup: Juan has a confirmed ₱500 booking', b.status === 'CONFIRMED' && b.amountDue === 50000, b);
+  const body = { scope: { kind: 'bookings', bookingIds: [b.id] }, category: 'equipment_failure', reason: 'Net post broke' };
+
+  // Customers can't cancel, and can't reach the operator tools either.
+  const asPlayer = await juan.post('/api/staff/disruptions/preview', body);
+  check('player previewing a disruption → 403', asPlayer.status === 403, asPlayer.status);
+  const playerCancel = await juan.post(`/api/bookings/${b.id}/cancel`, { reason: 'Changed plans' });
+  check('player cancel still → 409 NOT_CANCELLABLE', playerCancel.status === 409 && playerCancel.data.error.code === 'NOT_CANCELLABLE', playerCancel.data);
+
+  const extra = await rhea.post('/api/staff/disruptions/preview', { ...body, creditAmount: 999999 });
+  check('unknown money fields are refused → 422', extra.status === 422, extra.data);
+  const custReq = await rhea.post('/api/staff/disruptions/preview', { ...body, category: 'customer_request' });
+  check("staff can't cancel at a customer's request (admin only) → 403", custReq.status === 403, custReq.data);
+  const noComp = await rhea.post('/api/staff/disruptions/preview', { ...body, compensation: 'none' });
+  check('staff cannot cancel without a credit → 403', noComp.status === 403, noComp.data);
+
+  const pv = await rhea.post('/api/staff/disruptions/preview', body);
+  const p = pv.data.preview;
+  const item = p?.items?.[0];
+  check('preview → cancel with a full ₱500 credit', pv.status === 200 && item?.action === 'cancel' && item.credit === 50000 && p.totals.credit === 50000, pv.data);
+  check('the preview pins the time it applies from', Number.isInteger(p?.input?.scope?.effectiveFrom), p?.input);
+  check('a preview changes nothing', (await juan.get(`/api/bookings/${b.id}`)).data.booking.status === 'CONFIRMED');
+
+  const noKey = await rhea.post('/api/staff/disruptions', { ...p.input, previewToken: p.previewToken });
+  check('confirming without an Idempotency-Key → 400', noKey.status === 400, noKey.data);
+  const stale = await rhea.req('POST', '/api/staff/disruptions', { json: { ...p.input, previewToken: 'a'.repeat(64) }, headers: { 'Idempotency-Key': newKey() } });
+  check('a stale preview → 409 DISRUPTION_CHANGED with a fresh one', stale.status === 409 && stale.data.error.code === 'DISRUPTION_CHANGED' && stale.data.error.details?.preview?.previewToken === p.previewToken, stale.data);
+
+  const key = newKey();
+  const done = await applyPreview(rhea, p, 'staff', key);
+  check('confirm → 201 with the outcome', done.status === 201 && done.data.items?.[0]?.outcome === 'cancelled' && done.data.items[0].credit === 50000, done.data);
+  const again = await applyPreview(rhea, p, 'staff', key);
+  check('double-click (same key) → the same disruption, nothing new', again.status === 200 && again.data.replay === true && again.data.disruption?.id === done.data.disruption?.id, again.data);
+  const reused = await rhea.req('POST', '/api/staff/disruptions', { json: { ...p.input, reason: 'Something else', previewToken: p.previewToken }, headers: { 'Idempotency-Key': key } });
+  check('same key, different change → 409 IDEMPOTENCY_KEY_REUSED', reused.status === 409 && reused.data.error.code === 'IDEMPOTENCY_KEY_REUSED', reused.data);
+  const credits = sql(`SELECT id, amount, remaining FROM booking_credits WHERE source_booking_id = '${b.id}';`)[0].results;
+  check('exactly one ₱500 credit for the booking', credits.length === 1 && credits[0].amount === 50000 && credits[0].remaining === 50000, credits);
+  juanCredit = credits[0];
+  cancelledRef = b.ref;
+
+  const d = await juan.get(`/api/bookings/${b.id}`);
+  check('player sees it cancelled by Le Spinners', d.data.booking.status === 'CANCELLED' && d.data.booking.cancelledBy === 'staff' && d.data.booking.disrupted === true, d.data.booking);
+  check('…with the credit and the reason', d.data.credit?.disruptions?.[0]?.credit === 50000 && d.data.credit.disruptions[0].reason === 'Net post broke' && d.data.booking.creditIssued === 50000, d.data.credit);
+  check('…and no staff name or internal note', !('by' in (d.data.credit?.disruptions?.[0] ?? {})) && !('staffNote' in (d.data.credit?.disruptions?.[0] ?? {})));
+  const n = await juan.get('/api/notifications');
+  check('player notified with the credit', n.data.notifications.some((x) => x.type === 'booking_disrupted' && x.bookingId === b.id && x.body.includes('₱500 booking credit')), n.data.notifications.slice(0, 3));
+  const chat = await juan.get(`/api/bookings/${b.id}/messages`);
+  check('a system message lands in the booking chat', chat.data.messages.some((m) => m.kind === 'system' && m.body.startsWith('Booking cancelled by Le Spinners')));
+  const mine = await juan.get('/api/credits');
+  check('Booking credits: ₱500 available', mine.status === 200 && mine.data.summary.available === 50000 && mine.data.credits.some((c) => c.id === juanCredit.id && c.state === 'available'), mine.data);
+  check('the bookings list carries the credit total', (await juan.get('/api/bookings')).data.credits?.available === 50000);
+  const email = sql(`SELECT subject FROM outbox WHERE booking_id = '${b.id}' AND subject LIKE '%Booking cancelled%';`)[0].results;
+  check('cancellation email queued', email.length === 1, email);
+  const audited = sql(`SELECT COUNT(*) AS n FROM audit_log WHERE action = 'disruption_applied' AND entity_id = '${done.data.disruption.id}';`)[0].results[0];
+  check('audited in the same transaction', audited.n === 1, audited);
+
+  const twice = await rhea.post('/api/staff/disruptions/preview', body);
+  check('the cancelled booking is no longer affected', twice.status === 200 && twice.data.preview.items.length === 0 && twice.data.preview.notAffected[0]?.reason === 'ended', twice.data);
+  const nothing = await applyPreview(rhea, twice.data.preview);
+  check('…and confirming changes nothing → 422 NOTHING_TO_DO', nothing.status === 422 && nothing.data.error.code === 'NOTHING_TO_DO', nothing.data);
+  const staffView = await rhea.get(`/api/staff/bookings/${b.id}`);
+  check('staff detail: no second cancel & credit; shows who did it', staffView.data.actions.canDisrupt === false && staffView.data.credit?.disruptions?.[0]?.by === 'Rhea Lim', staffView.data.credit);
+}
+
+section('Rebook with the credit');
+{
+  const DA = localDate(8);
+  const open = await startsOpen(juan, 'pickleball', DA, 'court-2');
+  const q = await juan.get(`/api/bookings/quote?resourceId=court-2&starts=${open[0]}`);
+  check('quote: ₱500, all of it paid by credit', q.status === 200 && q.data.price === 50000 && q.data.creditApplied === 50000 && q.data.amountDue === 0, q.data);
+  const wrong = await juan.post('/api/bookings', { resourceId: 'court-2', date: DA, starts: [open[0]], useCredit: true, expectedCredit: 100 });
+  check('the app showed a different credit → 409 CREDIT_CHANGED', wrong.status === 409 && wrong.data.error.code === 'CREDIT_CHANGED' && wrong.data.error.details?.creditApplied === 50000, wrong.data);
+  const r = await juan.post('/api/bookings', { resourceId: 'court-2', date: DA, starts: [open[0]], useCredit: true, expectedCredit: 50000, amountDue: 0, status: 'CONFIRMED' });
+  const nb = r.data.booking;
+  check('booked with credit → CONFIRMED at once, nothing to pay', r.status === 201 && nb?.status === 'CONFIRMED' && nb.amountDue === 0 && nb.creditApplied === 50000 && nb.paymentMethodLabel === 'Paid with credit', r.data);
+  check('the replacement names the original booking', r.data.credit?.creditUses?.sources?.[0]?.sourceRef === cancelledRef, r.data.credit);
+  const after = await juan.get('/api/credits');
+  check('the credit is used up', after.data.summary.available === 0 && after.data.credits.find((c) => c.id === juanCredit.id)?.state === 'used', after.data);
+  const hist = await juan.get(`/api/credits/${juanCredit.id}`);
+  check('credit history: issued, then used (player view)', hist.status === 200 && hist.data.history.map((h) => h.kind).join(',') === 'issue,redeem' && hist.data.history[0].actor === 'Le Spinners', hist.data.history);
+  const peek = await pedro.get(`/api/credits/${juanCredit.id}`);
+  check("another player's credit → 404", peek.status === 404, peek.status);
+  const ledger = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${nb.ref}`);
+  check('a credit-paid booking is not new cash in Revenue', ledger.status === 200 && !ledger.data.rows.some((x) => x.id === nb.id), ledger.data.rows);
+  const noCredit = await juan.post('/api/bookings', { resourceId: 'court-2', date: DA, starts: [open[1]], useCredit: true });
+  check('no credit left → an ordinary hold for the full price', noCredit.status === 201 && noCredit.data.booking.status === 'TEMPORARY' && noCredit.data.booking.amountDue === 50000 && noCredit.data.booking.creditApplied === 0, noCredit.data);
+  if (noCredit.status === 201) await juan.post(`/api/bookings/${noCredit.data.booking.id}/release`, {});
+}
+
+section('Credit with a GCash top-up, returned credit and double spending');
+{
+  resetBookingLimits();
+  const DT = localDate(9);
+  // Pedro (non-member) gets a ₱600 credit: a closure on Court 3 cancels his confirmed booking.
+  const c3 = await startsOpen(pedro, 'pickleball', DT, 'court-3');
+  const orig = await confirmedBooking(pedro, 'court-3', DT, [c3[0]]);
+  const pv = await rhea.post('/api/staff/disruptions/preview', { scope: { kind: 'window', date: DT, start: c3[0], end: c3[0] + 60, resourceId: 'court-3' }, category: 'maintenance', reason: 'Lights failed' });
+  check('window preview finds the booking and plans the closure', pv.data.preview?.items?.length === 1 && pv.data.preview.items[0].credit === 60000 && pv.data.preview.closures.length === 1, pv.data);
+  const ap = await applyPreview(rhea, pv.data.preview);
+  check('applied: ₱600 credit, closure saved with it', ap.status === 201 && ap.data.disruption.creditedTotal === 60000 && ap.data.closures.length === 1, ap.data);
+  const credit = sql(`SELECT id FROM booking_credits WHERE source_booking_id = '${orig.id}';`)[0].results[0];
+
+  const c1 = await startsOpen(pedro, 'pickleball', DT, 'court-1');
+  const two = [c1[0], c1[1]]; // 2 × ₱600 = ₱1,200
+  const hold = await pedro.post('/api/bookings', { resourceId: 'court-1', date: DT, starts: two, useCredit: true, expectedCredit: 60000 });
+  const hb = hold.data.booking;
+  check('top-up: a hold for the ₱600 difference, ₱600 credit applied', hold.status === 201 && hb?.status === 'TEMPORARY' && hb.amountDue === 60000 && hb.creditApplied === 60000, hold.data);
+  const reserved = await pedro.get(`/api/credits/${credit.id}`);
+  check('the hold reserves the credit', reserved.data.credit?.remaining === 0 && reserved.data.credit.reserved === 60000, reserved.data.credit);
+  const rel = await pedro.post(`/api/bookings/${hb.id}/release`, {});
+  const back = sql(`SELECT remaining FROM booking_credits WHERE id = '${credit.id}';`)[0].results[0];
+  check('releasing the hold returns the credit', rel.status === 200 && back.remaining === 60000, { rel: rel.status, back });
+  const pn = await pedro.get('/api/notifications');
+  check('player told the credit is back', pn.data.notifications.some((x) => x.type === 'credit_restored' && x.bookingId === hb.id));
+
+  // The hold lapses: expiry and return commit together, and only once even with the cron safety net.
+  const hold2 = await pedro.post('/api/bookings', { resourceId: 'court-1', date: DT, starts: two, useCredit: true, expectedCredit: 60000 });
+  sql(`UPDATE bookings SET hold_expires_at = ${Date.now() - 1000} WHERE id = '${hold2.data.booking.id}';`);
+  await runCron();
+  await runCron();
+  const ex = sql(`SELECT b.status, c.remaining, (SELECT COUNT(*) FROM credit_transactions t WHERE t.booking_id = b.id AND t.kind = 'release') AS releases
+                    FROM bookings b, booking_credits c WHERE b.id = '${hold2.data.booking.id}' AND c.id = '${credit.id}';`)[0].results[0];
+  check('expired hold → EXPIRED, credit returned exactly once', ex?.status === 'EXPIRED' && ex.remaining === 60000 && ex.releases === 1, ex);
+
+  // Paid and verified: only the GCash part is revenue.
+  const hold3 = await pedro.post('/api/bookings', { resourceId: 'court-1', date: DT, starts: two, useCredit: true, expectedCredit: 60000 });
+  await payAndConfirm(pedro, hold3.data.booking);
+  const conf = (await pedro.get(`/api/bookings/${hold3.data.booking.id}`)).data.booking;
+  check('top-up verified → CONFIRMED, "GCash + credit"', conf.status === 'CONFIRMED' && conf.paymentMethodLabel === 'GCash + credit' && conf.totalValue === 120000, conf);
+  const row = (await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${conf.ref}`)).data.rows?.[0];
+  check('revenue counts the ₱600 cash only', row?.amount === 60000 && row.creditApplied === 60000 && row.payStatus === 'paid', row);
+  const kept = sql(`SELECT COUNT(*) AS n FROM credit_transactions WHERE booking_id = '${hold3.data.booking.id}' AND kind = 'release';`)[0].results[0];
+  check('a confirmed top-up keeps its credit (no release)', kept.n === 0, kept);
+
+  // Two tabs spend the same credit at once: exactly one wins, the other changes nothing.
+  const gift = await ana.req('POST', '/api/admin/credits', { json: { userId: 'u_pedro', amount: 30000, reason: 'Sorry for the wait' }, headers: { 'Idempotency-Key': newKey() } });
+  check('admin issues a ₱300 credit by hand', gift.status === 201 && gift.data.credit?.remaining === 30000, gift.data);
+  const t = (await startsOpen(pedro, 'table_tennis', DT, 'table-1')).filter((s) => s >= two[1] + 60);
+  const race = await Promise.all([
+    pedro.post('/api/bookings', { resourceId: 'table-1', date: DT, starts: [t[0]], useCredit: true, expectedCredit: 30000 }),
+    pedro.post('/api/bookings', { resourceId: 'table-1', date: DT, starts: [t[1]], useCredit: true, expectedCredit: 30000 }),
+  ]);
+  check('race: exactly one booking spends the credit', race.filter((x) => x.status === 201).length === 1 && race.some((x) => x.status === 409 && x.data.error.code === 'CREDIT_CHANGED'), race.map((x) => `${x.status} ${x.data?.error?.code ?? x.data?.booking?.status ?? ''}`));
+  const giftRow = sql(`SELECT remaining FROM booking_credits WHERE id = '${gift.data.credit?.id}';`)[0].results[0];
+  check('…and the credit is spent once', giftRow?.remaining === 0, giftRow);
+}
+
+section('Closure over many bookings (window disruption)');
+let windowDisruption;
+{
+  resetBookingLimits();
+  const DW = localDate(10);
+  const [s0, s1, s2, s3, s4] = await startsOpen(juan, 'pickleball', DW, 'court-1');
+  const bConf = await confirmedBooking(juan, 'court-1', DW, [s0]); // member ₱500
+  const bGap = await confirmedBooking(pedro, 'court-1', DW, [s2, s4]); // non-member 2 × ₱600, gap at s3
+  const bAfter = await confirmedBooking(maria, 'court-1', DW, [s3]); // starts when the window ends
+  const bTable = await confirmedBooking(pedro, 'table-1', DW, [s0]); // other activity
+  const bHold = (await maria.post('/api/bookings', { resourceId: 'court-2', date: DW, starts: [s0] })).data.booking;
+  const subHold = (await kim.post('/api/bookings', { resourceId: 'court-3', date: DW, starts: [s0] })).data.booking;
+  await kim.req('POST', `/api/bookings/${subHold.id}/proof`, { form: proofForm(pngFile('k.png', PAY_PNG), { amountPesos: (subHold.amountDue / 100).toFixed(2) }) });
+  const free = (await rhea.post('/api/staff/bookings', { resourceId: 'court-2', date: DW, starts: [s1], rate: 'member', payment: 'none' })).data.booking;
+  check('setup: seven bookings on the day', [bConf, bGap, bAfter, bTable, bHold, subHold, free].every((b) => b?.id), [bConf, bGap, bAfter, bTable, bHold, subHold, free].map((b) => b?.status));
+
+  const body = { scope: { kind: 'window', date: DW, start: s0, end: s3, activity: 'pickleball' }, category: 'weather', reason: 'Heavy rain', staffNote: 'Gutter overflow on Court 2' };
+  const pv = await rhea.post('/api/staff/disruptions/preview', body);
+  const items = pv.data.preview?.items ?? [];
+  const by = (id) => items.find((i) => i.bookingId === id);
+  check('only overlapping pickleball bookings are affected', items.length === 5 && !by(bAfter.id) && !by(bTable.id), items.map((i) => i.ref));
+  check('confirmed, not started → cancel, ₱500 credit', by(bConf.id)?.action === 'cancel' && by(bConf.id).credit === 50000, by(bConf.id));
+  check('partly inside, not started → cancel in full by default, staff may keep', by(bGap.id)?.action === 'cancel' && by(bGap.id).canChoose === true && by(bGap.id).credit === 120000, by(bGap.id));
+  check('unpaid hold → released, no credit', by(bHold.id)?.action === 'cancel' && by(bHold.id).credit === 0 && by(bHold.id).flags.some((f) => f.key === 'hold'), by(bHold.id));
+  check('proof waiting → deferred, ₱600 once verified', by(subHold.id)?.action === 'defer' && by(subHold.id).projectedCredit === 60000, by(subHold.id));
+  check('free staff booking → no credit', by(free.id)?.action === 'cancel' && by(free.id).credit === 0 && by(free.id).flags.some((f) => f.key === 'free'), by(free.id));
+  check('closures planned for every pickleball court', (pv.data.preview?.closures ?? []).length >= 3, pv.data.preview?.closures);
+
+  // Pedro's booking keeps 8 PM: only the closed hour is credited.
+  const pv2 = await rhea.post('/api/staff/disruptions/preview', { ...body, overrides: [{ bookingId: bGap.id, action: 'keep' }] });
+  const gap2 = pv2.data.preview?.items?.find((i) => i.bookingId === bGap.id);
+  check('keep → only the closed hour is credited (₱600 of ₱1,200)', gap2?.action === 'keep' && gap2.credit === 60000 && pv2.data.preview.totals.credit === 110000, gap2);
+  const ap = await applyPreview(rhea, pv2.data.preview);
+  windowDisruption = ap.data.disruption?.id;
+  check('applied → 201', ap.status === 201, ap.data);
+  const st = Object.fromEntries(sql(`SELECT id, status, compensated_amount FROM bookings WHERE id IN ('${[bConf, bGap, bAfter, bTable, bHold, subHold, free].map((b) => b.id).join("','")}');`)[0].results.map((r) => [r.id, r]));
+  check('cancelled: the confirmed booking, the hold, the free booking', st[bConf.id].status === 'CANCELLED' && st[bHold.id].status === 'CANCELLED' && st[free.id].status === 'CANCELLED', st);
+  check('kept and partly credited: the booking with the gap', st[bGap.id].status === 'CONFIRMED' && st[bGap.id].compensated_amount === 60000, st[bGap.id]);
+  check('untouched: the booking after the window, the table, the proof waiting', st[bAfter.id].status === 'CONFIRMED' && st[bTable.id].status === 'CONFIRMED' && st[subHold.id].status === 'PAYMENT_SUBMITTED', st);
+  const blocked = await maria.post('/api/bookings', { resourceId: 'court-1', date: DW, starts: [s1] });
+  check('the closed window takes no new bookings → 422 CLOSED', blocked.status === 422 && blocked.data.error.code === 'CLOSED', blocked.data);
+  const seen = await pedro.get(`/api/availability?activity=pickleball&date=${DW}`);
+  check('players see the closed window as closed', seen.data.resources.find((x) => x.id === 'court-2').slots.find((x) => x.start === s1)?.state === 'closed', seen.data.resources.find((x) => x.id === 'court-2').slots);
+  check('hold owner told "Your hold ended"', (await maria.get('/api/notifications')).data.notifications.some((x) => x.bookingId === bHold.id && x.title === 'Your hold ended'));
+  check('proof owner told a credit follows verification', (await kim.get('/api/notifications')).data.notifications.some((x) => x.bookingId === subHold.id && x.type === 'disruption_pending'));
+  const badges = await rhea.get('/api/staff/badges');
+  check('staff badge counts the booking still to finish', badges.data.disruptionsOpen >= 1, badges.data);
+  const note = sql(`SELECT resolved_at FROM notifications WHERE type = 'disruption' AND link = '/admin/disruptions/${windowDisruption}';`)[0].results[0];
+  check('staff summary notice stays open while one is pending', note && note.resolved_at === null, note);
+
+  // Verifying the waiting payment finishes the job: cancelled, ₱600 credit.
+  const approved = await rhea.post(`/api/staff/bookings/${subHold.id}/approve`, { checklist: true });
+  check('approving the waiting payment cancels it with its credit', approved.status === 200 && approved.data.resolvedDisruptions?.[0]?.outcome === 'cancelled' && approved.data.resolvedDisruptions[0].credit === 60000 && approved.data.booking.status === 'CANCELLED', approved.data.resolvedDisruptions ?? approved.data);
+  const after = await rhea.get(`/api/staff/disruptions/${windowDisruption}`);
+  check('disruption detail: five bookings, nothing left open', after.data.items?.length === 5 && after.data.disruption.openCount === 0 && after.data.disruption.creditedTotal === 170000, after.data.disruption);
+  const note2 = sql(`SELECT resolved_at FROM notifications WHERE type = 'disruption' AND link = '/admin/disruptions/${windowDisruption}';`)[0].results[0];
+  check('…and the staff notice is resolved', note2?.resolved_at != null, note2);
+  const list = await rhea.get('/api/staff/disruptions');
+  check('history lists it with its scope', list.data.disruptions?.some((x) => x.id === windowDisruption && x.scopeLabel === 'All pickleball courts'), list.data.disruptions?.slice(0, 2));
+  const playerView = await juan.get(`/api/bookings/${bConf.id}`);
+  check('players never see the internal note', !JSON.stringify(playerView.data).includes('Gutter overflow'));
+}
+
+section('Partial disruption of a booking in progress');
+{
+  resetBookingLimits();
+  const DP = localDate(11);
+  const open = await startsOpen(maria, 'pickleball', DP, 'court-2');
+  const b = await confirmedBooking(maria, 'court-2', DP, [open[0], open[1]]); // member, 2 × ₱500
+  // Move it to today, started an hour ago.
+  const nowLocal = new Date(Date.now() + TZ_MS);
+  const nowMin = nowLocal.getUTCHours() * 60 + nowLocal.getUTCMinutes();
+  const start = Math.max(0, nowMin - 60);
+  const end = Math.min(1440, start + 120);
+  // References are numbered per date, so the moved booking takes a reference of today's date too.
+  sql(`UPDATE bookings SET date = '${localDate()}', start_min = ${start}, end_min = ${end}, ref = 'LS-${localDate().replaceAll('-', '')}-990' WHERE id = '${b.id}';
+       UPDATE booking_slots SET date = '${localDate()}', start_min = ${start}, end_min = ${end} WHERE booking_id = '${b.id}';`);
+  const body = { scope: { kind: 'bookings', bookingIds: [b.id] }, category: 'unsafe_conditions', reason: 'Wet surface' };
+  const pv = await rhea.post('/api/staff/disruptions/preview', body);
+  const it = pv.data.preview?.items?.[0];
+  check('in progress → keep, credit only the unplayed part', it?.action === 'keep' && it.flags.some((f) => f.key === 'in_progress') && it.affectedMin > 0 && it.affectedMin < it.bookedMin, it);
+  check('credit = ⌊paid × unplayed ÷ booked⌋', it?.credit === Math.floor((100000 * it.affectedMin) / it.bookedMin), it);
+  const ap = await applyPreview(rhea, pv.data.preview);
+  const row = sql(`SELECT status, compensated_amount FROM bookings WHERE id = '${b.id}';`)[0].results[0];
+  check('the booking stays CONFIRMED with the credit recorded', ap.status === 201 && row.status === 'CONFIRMED' && row.compensated_amount === it.credit, { ap: ap.status, row });
+  const again = await rhea.post('/api/staff/disruptions/preview', body);
+  check('those minutes are never credited twice', again.data.preview?.items?.length === 0 && again.data.preview.notAffected[0]?.reason === 'already_compensated', again.data);
+  const retro = { ...body, scope: { ...body.scope, effectiveFrom: Date.now() - 2 * 86_400_000 } };
+  const staffRetro = await rhea.post('/api/staff/disruptions/preview', retro);
+  check('staff recording an earlier day → 403 RETRO_NOT_ALLOWED', staffRetro.status === 403 && staffRetro.data.error.code === 'RETRO_NOT_ALLOWED', staffRetro.data);
+  const adminRetro = await ana.post('/api/admin/disruptions/preview', retro);
+  check('admins may, within 7 days', adminRetro.status === 200, adminRetro.data);
+}
+
+section('Admin credit tools');
+{
+  resetBookingLimits();
+  const asStaff = await rhea.req('POST', '/api/admin/credits', { json: { userId: 'u_juan', amount: 10000, reason: 'Goodwill' }, headers: { 'Idempotency-Key': newKey() } });
+  check('staff issuing a credit → 403', asStaff.status === 403, asStaff.status);
+  const noKey = await ana.post('/api/admin/credits', { userId: 'u_juan', amount: 10000, reason: 'Goodwill' });
+  check('a manual credit needs an Idempotency-Key → 400', noKey.status === 400, noKey.data);
+  const toStaff = await ana.req('POST', '/api/admin/credits', { json: { userId: 'u_rhea', amount: 10000, reason: 'Goodwill' }, headers: { 'Idempotency-Key': newKey() } });
+  check('credits only go to player accounts → 404', toStaff.status === 404, toStaff.data);
+  const k = newKey();
+  const g = await ana.req('POST', '/api/admin/credits', { json: { userId: 'u_juan', amount: 25000, reason: 'Late payment verified' }, headers: { 'Idempotency-Key': k } });
+  const g2 = await ana.req('POST', '/api/admin/credits', { json: { userId: 'u_juan', amount: 25000, reason: 'Late payment verified' }, headers: { 'Idempotency-Key': k } });
+  const made = sql(`SELECT COUNT(*) AS n FROM booking_credits WHERE idempotency_key = '${k}';`)[0].results[0];
+  check('manual credit → 201; a retry with the same key adds nothing', g.status === 201 && g2.data.credit?.id === g.data.credit?.id && made.n === 1, { g: g.status, g2: g2.data, made });
+  const id = g.data.credit.id;
+  const tooMuch = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 99900, method: 'cash' });
+  check('refund above the balance → 422', tooMuch.status === 422, tooMuch.data);
+  const noRef = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash' });
+  check('a GCash refund needs its reference → 422', noRef.status === 422, noRef.data);
+  const refund = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash', reference: '1234 567 890' });
+  check('refund recorded: ₱200 left, reference kept', refund.status === 200 && refund.data.credit.remaining === 20000 && refund.data.history.some((h) => h.kind === 'refund' && (h.note ?? '').includes('1234 567 890')), refund.data);
+
+  // A pending top-up hold reserves the credit: no void until it is settled.
+  const summary = (await juan.get('/api/credits')).data.summary.available;
+  const DV = localDate(11);
+  const open = await startsOpen(juan, 'pickleball', DV, 'court-1');
+  const h = await juan.post('/api/bookings', { resourceId: 'court-1', date: DV, starts: [open[0], open[1]], useCredit: true });
+  check('top-up hold uses all of Juan\'s credit', h.status === 201 && h.data.booking.status === 'TEMPORARY' && h.data.booking.creditApplied === summary && summary < 100000, { summary, b: h.data.booking });
+  const pending = await ana.post(`/api/admin/credits/${id}/void`, { reason: 'Issued twice by mistake' });
+  check('void while a hold uses it → 409 CREDIT_PENDING', pending.status === 409 && pending.data.error.code === 'CREDIT_PENDING', pending.data);
+  await juan.post(`/api/bookings/${h.data.booking.id}/release`, {});
+  const voided = await ana.post(`/api/admin/credits/${id}/void`, { reason: 'Issued twice by mistake' });
+  check('void → state voided, nothing left', voided.status === 200 && voided.data.credit.state === 'voided' && voided.data.credit.remaining === 0, voided.data);
+  const twice = await ana.post(`/api/admin/credits/${id}/void`, { reason: 'Again' });
+  check('void again → 409 CREDIT_EMPTY', twice.status === 409 && twice.data.error.code === 'CREDIT_EMPTY', twice.data);
+  const seen = await juan.get('/api/credits');
+  check('the player sees it voided, with the reason in a notice', seen.data.credits.some((c) => c.id === id && c.state === 'voided') && (await juan.get('/api/notifications')).data.notifications.some((x) => x.type === 'credit_changed' && x.body.includes('Issued twice by mistake')));
+  const search = await rhea.get('/api/staff/credits?q=Juan');
+  check('staff can search credits', search.status === 200 && search.data.credits.some((c) => c.id === id && c.user.name === 'Juan Dela Cruz'), search.data);
+  const detail = await rhea.get(`/api/staff/credits/${id}`);
+  check('staff see the full history with names', detail.data.history?.map((x) => x.kind).join(',') === 'issue,refund,redeem,release,void' && detail.data.history[0].actor === 'Ana Reyes', detail.data.history);
+  const noPost = await rhea.post('/api/staff/credits', { userId: 'u_juan', amount: 1, reason: 'Nope nope' });
+  check('no credit-issuing route under /api/staff → 404', noPost.status === 404, noPost.status);
+}
+
+section('Booking credit invariants');
+{
+  const drift = sql(`SELECT c.id FROM booking_credits c
+                      WHERE c.remaining != (SELECT COALESCE(SUM(t.amount), 0) FROM credit_transactions t WHERE t.credit_id = c.id)
+                         OR c.remaining < 0 OR c.remaining > c.amount;`)[0].results;
+  check('every credit balance equals its ledger', drift.length === 0, drift);
+  const over = sql(`SELECT id FROM bookings WHERE compensated_amount > amount_due + credit_applied;`)[0].results;
+  check('no booking was credited more than was paid for it', over.length === 0, over);
+  const doubled = sql(`SELECT related_txn_id FROM credit_transactions WHERE kind = 'release' GROUP BY related_txn_id HAVING COUNT(*) > 1;`)[0].results;
+  check('no redemption was returned twice', doubled.length === 0, doubled);
+  const orphan = sql(`SELECT r.id FROM credit_transactions r LEFT JOIN credit_transactions t ON t.id = r.related_txn_id
+                       WHERE r.kind = 'release' AND (t.id IS NULL OR t.kind != 'redeem' OR t.amount != -r.amount);`)[0].results;
+  check('every return matches the redemption it undoes', orphan.length === 0, orphan);
+  const dup = sql(`SELECT source_booking_id FROM booking_credits WHERE disruption_id IS NOT NULL GROUP BY source_booking_id, disruption_id HAVING COUNT(*) > 1;`)[0].results;
+  check('one credit per booking per disruption', dup.length === 0, dup);
+  const credited = sql(`SELECT b.id FROM bookings b WHERE b.status IN ('CONFIRMED', 'PAYMENT_SUBMITTED') AND EXISTS (
+                          SELECT 1 FROM closures c JOIN booking_times t ON t.booking_id = b.id
+                           WHERE c.disruption_id IS NOT NULL AND c.date = t.date AND (c.resource_id IS NULL OR c.resource_id = t.resource_id)
+                             AND c.start_min < t.end_min AND c.end_min > t.start_min AND c.created_at > b.created_at
+                             AND NOT EXISTS (SELECT 1 FROM disruption_items di WHERE di.booking_id = b.id AND di.disruption_id = c.disruption_id));`)[0].results;
+  check('no live booking sits unhandled in a disruption closure', credited.length === 0, credited);
+}
+
 section('Logout and revoked sessions');
 {
   resetSignInLimits();

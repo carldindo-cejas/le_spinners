@@ -5,7 +5,8 @@ import { isoDate } from '../../core/format.js';
 import { clearFieldErrors, errorState, openModal, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame } from '../shell.js';
 import { API, BASE, isAdminConsole } from '../console.js';
-import { followUpNote, withImpactCheck } from '../impact.js';
+import { disruptionAsPromise, followUpNote, withImpactCheck } from '../impact.js';
+import { openDisruptionDialog } from '../disrupt.js';
 
 const TABS = [
   { key: 'all', label: 'All' },
@@ -39,9 +40,20 @@ function card(r) {
   </article>`;
 }
 
-/** PATCH with the affected-bookings check. Returns true when the change was applied. */
+/**
+ * PATCH with the affected-bookings check. Returns true when the change was applied. Staff may
+ * first cancel the affected bookings with a booking credit (maintenance, disabling, open play).
+ */
 async function patch(r, body, done) {
-  const res = await withImpactCheck((confirmAffected) => api.patch(`${API}/facilities/${encodeURIComponent(r.id)}`, { ...body, confirmAffected }));
+  const res = await withImpactCheck((confirmAffected) => api.patch(`${API}/facilities/${encodeURIComponent(r.id)}`, { ...body, confirmAffected }), {
+    disrupt: (affected) => disruptionAsPromise((finish) => openDisruptionDialog({
+      title: `Cancel & credit · ${r.name}`,
+      intro: `After this, the change to ${r.name} is saved.`,
+      scope: { kind: 'bookings', bookingIds: affected.map((b) => b.id) },
+      defaults: { category: 'maintenance', reason: body.maintenanceNote ? `${r.name}: ${body.maintenanceNote}` : `${r.name} is out of service`, closeSlots: false },
+      onFinish: finish,
+    })).then((x) => (x ? { done: false } : null)),
+  });
   if (!res) return false;
   toast(done, { sub: followUpNote(res) || 'Players see the change right away.' });
   return true;

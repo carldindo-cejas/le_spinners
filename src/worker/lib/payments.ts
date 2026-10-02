@@ -6,6 +6,7 @@ import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt } from '.
 import type { Settings } from './settings';
 import { dateLabel, minutesLabel, peso } from './time';
 import { activityLabel, changedAt, effectiveStatus, eventStmt, getBooking, slotLabel, systemMessageStmt, type BookingJoin } from './bookings';
+import { releaseStmts } from './credits';
 
 /**
  * Proof links are signed for a 5-minute bucket and stay valid for 5–10 minutes.
@@ -157,7 +158,7 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
     userNoticeStmt(db, b.user_id, { type: 'payment_verified', title: 'Payment verified', body: `Booking confirmed · ${where}`, link: `/bookings/${bookingId}`, bookingId }, now, g),
     resolveStaffStmt(db, bookingId, ['proof_submitted', 'new_booking', 'hold_expiring'], now, g),
     outboxStmt(db, 'email', b.user_email ?? '', 'Le Spinners — Booking confirmed',
-      `Hi ${b.user_name},\n\nPayment verified. Your booking is confirmed.\n\n${activityLabel(b.activity)} · ${where}\nReference: ${b.ref}\nAmount: ${peso(b.amount_due)}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${bookingId}\n\nSee you on court!\nLe Spinners Recreational Hub`,
+      `Hi ${b.user_name},\n\nPayment verified. Your booking is confirmed.\n\n${activityLabel(b.activity)} · ${where}\nReference: ${b.ref}\nAmount: ${peso(b.amount_due)}${b.credit_applied > 0 ? ` GCash + ${peso(b.credit_applied)} booking credit` : ''}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${bookingId}\n\nSee you on court!\nLe Spinners Recreational Hub`,
       bookingId, now, g),
   ]);
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
@@ -209,6 +210,8 @@ export async function rejectPayment(
     outboxStmt(db, 'email', b.user_email ?? '', 'Le Spinners — Payment proof rejected',
       `Hi ${b.user_name},\n\nWe couldn't verify your payment for ${where} (${b.ref}).\n\nReason: ${input.reason}\n\n${input.keepHold ? `Your slot is held for ${settings.resubmitMinutes} more minutes. Send a new screenshot here: ${env.APP_ORIGIN}/bookings/${bookingId}` : 'The slot was released. You can book again anytime.'}\n\nLe Spinners Recreational Hub`,
       bookingId, now, g),
+    // Without a resubmit window the booking is over: any booking credit it used comes back.
+    ...releaseStmts(db, 'b.id = ? AND b.rejected_at = ?', [bookingId, now], now),
   ]);
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
 }
@@ -233,8 +236,11 @@ export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: 
     outboxStmt(db, 'email', b.user_email ?? '', 'Le Spinners — Booking cancelled',
       `Hi ${b.user_name},\n\nYour booking ${b.ref} (${where}) was cancelled by Le Spinners.\nReason: ${reason}\n\nQuestions? Reply in the booking chat: ${env.APP_ORIGIN}/bookings/${bookingId}/chat\n\nLe Spinners Recreational Hub`,
       bookingId, now, g),
+    ...releaseStmts(db, 'b.id = ? AND b.cancelled_at = ?', [bookingId, now], now),
   ]);
-  if (!update?.meta.changes) throw conflict('NOT_CANCELLABLE', 'Only unpaid holds can be cancelled. Bookings with a submitted payment or a confirmation stay as they are.');
+  if (!update?.meta.changes) {
+    throw conflict('NOT_CANCELLABLE', 'Only unpaid holds can be cancelled here. For a paid or confirmed booking, use "Cancel & credit": it issues the player a booking credit.');
+  }
 }
 
 // ── Private proof images ───────────────────────────────────────────────────

@@ -14,6 +14,12 @@ const LOOK = {
   proof_rejected: { tile: 'red', icon: 'x-circle' },
   booking_cancelled: { tile: 'neutral', icon: 'circle-slash' },
   booking_expired: { tile: 'neutral', icon: 'clock-x' },
+  booking_disrupted: { tile: 'neutral', icon: 'calendar-x' },
+  booking_partly_credited: { tile: 'blue', icon: 'gift' },
+  disruption_pending: { tile: 'amber', icon: 'calendar-x' },
+  credit_booking_confirmed: { tile: 'volt', icon: 'check' },
+  credit_restored: { tile: 'blue', icon: 'gift' },
+  credit_changed: { tile: 'blue', icon: 'gift' },
 };
 
 const FILTERS = [

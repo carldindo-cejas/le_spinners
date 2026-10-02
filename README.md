@@ -8,9 +8,9 @@ page for its role:
 
 | Role | Sign in | Dashboard | What it's for |
 |---|---|---|---|
-| User (player) | `/login` | `/` | Live availability, booking any open times on a court or table (back to back or with gaps, price × slots), a 10-minute temporary hold, GCash payment instructions, payment-screenshot upload, booking chat, notifications, profile |
-| Staff | `/staff/login` | `/staff/` | Dashboard, payment verification (approve after ticking the required "Before you approve" checklist, or reject with a reason), bookings with their author ("Online" or "Staff · name" / "Admin · name"), personal bookings on site (**New booking**: confirmed at once, paid at the desk or free), per-booking chat that opens in place on the booking and review pages, notification center, calendar, courts and tables, weekly hours and closed dates, own profile |
-| Admin | `/admin/login` | `/admin/` | Everything staff can do, plus Settings (GCash details and QR, prices, alert recipients, booking rules, the email/SMS outbox) and **Revenue** at `/revenue/` (collected revenue and the booking ledger) |
+| User (player) | `/login` | `/` | Live availability, booking any open times on a court or table (back to back or with gaps, price × slots), a 10-minute temporary hold, GCash payment instructions, payment-screenshot upload, booking chat, notifications, profile, **booking credits** (what Le Spinners owes after cancelling a paid booking) and **Rebook** |
+| Staff | `/staff/login` | `/staff/` | Dashboard, payment verification (approve after ticking the required "Before you approve" checklist, or reject with a reason), bookings with their author ("Online" or "Staff · name" / "Admin · name"), personal bookings on site (**New booking**: confirmed at once, paid at the desk or free), per-booking chat that opens in place on the booking and review pages, notification center, calendar, courts and tables, weekly hours and closed dates, **Cancel & credit** and **Disruptions** (cancel or cut short paid bookings with a booking credit), booking credits, own profile |
+| Admin | `/admin/login` | `/admin/` | Everything staff can do, plus Settings (GCash details and QR, prices, alert recipients, booking rules, the email/SMS outbox), **Revenue** at `/revenue/` (collected revenue and the booking ledger), credits issued by hand, voids and cash-refund records, and disruptions up to 7 days back |
 
 Member and non-member are a player's *membership* (it sets the price), not a role, and it
 never grants console access.
@@ -37,7 +37,10 @@ Select time ─▶ TEMPORARY (slot held 10 min, countdown)
              ▼                                   ▼
           CONFIRMED ─▶ COMPLETED            REJECTED (optional 10-min resubmit window)
                                                  │ no new proof in time
-TEMPORARY with no proof in time ─▶ EXPIRED ◀─────┘        Player/staff cancel ─▶ CANCELLED
+TEMPORARY with no proof in time ─▶ EXPIRED ◀─────┘   Player releases an unpaid hold ─▶ CANCELLED
+
+Le Spinners cancels (Cancel & credit, or a disruption) ─▶ CANCELLED + booking credit
+A booking already under way when play stops            ─▶ stays CONFIRMED + credit for the lost time
 ```
 
 The app never says "Payment received". An upload is "Payment proof submitted";
@@ -46,6 +49,32 @@ only staff approval shows "Payment verified" and "Booking confirmed".
 What other players see for a slot: **On hold · may reopen** (TEMPORARY, or REJECTED during
 its resubmit window), **Unavailable** (PAYMENT_SUBMITTED), **Booked** (CONFIRMED). Never a
 name, amount or screenshot.
+
+Players can't cancel a booking: the app has no cancel button and `POST /api/bookings/:id/cancel`
+always answers `409 NOT_CANCELLABLE`. They can release an unpaid hold, and anything else goes
+through the booking chat.
+
+## Disruptions and booking credits
+
+When Le Spinners can't honour a booking (weather, unsafe conditions, repairs, an emergency, its
+own mistake), staff use **Cancel & credit** on the booking, or record a **disruption** for a
+time window on one court, one activity or the whole facility. The plan and its open policy
+questions are in [REBOOKING.md](REBOOKING.md).
+
+- Everything is previewed first: each affected booking, what happens to it and the credit.
+  Nothing changes until staff confirm, and a confirmation can't be applied twice.
+- A paid booking that hasn't started is cancelled and its full value becomes **booking credit**.
+  A booking already under way keeps its status; only the time that couldn't be played is
+  credited (per minute, rounded down to the centavo). Unpaid holds are released, with no credit.
+  A booking whose payment proof is waiting is finished once staff verify or reject it.
+- Booking credit is money, never a cash refund. It is spent automatically on the player's next
+  booking (any court or table): if it covers the price the booking is confirmed at once; if
+  not, the rest is paid by GCash and the credit comes back if that hold ends unpaid.
+- The closure, the cancellations, the credits, the ledger, the notices and the audit row are one
+  database transaction. Every credit change is a row in `credit_transactions`, and a credit's
+  `remaining` always equals the sum of its ledger.
+- Admins can issue a credit by hand, void one, or record a cash refund paid outside the app
+  (which spends that much credit). Credits don't expire: no expiry policy has been decided.
 
 ## Revenue reporting
 
@@ -59,10 +88,12 @@ verified, counted on the day they verified it:
 | Paid · verified (`CONFIRMED` or `COMPLETED`, `confirmed_at` set) | Yes: `amount_due`, dated `confirmed_at` |
 | Pending verification (`PAYMENT_SUBMITTED`) | No, shown as pending |
 | Proof rejected | No |
-| Cancelled after payment (verified, then cancelled) | No, reported separately: refunds happen outside the app and aren't recorded |
+| Cancelled · credited (cancelled by Le Spinners, the value kept as booking credit) | No, reported with cancelled after payment |
+| Cancelled after payment (verified, then cancelled, no credit recorded) | No, reported separately |
 | Cancelled before verification | No |
 
-Each booking is one ledger row, so resubmitted proofs never double count. Days, weeks
+Each booking is one ledger row, so resubmitted proofs never double count. `amount_due` is the
+cash part: booking credit used to pay (`credit_applied`) is never counted as collected cash. Days, weeks
 (Monday–Sunday), months and years use facility time (`TZ_OFFSET_MINUTES`, Asia/Manila).
 GCash is the only payment method the app records. The API is
 `GET /api/admin/revenue/summary`, `/ledger` and `/export`. The CSV is built in parts of
@@ -115,8 +146,9 @@ http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*
 ```bash
 npm run db:reset:local
 npm run dev:test          # keep it running in another terminal
-npm run test:smoke        # about 360 checks: sign-in per role, API access by role, holds, double booking,
-                          # uploads, privacy, approve/reject, expiry, chat, courts, hours, closures, revenue…
+npm run test:smoke        # about 480 checks: sign-in per role, API access by role, holds, double booking,
+                          # uploads, privacy, approve/reject, expiry, chat, courts, hours, closures, revenue,
+                          # cancel & credit, disruptions, rebooking with credit, double spending, ledger…
 ```
 
 The suite edits the local database, so run `npm run db:reset:local` before each run.
@@ -187,10 +219,15 @@ Existing deployments need no database migration for roles: `users.role` already 
 The revenue page adds two indexes. On an existing deployment, run `npm run db:migrate:remote`
 once (it applies `migrations/0003_revenue_indexes.sql`); it doesn't change any data.
 
+Disruptions and booking credits add tables and columns (`migrations/0007_disruptions_credits.sql`,
+additive only). Run `npm run db:migrate:remote` **before** `npm run deploy`: the old Worker
+ignores the new columns, the new one needs them.
+
 ### Email alerts (optional)
 
 Staff get an email for every payment proof ("Le Spinners — Booking Requires Payment
-Verification"), and players get an email when a booking is confirmed or rejected.
+Verification"), and players get an email when a booking is confirmed or rejected, and when
+Le Spinners cancels or cuts short a booking and adds a booking credit.
 Messages are written to the `outbox` table and sent through [Resend](https://resend.com)
 once both of these are set:
 
@@ -220,9 +257,9 @@ yet. Adding one later means sending the queued rows in `flushOutbox`
 
     | Path | Allowed |
     |---|---|
-    | `/api/bookings/*`, `/api/notifications/*`, `/api/availability*` | players (their own bookings only) |
-    | `/api/staff/*` | staff and admins: dashboard, verification, bookings, chat, staff notifications, schedule, courts, hours, closures |
-    | `/api/admin/*` | admins: the same operations, plus settings, GCash QR, prices, the outbox and revenue (`/api/admin/revenue/*`) |
+    | `/api/bookings/*`, `/api/credits/*`, `/api/notifications/*`, `/api/availability*` | players (their own bookings and credits only) |
+    | `/api/staff/*` | staff and admins: dashboard, verification, bookings, chat, staff notifications, schedule, courts, hours, closures, disruptions (cancel & credit), credit lookups |
+    | `/api/admin/*` | admins: the same operations, plus settings, GCash QR, prices, the outbox, revenue (`/api/admin/revenue/*`) and credit changes (`/api/admin/credits/*`) |
     | `/api/me`, `/api/auth/*`, `/api/files/proofs/:id`, `/api/facility*` | shared, checked per route |
 
     Missing or expired sessions get `401`; signed-in accounts without the role get `403`, and
@@ -230,12 +267,12 @@ yet. Adding one later means sending the queued rows in `flushOutbox`
     reflect this; they are not the security boundary.
   - Nobody can change a role through the app. Staff and admin accounts are created with
     `npm run create-admin`.
-- **Facility changes never cancel bookings.** Putting a court into maintenance or open play
-  (free for all: players see it marked OPEN PLAY and can't book it), disabling it, closing a
-  date or time, or changing weekly hours first lists the active bookings it would
+- **Facility changes never cancel bookings on their own.** Putting a court into maintenance or
+  open play (free for all: players see it marked OPEN PLAY and can't book it), disabling it,
+  closing a date or time, or changing weekly hours first lists the active bookings it would
   affect (`409 AFFECTS_BOOKINGS`). The change is applied only when the request confirms every
-  one of them by id, and the bookings stay as they are for staff to follow up in chat or cancel
-  with a reason. Courts are never deleted, only disabled, and past closures can't be removed.
+  one of them by id. Staff then either keep the bookings and follow up in chat, or choose
+  **Cancel & credit**, which previews and applies a disruption. Courts are never deleted, only disabled, and past closures can't be removed.
   Every change is written to `audit_log` with the affected booking references.
 - **Passwords** never reach the server. The browser derives
   `clientHash = PBKDF2-SHA256(password, salt, 600 000 iterations)` (16-byte random salt per
@@ -259,8 +296,13 @@ yet. Adding one later means sending the queued rows in `flushOutbox`
 - **Cross-site requests.** Every state-changing request must come from the app's own
   origin (the `Origin` check), on top of SameSite cookies.
 - **Status changes are server-only.** Players can only ask for actions (reserve, upload,
-  release, cancel). The server checks ownership, role and the current status inside one
-  database batch.
+  release an unpaid hold). The server checks ownership, role and the current status inside one
+  database batch. Players never cancel a booking.
+- **Money is computed on the server.** Prices, credit amounts and balances never come from the
+  browser (unknown fields such as `amount` are refused). A disruption confirmation needs the
+  preview's token and an `Idempotency-Key`; every booking update checks the status and version
+  the preview saw. Spending credit runs in the same transaction as the booking, and
+  `CHECK (remaining >= 0)` makes a second spend of the same value fail as a whole.
 - **No double booking.** Each hold is a single atomic `INSERT … WHERE NOT EXISTS
   (overlap)`, backed by a partial unique index.
 - **Payment screenshots:**
@@ -298,8 +340,9 @@ src/worker/             Hono API (TypeScript)
   routes/               auth, facility/availability, bookings, notifications/files,
                         admin.ts (operations, served at /api/staff and /api/admin),
                         admin-settings.ts (admin only), facilities.ts (courts, hours, closures),
+                        disruptions.ts (cancel & credit), credits.ts (players, staff, admin),
                         revenue.ts (admin only: revenue summary, ledger, CSV)
-  lib/                  bookings, payments, availability, facility, chat, notify, images, auth, …
+  lib/                  bookings, payments, availability, facility, disruptions, credits, chat, notify, images, auth, …
 migrations/             D1 schema
 db/                     facility.sql (courts/tables), seed.dev.sql + demo images (local only)
 scripts/                reset-local-db.mjs, create-admin.mjs
@@ -311,6 +354,6 @@ specs/                  technical design
 
 Tournaments, user and staff account management screens (accounts are created with
 `npm run create-admin`, and membership is still confirmed in the database), moving a booking
-to another court or time, a real SMS provider, push notifications, live WebSocket chat
-(the app refreshes every 10–15 seconds instead), and recording refunds (the revenue page
-reports cancelled-after-payment bookings separately because a refund can't be recorded yet).
+to another court or time, staff booking for a walk-in player with their credit, credit expiry
+(no policy decided), a real SMS provider, push notifications, and live WebSocket chat (the app
+refreshes every 10–15 seconds instead).

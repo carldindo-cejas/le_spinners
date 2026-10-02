@@ -47,7 +47,7 @@ export async function heldView({ params }) {
     <div class="stack stack-8 center">
       <p class="overline amber">Booking created</p>
       <h1 class="h1">${b.resource.name} is held for you</h1>
-      <p class="body">Pay ${b.amountLabel} by GCash and upload your screenshot before the timer runs out. Until then, other players see this slot as "On hold".</p>
+      <p class="body">Pay ${b.amountLabel} by GCash${b.creditApplied ? ` (your ${b.creditAppliedLabel} booking credit covers the rest)` : ''} and upload your screenshot before the timer runs out. Until then, other players see this slot as "On hold".</p>
     </div>
     <p class="banner warn" role="alert" data-warn-line hidden>${icon('hourglass', 20, 2.2)}<span><b>Your temporary reservation will expire soon.</b> Upload your proof now to keep ${b.resource.name}.</span></p>
     <a class="banner neutral" href="/bookings/${b.id}" data-ended-line hidden>${icon('clock-x', 20, 2.2)}<span>The hold ended and ${b.resource.name} was released. See what you can do next.</span></a>
@@ -56,6 +56,7 @@ export async function heldView({ params }) {
       <dl class="kv summary-card">
         <div><dt>${b.activity === 'table_tennis' ? 'Table' : 'Court'}</dt><dd>${b.activityLabel} · ${b.resource.name}</dd></div>
         <div><dt>When</dt><dd>${dateLabel(b.date)} · ${bookingTime(b)}</dd></div>
+        ${b.creditApplied ? html`<div><dt>Booking credit</dt><dd class="mono">−${b.creditAppliedLabel}</dd></div>` : ''}
         <div><dt>To pay</dt><dd class="mono">${b.amountLabel}</dd></div>
         <div><dt>Hold ends</dt><dd class="amber-strong">${clock(b.holdExpiresAt)}</dd></div>
       </dl>
@@ -202,6 +203,7 @@ export async function payView({ params, query }) {
     <section class="card amount-card">
       <div class="card-head"><span class="overline">Payment required</span>${statusPill(b.status, { small: true })}</div>
       <p class="amount mono">${b.amountLabel}</p>
+      ${b.creditApplied ? html`<p class="small">${b.totalLabel} total · ${b.creditAppliedLabel} paid with booking credit</p>` : ''}
       <p class="small">${b.rate === 'member' ? 'Member rate' : 'Non-member rate'} · ${b.durationLabel}</p>
       <p class="strong">${b.activityLabel} · ${b.resource.name}</p>
       <p class="small">${monthDayYear(b.date)} · ${bookingTime(b, { full: true })}</p>

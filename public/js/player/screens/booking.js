@@ -1,10 +1,11 @@
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { $, html, on } from '../../core/dom.js';
 import { icon, courtArt } from '../../core/icons.js';
-import { bookingTime, clock, dateLabel, dayClock, initials, isoDate, longDate, peso, shortDate } from './util.js';
+import { bookingTime, clock, dateLabel, dayClock, initials, isoDate, longDate, peso } from './util.js';
 import { copyText, errorState, memberTag, openModal, poll, ringSvg, skeletonRows, startCountdown, statusPill, toast } from '../../core/ui.js';
 import { navigate, show, state, subHeader } from '../shell.js';
 import { lockLine } from '../components.js';
+import { rebookFromBooking } from '../rebook.js';
 
 function when(ms) {
   return isoDate(ms) === isoDate(Date.now()) ? clock(ms) : dayClock(ms);
@@ -34,8 +35,8 @@ function progress(d) {
     .map((e) => ({
       label: e.type === 'created' ? 'Booking created' : e.type === 'approved' ? 'Payment verified' : e.type === 'rejected' ? 'Proof rejected' : e.label,
       time: when(e.at),
-      state: e.type === 'rejected' ? 'error' : 'done',
-      sub: e.type === 'rejected' || e.type === 'cancelled' ? e.note : '',
+      state: e.type === 'rejected' || e.type === 'disrupted' ? 'error' : 'done',
+      sub: ['rejected', 'cancelled', 'disrupted', 'partially_disrupted', 'credit_applied', 'credit_booked'].includes(e.type) ? e.note : '',
     }));
   if (b.status === 'CONFIRMED' || b.status === 'COMPLETED') {
     const approved = d.timeline.find((e) => e.type === 'approved');
@@ -105,6 +106,42 @@ function viewProof(d) {
   });
 }
 
+// ── Disruptions and booking credit (REBOOKING.md §12) ────────────────────────
+
+/** "₱1,000 · GCash · verified", "₱1,000 · Paid with credit", "₱1,200 · ₱600 GCash + ₱600 credit". */
+function paymentLine(b) {
+  if (b.creditApplied > 0 && b.amountDue > 0) return `${b.totalLabel} · ${b.amountLabel} GCash + ${b.creditAppliedLabel} booking credit`;
+  if (b.creditApplied > 0) return `${b.totalLabel} · paid with booking credit`;
+  if (b.paymentMethod === 'on_site') return `${b.amountLabel} · paid on site`;
+  return `${b.amountLabel} · GCash · verified`;
+}
+
+/** Where the booking credit that paid for this booking came from. */
+function creditUsedCard(d) {
+  const uses = d.credit?.creditUses;
+  if (!uses || !uses.sources.length) return '';
+  const refs = [...new Set(uses.sources.map((s) => s.sourceRef).filter(Boolean))];
+  return html`<p class="banner info compact">${icon('gift', 18, 2.2)}<span>${d.booking.creditAppliedLabel} booking credit applied${refs.length ? html` · from <b class="mono">${refs.join(', ')}</b>` : ''}${uses.returned ? ' · returned when this hold ended' : ''}.</span></p>`;
+}
+
+/** Part of a confirmed or completed booking couldn't go ahead and was credited. */
+function partialCards(d) {
+  const parts = (d.credit?.disruptions || []).filter((x) => x.outcome === 'partial');
+  return parts.map((x) => html`<section class="card card-pad stack stack-8 credit-note">
+    <div class="row" data-gap="12"><span class="tile blue">${icon('gift', 22)}</span>
+      <div class="grow"><p class="strong">${x.affectedLabel} couldn't go ahead</p><p class="small">${x.reason}</p></div>
+      ${x.credit > 0 ? html`<span class="mono strong">${x.creditLabel}</span>` : ''}</div>
+    ${x.credit > 0 ? html`<p class="small ink2">Added to your booking credits. It isn't a cash refund: it pays for your next booking. <a href="/credits">See my credits</a></p>` : ''}
+  </section>`);
+}
+
+/** The booking's time was closed while its payment is still being checked. */
+function pendingCard(d) {
+  const p = (d.credit?.disruptions || []).find((x) => x.outcome === 'deferred');
+  if (!p) return '';
+  return html`<section class="banner warn" role="status">${icon('calendar-x', 20, 2.2)}<div><b>Le Spinners closed this time · ${p.reason}.</b><br>Once staff verify your payment, the booking is cancelled and what you paid becomes booking credit.</div></section>`;
+}
+
 // ── Views by status ────────────────────────────────────────────────────────
 
 function verifyingView(d) {
@@ -116,11 +153,13 @@ function verifyingView(d) {
       <div><p class="overline violet">Payment verification</p><p class="h3">Waiting for admin approval</p>
         <p class="small ink2">Payment proof submitted at ${b.submittedAt ? clock(b.submittedAt) : ''}. We'll notify you as soon as staff verify it.</p></div>
     </section>
+    ${pendingCard(d)}
     ${bookingSummaryCard(b)}
+    ${creditUsedCard(d)}
     ${progress(d)}
     ${proofCard(d)}
     ${chatPreview(d)}
-    <p class="small center">Once payment proof is submitted, the booking can't be cancelled. Questions? Ask in the booking chat.</p>
+    <p class="small center">Bookings can't be cancelled in the app. Questions or a change of plans? Ask in the booking chat.</p>
   </div>`;
 }
 
@@ -188,6 +227,7 @@ function confirmedDetails(d) {
       </div>
       <div class="ht-strip"><span class="mono">${b.ref}</span><span>Show at the front desk</span></div>
     </section>
+    ${partialCards(d)}
     ${progress(d)}
     <section class="card card-pad-lg stack stack-8">
       <p class="overline">Booking</p>
@@ -197,21 +237,56 @@ function confirmedDetails(d) {
         <div><dt>Date</dt><dd>${longDate(b.date)}</dd></div>
         <div><dt>Time</dt><dd>${bookingTime(b, { full: true })}</dd></div>
         <div><dt>Status</dt><dd class="${b.status === 'CONFIRMED' ? 'green-text' : ''}">${b.status === 'COMPLETED' ? 'Completed' : 'Confirmed'}</dd></div>
-        <div><dt>Payment</dt><dd>${b.amountLabel} · GCash · verified</dd></div>
+        <div><dt>Payment</dt><dd>${paymentLine(b)}</dd></div>
       </dl>
     </section>
+    ${creditUsedCard(d)}
     <section class="card card-pad-lg stack stack-12">
       <p class="overline">Customer</p>
       <div class="row" data-gap="12"><span class="avatar">${initials(u.name)}</span>
         <div class="grow"><p class="strong">${u.name}</p><p class="small">${[u.phone, u.email].filter(Boolean).join(' · ')}</p></div>${memberTag(u.membership, { small: true })}</div>
     </section>
     ${chatPreview(d)}
-    ${b.status === 'CONFIRMED' ? html`<p class="small center">Confirmed bookings can't be cancelled. If something comes up, message staff in the booking chat.</p>` : ''}
+    ${b.status === 'CONFIRMED' ? html`<p class="small center">Bookings can't be cancelled in the app. If something comes up, message staff in the booking chat. If Le Spinners has to cancel, you get booking credit.</p>` : ''}
+  </div>`;
+}
+
+/** Le Spinners cancelled the booking (closure, weather, repairs…): the credit and the way to rebook. */
+function disruptedDetails(d) {
+  const b = d.booking;
+  const x = (d.credit?.disruptions || []).filter((r) => r.outcome === 'cancelled').pop();
+  const credit = x ? x.credit : b.creditIssued;
+  const left = x && x.creditRemaining != null ? x.creditRemaining : credit;
+  const wasHold = !b.confirmedAt;
+  return html`${detailsHeader(d)}
+  <div class="screen tight screen-enter">
+    <section class="status-banner neutral" role="status">
+      <span class="tile neutral">${icon('calendar-x', 22)}</span>
+      <div><p class="overline">Cancelled by Le Spinners</p><p class="h3">${x ? x.reason : b.cancelReason || 'Cancelled'}</p>
+        <p class="small ink2">${b.cancelledAt ? dayClock(b.cancelledAt) : ''}${x ? ` · ${x.categoryLabel}` : ''}</p></div>
+    </section>
+    <section class="card card-pad-lg stack stack-12">
+      <div class="card-head"><span class="mono">${b.ref}</span>${statusPill('CANCELLED', { small: true })}</div>
+      <dl class="kv">
+        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</dd></div>
+        <div><dt>Paid</dt><dd>${wasHold ? 'Nothing · the hold ended' : paymentLine(b)}</dd></div>
+      </dl>
+    </section>
+    ${credit > 0 ? html`<section class="card card-pad-lg stack stack-12 credit-hero">
+      <div class="row" data-gap="12"><span class="tile blue">${icon('gift', 22)}</span>
+        <div class="grow"><p class="overline blue">Booking credit</p><p class="credit-amount mono">${left < credit ? `${peso(left)} left` : peso(credit)}</p></div></div>
+      <p class="small ink2">${left < credit ? `${peso(credit)} was added for this booking. ` : ''}It isn't a cash refund: it pays for your next booking automatically.</p>
+      ${left > 0 ? html`<button type="button" class="btn btn-primary btn-lg btn-block" data-act="rebook">${icon('calendar-plus', 20)}Rebook</button>` : ''}
+      <a class="btn btn-secondary btn-block" href="/credits">See my booking credits</a>
+    </section>` : html`<p class="banner neutral compact">${icon('info', 18, 2.2)}<span>${wasHold ? 'Nothing was charged for this booking.' : 'Questions about this booking? Ask in its chat.'}</span></p>
+      <a class="btn btn-primary btn-lg btn-block" href="/book">Book another time</a>`}
+    ${chatPreview(d)}
   </div>`;
 }
 
 function cancelledDetails(d) {
   const b = d.booking;
+  if (b.cancelledBy === 'staff' && b.disrupted) return disruptedDetails(d);
   const ev = [...d.timeline].reverse().find((e) => e.type === 'cancelled' || e.type === 'released');
   const byYou = !ev || ev.actor === 'You';
   const paid = Boolean(b.confirmedAt);
@@ -232,50 +307,6 @@ function cancelledDetails(d) {
     </section>` : ''}
     <a class="btn btn-primary btn-lg btn-block" href="/book">Book another time</a>
   </div>`;
-}
-
-function openCancel(d) {
-  const b = d.booking;
-  let reason = null;
-  const reasons = ['Schedule changed', "Can't make it", 'Booked by mistake', 'Other'];
-  let busy = false;
-  const m = openModal({
-    sheet: true,
-    label: 'Cancel this booking?',
-    locked: () => busy,
-    content: () => html`<span class="tile red lg">${icon('circle-slash', 26)}</span>
-      <h2 class="h2">Cancel this booking?</h2>
-      <p class="body"><b>${b.resource.name} · ${dateLabel(b.date)} · ${bookingTime(b)}</b> will be released to other players. This can't be undone.</p>
-      <p class="label">Reason (optional, helps staff)</p>
-      <div class="chip-row wrap" role="group" aria-label="Reason">${reasons.map((r) => html`<button type="button" class="chip" data-reason="${r}" aria-pressed="${reason === r ? 'true' : 'false'}">${r}</button>`)}</div>
-      <p class="banner neutral compact">${icon('info', 18, 2.2)}<span>Your ${b.amountLabel} payment isn't refunded automatically — staff will follow up in the booking chat.</span></p>
-      <button type="button" class="btn btn-danger btn-lg btn-block" data-act="confirm">Cancel booking</button>
-      <button type="button" class="btn btn-secondary btn-block" data-close>Keep booking</button>`,
-    onOpen: (panel) => {
-      on(panel, 'click', '[data-reason]', (_e, btn) => {
-        reason = reason === btn.dataset.reason ? null : btn.dataset.reason;
-        for (const c of panel.querySelectorAll('[data-reason]')) c.setAttribute('aria-pressed', String(c.dataset.reason === reason));
-      });
-      on(panel, 'click', '[data-act="confirm"]', async (_e, btn) => {
-        busy = true;
-        setBusy(btn, true, 'Cancelling…');
-        try {
-          await api.post(`/api/bookings/${b.id}/cancel`, reason ? { reason } : {});
-          busy = false;
-          m.close();
-          navigate(`/bookings/${b.id}/cancelled`, { replace: true });
-        } catch (err) {
-          busy = false;
-          setBusy(btn, false);
-          toast(err.message, { type: 'error' });
-          if (err.code === 'CANCEL_WINDOW_CLOSED' || err.code === 'INVALID_STATUS') {
-            m.close();
-            navigate(`/bookings/${b.id}`, { replace: true });
-          }
-        }
-      });
-    },
-  });
 }
 
 export async function bookingView({ params }) {
@@ -304,7 +335,7 @@ export async function bookingView({ params }) {
   const cleanups = [];
   const wire = () => {
     on(root, 'click', '[data-act="view-proof"]', () => viewProof(d));
-    on(root, 'click', '[data-act="cancel"]', () => openCancel(d));
+    on(root, 'click', '[data-act="rebook"]', () => navigate(rebookFromBooking(d.booking, state.facility.rules.slotMinutes)));
     if (d.booking.status === 'REJECTED' && d.booking.canSubmitProof) {
       cleanups.push(startCountdown(root, {
         expiresAt: d.booking.holdExpiresAt,
@@ -357,7 +388,9 @@ export async function confirmedView({ params }) {
     <div class="done-ring green" aria-hidden="true"><span>${icon('check', 36, 3)}</span></div>
     <div class="stack stack-8 center">
       <h1 class="h1 big">Booking confirmed</h1>
-      <p class="body">Your payment has been verified and your booking is confirmed. See you on the court!</p>
+      <p class="body">${b.creditApplied > 0 && b.amountDue === 0
+        ? `Paid with ${b.creditAppliedLabel} of your booking credit. See you on the court!`
+        : 'Your payment has been verified and your booking is confirmed. See you on the court!'}</p>
     </div>
     <section class="ticket">
       <div class="tk-top">
@@ -369,7 +402,7 @@ export async function confirmedView({ params }) {
       <div class="tk-bottom">
         <div class="row row-between"><div><p class="overline">Booking reference</p><p class="mono tk-ref">${b.ref}</p></div>
           <button type="button" class="icon-btn tonal" data-copy="${b.ref}" aria-label="Copy booking reference">${icon('copy', 20)}</button></div>
-        <div class="grid-2"><div><p class="meta">Payment</p><p class="strong green-text">Verified · ${b.amountLabel}</p></div><div><p class="meta">Player</p><p class="strong">${state.user.name}</p></div></div>
+        <div class="grid-2"><div><p class="meta">Payment</p><p class="strong green-text">${b.creditApplied > 0 ? (b.amountDue > 0 ? `${b.amountLabel} GCash + ${b.creditAppliedLabel} credit` : `Booking credit · ${b.creditAppliedLabel}`) : `Verified · ${b.amountLabel}`}</p></div><div><p class="meta">Player</p><p class="strong">${state.user.name}</p></div></div>
         <p class="small">Show this reference at the front desk when you arrive.</p>
       </div>
     </section>
@@ -384,42 +417,10 @@ export async function confirmedView({ params }) {
   });
 }
 
-// ── S06: booking cancelled ─────────────────────────────────────────────────
+// ── Old /bookings/:id/cancelled links ────────────────────────────────────────
 
-export async function cancelledView({ params }) {
-  show(html`<div class="screen">${skeletonRows(1, 'sk-card')}</div>`);
-  let d;
-  try {
-    d = await api.get(`/api/bookings/${encodeURIComponent(params.id)}`);
-  } catch {
-    return navigate(`/bookings/${params.id}`, { replace: true });
-  }
-  const b = d.booking;
-  if (b.status !== 'CANCELLED') return navigate(`/bookings/${b.id}`, { replace: true });
-  const paid = Boolean(b.confirmedAt);
-  show(html`<div class="screen screen-enter">
-    <div class="done-ring neutral" aria-hidden="true"><span>${icon('circle-slash', 38)}</span></div>
-    <div class="stack stack-8 center">
-      <h1 class="h1">Booking cancelled</h1>
-      <p class="body">${b.resource.name} on ${dateLabel(b.date)} · ${bookingTime(b)} is open again for other players.</p>
-    </div>
-    <section class="card card-pad-lg stack stack-12">
-      <div class="card-head"><span class="mono">${b.ref}</span>${statusPill('CANCELLED', { small: true })}</div>
-      <dl class="kv">
-        <div><dt>Booking</dt><dd class="strike">${b.resource.name} · ${shortDate(b.date)} · ${bookingTime(b)}</dd></div>
-        <div><dt>Cancelled</dt><dd>By you${b.cancelledAt ? ` · ${dayClock(b.cancelledAt)}` : ''}</dd></div>
-        ${b.cancelReason ? html`<div><dt>Reason</dt><dd>${b.cancelReason}</dd></div>` : ''}
-      </dl>
-    </section>
-    ${paid ? html`<section class="card card-pad-lg stack stack-12 refund-card">
-      <p class="h3">About your ${b.amountLabel}</p>
-      <p class="small ink2">Refunds aren't automatic. Staff will reply in this booking's chat about a refund or credit.</p>
-      <a class="btn btn-secondary btn-sm" href="/bookings/${b.id}/chat">${icon('chat', 18)}Open booking chat</a>
-    </section>` : ''}
-    <div class="stack stack-8">
-      <a class="btn btn-primary btn-lg btn-block" href="/book">Book another time</a>
-      <a class="btn btn-secondary btn-block" href="/">Back to home</a>
-    </div>
-  </div>`);
+/** Players can't cancel bookings (REBOOKING.md §4), so this screen only forwards old links. */
+export function cancelledView({ params }) {
+  navigate(`/bookings/${encodeURIComponent(params.id)}`, { replace: true });
 }
 

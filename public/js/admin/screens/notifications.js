@@ -12,6 +12,7 @@ const KIND = {
   hold_expiring: { label: 'Payment window expiring', tile: 'amber', icon: 'hourglass', action: 'View booking', group: 'bookings' },
   new_booking: { label: 'New booking created', tile: 'green', icon: 'calendar-plus', action: 'View booking', group: 'bookings' },
   booking_cancelled: { label: 'Booking cancelled', tile: 'neutral', icon: 'circle-slash', action: 'View booking', group: 'bookings' },
+  disruption: { label: 'Disruption', tile: 'amber', icon: 'calendar-x', action: 'Open the record', group: 'bookings' },
 };
 
 const FILTERS = [

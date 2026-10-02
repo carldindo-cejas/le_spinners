@@ -173,7 +173,7 @@ revenueRoutes.get('/summary', async (c) => {
 /** Empty query values ("?q=") mean "not set". */
 const opt = <T extends z.ZodType>(schema: T) => z.preprocess((v) => (v === '' ? undefined : v), schema.optional());
 
-const PAY_STATUSES = ['paid', 'pending', 'rejected', 'cancelled_paid', 'cancelled_unverified'] as const;
+const PAY_STATUSES = ['paid', 'pending', 'rejected', 'cancelled_paid', 'cancelled_credited', 'cancelled_unverified'] as const;
 type PayStatus = (typeof PAY_STATUSES)[number];
 const SORTS = ['date', 'ref', 'user', 'facility', 'type', 'duration', 'amount', 'method', 'status'] as const;
 
@@ -195,19 +195,22 @@ type LedgerQuery = z.infer<typeof ledgerSchema>;
 // Each booking that ever had a payment proof is one ledger row. Its payment status
 // and timestamp come from the booking's own verification fields:
 //   paid                   verified, booking kept (CONFIRMED / COMPLETED)   → at confirmed_at
-//   cancelled_paid         verified, booking cancelled later               → at confirmed_at
+//   cancelled_credited     verified, cancelled by Le Spinners with a booking credit → at confirmed_at
+//   cancelled_paid         verified, cancelled later, no credit recorded    → at confirmed_at
 //   pending                proof waiting for staff                         → at submitted_at
 //   rejected               latest proof rejected (window open, lapsed or released) → at rejected_at
 //   cancelled_unverified   cancelled while the proof was still unchecked   → at submitted_at
+// amount_due is the cash part; credit_applied (booking credit used) is never cash collected.
 const LEDGER_CTE = `
   WITH ledger AS (
-    SELECT b.id, b.ref, b.status, b.date, b.start_min, b.end_min, b.amount_due, b.rate, b.payment_method,
+    SELECT b.id, b.ref, b.status, b.date, b.start_min, b.end_min, b.amount_due, b.rate, b.payment_method, b.credit_applied,
            ${SEGMENTS_SQL('b')},
            (SELECT COALESCE(SUM(t.end_min - t.start_min), 0) FROM booking_times t WHERE t.booking_id = b.id) AS booked_min,
            b.submitted_at, b.confirmed_at, b.rejected_at, b.cancelled_at, b.updated_at, b.resource_id,
            r.name AS resource_name, r.activity, u.name AS user_name, u.email AS user_email,
            cu.name AS verified_by,
            CASE WHEN b.confirmed_at IS NOT NULL AND b.status IN ('CONFIRMED', 'COMPLETED') THEN 'paid'
+                WHEN b.confirmed_at IS NOT NULL AND EXISTS (SELECT 1 FROM booking_credits c WHERE c.source_booking_id = b.id) THEN 'cancelled_credited'
                 WHEN b.confirmed_at IS NOT NULL THEN 'cancelled_paid'
                 WHEN b.status = 'PAYMENT_SUBMITTED' THEN 'pending'
                 WHEN b.rejected_at IS NOT NULL AND b.rejected_at >= b.submitted_at THEN 'rejected'
@@ -232,7 +235,7 @@ const SORT_SQL: Record<(typeof SORTS)[number], string> = {
   duration: 'booked_min',
   amount: 'amount_due',
   method: 'payment_method',
-  status: `CASE pay_status WHEN 'paid' THEN 1 WHEN 'pending' THEN 2 WHEN 'rejected' THEN 3 WHEN 'cancelled_paid' THEN 4 ELSE 5 END`,
+  status: `CASE pay_status WHEN 'paid' THEN 1 WHEN 'pending' THEN 2 WHEN 'rejected' THEN 3 WHEN 'cancelled_credited' THEN 4 WHEN 'cancelled_paid' THEN 5 ELSE 6 END`,
 };
 
 type LedgerRow = {
@@ -247,6 +250,7 @@ type LedgerRow = {
   amount_due: number;
   rate: 'member' | 'non_member';
   payment_method: PaymentMethod;
+  credit_applied: number;
   submitted_at: number;
   confirmed_at: number | null;
   rejected_at: number | null;
@@ -314,12 +318,14 @@ const PAY_LABEL: Record<PayStatus, string> = {
   pending: 'Pending verification',
   rejected: 'Proof rejected',
   cancelled_paid: 'Cancelled after payment',
+  cancelled_credited: 'Cancelled · credited',
   cancelled_unverified: 'Cancelled · not verified',
 };
 
 const AT_KIND: Record<PayStatus, string> = {
   paid: 'Verified',
   cancelled_paid: 'Verified',
+  cancelled_credited: 'Verified',
   pending: 'Proof submitted',
   rejected: 'Rejected',
   cancelled_unverified: 'Proof submitted',
@@ -350,7 +356,9 @@ function rowDTO(r: LedgerRow) {
     amount: r.amount_due,
     amountLabel: peso(r.amount_due),
     method: r.payment_method,
-    methodLabel: paymentMethodLabel(r.payment_method),
+    methodLabel: paymentMethodLabel(r.payment_method, r.credit_applied),
+    /** Booking credit that paid the rest (never cash collected). */
+    creditApplied: r.credit_applied,
     gcashRef: r.gcash_ref,
     verifiedBy: r.verified_by,
     cancelledAt: r.cancelled_at,
@@ -374,8 +382,8 @@ revenueRoutes.get('/ledger', async (c) => {
               COUNT(CASE WHEN pay_status = 'paid' THEN 1 END) AS paid_n,
               COALESCE(SUM(CASE WHEN pay_status = 'pending' THEN amount_due END), 0) AS pending_amt,
               COUNT(CASE WHEN pay_status = 'pending' THEN 1 END) AS pending_n,
-              COALESCE(SUM(CASE WHEN pay_status = 'cancelled_paid' THEN amount_due END), 0) AS cxl_amt,
-              COUNT(CASE WHEN pay_status = 'cancelled_paid' THEN 1 END) AS cxl_n
+              COALESCE(SUM(CASE WHEN pay_status IN ('cancelled_paid', 'cancelled_credited') THEN amount_due END), 0) AS cxl_amt,
+              COUNT(CASE WHEN pay_status IN ('cancelled_paid', 'cancelled_credited') THEN 1 END) AS cxl_n
          FROM ledger ${f.sql}`,
     )
     .bind(...f.params);

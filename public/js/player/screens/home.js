@@ -139,6 +139,7 @@ export function homeView(ctx) {
         </section>
       </div>
       <div class="col">
+        <div data-credit></div>
         <section class="section o-3">
           <div class="section-head"><h2 class="h2">Upcoming booking</h2><a href="/bookings">See all</a></div>
           <div data-upcoming>${skeletonRows(1, 'sk-card')}</div>
@@ -173,6 +174,11 @@ export function homeView(ctx) {
     try {
       const res = await api.get('/api/bookings');
       stopCountdowns();
+      const credit = res.credits;
+      render(root.querySelector('[data-credit]'), credit && credit.available > 0
+        ? html`<a class="card card-link credit-banner" href="/credits"><span class="tile blue">${icon('gift', 22)}</span>
+            <span class="grow"><span class="strong">You have <span class="mono">${credit.availableLabel}</span> booking credit</span><br><span class="small">It pays for your next booking automatically.</span></span>${icon('chevron-right', 18, 2.2)}</a>`
+        : '');
       render(upcomingEl, upcomingBlock(res.bookings));
       render(recentEl, recentBlock(res.bookings));
       stopCountdowns = startCardCountdowns(upcomingEl, res.now, () => setTimeout(loadBookings, 1500));

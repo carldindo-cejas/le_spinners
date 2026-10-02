@@ -1,5 +1,7 @@
 import type { Bindings } from '../types';
 import { completePast, sweepExpired, warnExpiringHolds } from './bookings';
+import { reconcileCreditHolds } from './credits';
+import { closeUnpaidDeferred } from './disruptions';
 import { flushOutbox } from './notify';
 import { loadSettings } from './settings';
 import { DAY_MS } from './time';
@@ -19,6 +21,9 @@ export async function runMaintenance(env: Bindings, now = Date.now(), opts: { cr
     ['completed', () => completePast(env, now)],
   ];
   if (opts.cron) {
+    // Safety nets: every path that ends a hold already returns its credit in the same batch.
+    tasks.push(['creditsReturned', () => reconcileCreditHolds(env, now)]);
+    tasks.push(['deferredClosed', () => closeUnpaidDeferred(env, now)]);
     tasks.push(['outbox', () => flushOutbox(env)]);
     if (new Date(now).getUTCMinutes() === 0) tasks.push(['housekeeping', () => housekeeping(env, now)]);
   }

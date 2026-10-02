@@ -482,3 +482,27 @@ th.r .th-sort { justify-content: flex-end; }
 .pager-num:hover { background: var(--chalk); }
 .pager-num[aria-current="page"] { background: var(--ink-900); border-color: var(--ink-900); color: #fff; }
 .pager-gap { padding: 0 4px; color: var(--ink-400); }
+
+/* ── Disruptions & booking credits (REBOOKING.md §11) ───────────────────── */
+.dz-list { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.dialog .dz-list { max-height: 46vh; overflow-y: auto; padding-right: 2px; }
+.dz-item { display: flex; gap: 14px; justify-content: space-between; padding: 12px 14px; border: 1px solid var(--line-soft); border-radius: 14px; background: var(--white); }
+.dz-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dz-main .mono { font-size: 13px; }
+.dz-side { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; text-align: right; flex-shrink: 0; }
+.dz-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.dz-totals > div { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; background: var(--chalk); border-radius: 12px; }
+.dz-totals .num { font-size: 22px; font-weight: 800; color: var(--ink-900); }
+.dz-totals .num.sm { font-size: 15px; }
+.dz-not summary { cursor: pointer; font-size: 14px; font-weight: 700; color: var(--ink-700); }
+.dz-not ul { margin: 6px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--ink-700); display: flex; flex-direction: column; gap: 4px; }
+.dz-card { display: flex; flex-direction: column; gap: 6px; color: inherit; text-decoration: none; }
+.dz-card:hover { background: var(--row-hover); }
+.dz-form { max-width: 760px; }
+.dz-history { list-style: none; margin: 0; padding: 0; }
+.seg.sm { padding: 3px; border-radius: 12px; }
+.seg.sm button { min-height: 32px; padding: 4px 10px; font-size: 13px; border-radius: 9px; }
+@media (max-width: 640px) {
+  .dz-item { flex-direction: column; }
+  .dz-side { align-items: flex-start; text-align: left; }
+}

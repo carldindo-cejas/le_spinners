@@ -32,7 +32,8 @@ export function bookingCard(b) {
       <div class="bcard-meta">${where}</div>
       ${b.status === 'PAYMENT_SUBMITTED' ? html`<p class="bcard-line violet">${icon('shield-clock', 16, 2.2)}Payment proof submitted · waiting for admin verification</p>` : ''}
       ${b.status === 'EXPIRED' ? html`<p class="bcard-line">${b.rejectedAt ? 'Proof rejected · slot released' : 'No payment proof within the payment window'}</p>` : ''}
-      ${b.status === 'CANCELLED' ? html`<p class="bcard-line">${b.cancelReason === 'Released by player' ? 'Hold released by you' : 'Cancelled'}${b.cancelledAt ? ` · ${dateLabel(isoDate(b.cancelledAt))}` : ''}</p>` : ''}
+      ${b.status === 'CANCELLED' ? html`<p class="bcard-line">${b.cancelledBy === 'player' ? 'Hold released by you' : 'Cancelled by Le Spinners'}${b.cancelledAt ? ` · ${dateLabel(isoDate(b.cancelledAt))}` : ''}</p>` : ''}
+      ${b.creditIssued > 0 ? html`<p class="bcard-line blue-text">${icon('gift', 16, 2.2)}${b.creditIssuedLabel} booking credit</p>` : ''}
       ${!holding ? html`<div class="bcard-foot">
         <a class="btn btn-secondary btn-sm grow" href="${bookingHref(b)}">View details</a>
         ${b.status !== 'EXPIRED' ? chatButton(b) : ''}

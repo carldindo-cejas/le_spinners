@@ -353,14 +353,18 @@ function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
         setBusy(btn, true, 'Approving…');
         try {
           const post = panel.querySelector('[name="post"]').checked;
-          await api.post(`${API}/bookings/${b.id}/approve`, post ? { message: chatText, checklist: true } : { checklist: true });
+          const res = await api.post(`${API}/bookings/${b.id}/approve`, post ? { message: chatText, checklist: true } : { checklist: true });
           busy = false;
           m.close();
           await refreshBadges();
           const next = await nextPending(b.id);
           const left = state.badges.pendingVerification;
-          toast('Booking confirmed', {
-            sub: left ? `${first} was notified · ${left} left to verify` : `${first} was notified`,
+          // A closure was waiting on this payment: the booking is now cancelled with a credit.
+          const closed = (res.resolvedDisruptions || []).find((x) => x.outcome === 'cancelled' || x.outcome === 'partial');
+          toast(closed ? 'Payment verified · booking cancelled by the closure' : 'Booking confirmed', {
+            sub: closed
+              ? `${first} got ${peso(closed.credit || 0)} booking credit${left ? ` · ${left} left to verify` : ''}`
+              : left ? `${first} was notified · ${left} left to verify` : `${first} was notified`,
             timeout: 8000,
             action: next ? { label: 'Next', onClick: () => navigate(`${BASE}/verify/${next.id}`) } : null,
           });
@@ -498,6 +502,7 @@ export async function verifyDetailView({ params }) {
               : b.status === 'EXPIRED' && b.rejectedAt ? html`<b>Proof rejected</b> by ${b.rejectedBy || 'staff'}; the slot was released.`
                 : html`This booking is <b>${b.status.toLowerCase().replace('_', ' ')}</b> — nothing to verify.`
         }</span></p>` : ''}
+        ${(d.credit?.disruptions || []).filter((x) => x.outcome === 'deferred').map((x) => html`<p class="banner warn" role="status">${icon('calendar-x', 20, 2.2)}<span><b>This time is closed · ${x.reason}.</b> Verify the payment as usual: approving cancels the booking and gives ${firstName(b.user.name)} the value as booking credit. Rejecting leaves nothing to credit.</span></p>`)}
         <div class="cols c-420">
           <div class="stack stack-16">
             <section class="panel panel-body stack stack-8"><p class="eyebrow">Booking verification</p>

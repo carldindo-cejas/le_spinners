@@ -134,7 +134,7 @@ App icons: 512, 192 and maskable. Keep the ball inside the 80% safe circle.
 | `CONFIRMED` | CONFIRMED | Volt | Staff verified the payment. |
 | `REJECTED` | PROOF REJECTED | Red | Reason given. 10-minute resubmit window, then it expires. |
 | `EXPIRED` | EXPIRED | Neutral | No proof in time. Slot released. Final. |
-| `CANCELLED` | CANCELLED | Neutral | By the player (24 h+ ahead) or by staff. Slot released. Final. |
+| `CANCELLED` | CANCELLED | Neutral | A hold the player released, or a booking Le Spinners cancelled (**Cancel & credit** or a disruption; paid bookings get a booking credit). Players never cancel. Slot released. Final. |
 | `COMPLETED` | COMPLETED | Neutral | The booked hour is over. Shown under Past. Final. |
 
 **Booked by** (built 2026-10-01, staff only): every booking records its author — `online` (player app) or made in a console by `staff` / `admin` (with the name). Shown as a sub-line under the reference in the Bookings list and a "Booked by" row on booking details. Console bookings skip `TEMPORARY`/`PAYMENT_SUBMITTED` and start `CONFIRMED`; payment method `on_site` (revenue, ledger method "Paid on site") or `none` (no charge, not in the ledger). Players still see only "Booked".
@@ -143,7 +143,9 @@ App icons: 512, 192 and maskable. Keep the ball inside the 80% safe circle.
 `CONFIRMED` → (hour is over) `COMPLETED`. `TEMPORARY` goes to `EXPIRED` after 10 min with no proof,
 or the player can release it. `PAYMENT_SUBMITTED` goes to `REJECTED` when staff reject. `REJECTED`
 goes back to `PAYMENT_SUBMITTED` with new proof, or to `EXPIRED` after 10 min. `CONFIRMED` goes to
-`CANCELLED` when the player cancels 24 h+ ahead or staff cancel.
+`CANCELLED` when Le Spinners cancels it (Cancel & credit, or a disruption), with a booking credit for the value paid.
+A booking already under way when play stops stays `CONFIRMED` and gets credit for the time that couldn't be played
+(REBOOKING.md).
 Arrow colours on the diagram: player action, staff action, automatic (timer/clock).
 
 ### What other players see
@@ -179,6 +181,10 @@ Admin calendar adds **Blocked / BOOKED BY STAFF**.
   `open_play`, and a hold is refused with `422 OPEN_PLAY`. Staff and admins switch it from Resources
   (Open play / End open play buttons, or the status select in Edit); like maintenance, it lists affected
   bookings first and keeps them.
+- **Booking credit:** AVAILABLE (volt) · PARTLY USED (blue) · USED · REFUNDED · EXPIRED (neutral) · VOIDED (neutral in
+  the player app, red in the consoles). Gift icon, blue tile. Always called "booking credit", never "refund".
+- **Disruption category:** WEATHER · UNSAFE CONDITIONS · MAINTENANCE · EQUIPMENT FAILURE · EMERGENCY · FACILITY ERROR ·
+  CUSTOMER REQUEST (admin only) · OTHER, as amber pills; a `calendar-x` icon marks disruptions.
 - **User account:** ACTIVE · DISABLED
 - **Payment check:** AMOUNT MATCHES · AMOUNT DIFFERS (plus NO REF. NO.)
 
@@ -194,7 +200,8 @@ Admin calendar adds **Blocked / BOOKED BY STAFF**.
 | GCash ref & amount | What they typed | Never | Yes, next to the amount due |
 | Booking chat | One thread per own booking | Never | All threads, each tied to its booking |
 | Phone & email | Their own | Never | Yes |
-| Can change | Reserve, upload proof, release hold, cancel 24 h+ ahead | Nothing | Approve, reject with reason, cancel, block slots (all logged) |
+| Booking credit | Their own credits and history ("Le Spinners" as the actor) | Never | Every credit, with staff names and internal notes |
+| Can change | Reserve, upload proof, release an unpaid hold, rebook with credit. Never cancel a booking | Nothing | Approve, reject with reason, cancel holds, cancel & credit paid bookings, record disruptions, block slots; admins also issue, void and refund credits (all logged) |
 
 **Server rules (Workers + Hono + D1)**
 1. Check ownership on every request. Hiding something in the UI is not enough.
@@ -218,7 +225,12 @@ Admin calendar adds **Blocked / BOOKED BY STAFF**.
 | Proof rejected | Reason + resubmit link | Yes, with reason | — | — | — |
 | Booking expired | "Booking expired" | — | — | — | — |
 | New chat message | Unread badge | — | Unread badge | — | — |
-| Booking cancelled | "Booking cancelled" | Yes | Cancelled | Yes | — |
+| Booking cancelled (hold, by staff) | "Booking cancelled" | Yes | Cancelled | Yes | — |
+| Cancelled by Le Spinners (disruption) | "Booking cancelled by Le Spinners" + reason + credit (+ chat system message) | Yes, with Rebook link | One summary per disruption (unresolved while bookings need follow-up) | — | — |
+| Part of a booking credited | "Part of your booking couldn't go ahead" + credit | Yes | In the summary | — | — |
+| Booking time closed, proof waiting | "Your booking time is closed" · credit follows verification | — | Disruption follow-up | — | — |
+| Booked with booking credit | "Booking confirmed" · paid with credit | Yes | New booking · paid with credit (resolved) | — | — |
+| Credit returned / changed by an admin | "Your booking credit is back" / what changed and why | — / Yes | — | — | — |
 
 - Staff email subject: **"Le Spinners — Booking Requires Payment Verification"**, sent from "Le Spinners Staff Console". The screenshot is never attached; it opens only inside the console.
 - SMS: sender "LeSpinners". Keep it GSM-7 and one segment of 160 characters or less. Use a plain hyphen ("6-7 PM"), because an en dash or emoji switches the message to UCS-2 (70 chars). With no provider connected, every SMS is written to an outbox with status `QUEUED`.
@@ -340,9 +352,10 @@ Each exists once and is reused:
 | Booking expired | "Your hold on Court 2 ended", EXPIRED card, "Book another time", "Already paid but ran out of time? Send your screenshot in the booking chat." |
 | Booking confirmed | Success animation, ticket with reference, "Show this reference at the front desk" |
 | My bookings | Tabs Upcoming / Past / Cancelled. Sections ACTION NEEDED (hold with countdown + Pay now) and COMING UP |
-| Booking details (confirmed) | Ticket, progress, booking table, customer card, chat preview, "Need to cancel?" with 24 h deadline + Cancel booking |
-| Cancel dialog | Consequence, optional reason chips (Schedule changed / Can't make it / Booked by mistake / Other), "Your 500 payment isn't refunded automatically — staff will follow up in the booking chat." |
-| Booking cancelled | Slot reopened, CANCELLED summary (by whom, when, reason), "About your 500 — refunds aren't automatic" |
+| Booking details (confirmed) | Ticket, progress, booking table (Payment: "₱1,000 · GCash · verified", "paid with booking credit" or "GCash + credit"), customer card, chat preview, "Bookings can't be cancelled in the app" note. Part of it disrupted → "5:00 – 6:00 PM couldn't go ahead · ₱600" credit card. **No cancel button** (the mock's cancel dialog is not built: players never cancel) |
+| Booking cancelled by Le Spinners (built 2026-10-02) | Neutral status banner (calendar-x tile, "CANCELLED BY LE SPINNERS", reason, when · category), struck-through booking, Paid line, **Booking credit** card (gift tile, amount or "₱X left", "It isn't a cash refund: it pays for your next booking automatically", **Rebook**, See my booking credits), chat preview. A released hold keeps the plain cancelled view |
+| Booking credits (built 2026-10-02, `/credits`) | "AVAILABLE TO SPEND" hero with the total + Book with my credit; Ready to use / Used and past lists (amount, "From LS-… · reason", state pill); "How booking credit works" 1-2-3. Detail `/credits/:id`: amount left of issued, reserved-by-a-hold banner, why/from/issued/expires, Rebook LS-…, History (issued, used for LS-…, returned, refund recorded, voided) |
+| Rebook (built 2026-10-02) | The booking wizard with a blue "Rebooking LS-… · your booking credit pays at checkout" banner (Stop) on every step; the time step preselects the original times where open; Review shows Price, Booking credit (Use my credit ✓) and "Nothing to pay" / "To pay by GCash"; button **Book with credit** (confirmed at once) or **Reserve & pay ₱X** (top-up hold) |
 | Booking chat | Header with resource/time, reference + status badge, "Private · only you and Le Spinners staff", system events, proof card, composer |
 | Notifications | Mark all read, filter All / Bookings / Messages, grouped TODAY / EARLIER |
 | Notification detail | Message, booking card, reference, View booking / Open booking chat / Notification settings |
@@ -360,7 +373,7 @@ Each exists once and is reused:
 | Approve dialog | Summary + optional "post in chat" message + what the player gets |
 | Reject dialog | Required reason radio (amount mismatch / unclear proof / ref not found / wrong account / other), message to player, keep slot on hold 10 min for corrected proof |
 | Bookings | Tabs All / Needs verification / Temporary / Confirmed / Cancelled & expired, search, date range, Activity/Resource/Status filters, Export CSV, paginated table |
-| Booking details | Header with status + Open chat + Cancel booking, timeline ("Verified by Ana Reyes"), payment, customer card (bookings count, no-shows, **Booked by**: "Online · player app" or "Admin · Ana Reyes"), conversation, "Next" to continue verifying. **Booking chat expands in place** (built 2026-10-01): the "Booking chat" card is a toggle (chevron flips); open, the two columns stretch to one height and the chat fills what's left of its column, ending level with the bottom card of the other column (one-line header when open, floor 240px; on phones a fixed `min(70vh, 520px)`); the thread scrolls inside, with quick replies, composer and "Open in Messages". Same card on the payment review page |
+| Booking details | Header with status + Open chat + **Cancel & credit** (paid/confirmed; "verify the payment first" hint while a proof waits) + Cancel hold (unpaid holds) + Issue credit (admins), Disruption and Booking credit panels (built 2026-10-02), timeline ("Verified by Ana Reyes"), payment, customer card (bookings count, no-shows, **Booked by**: "Online · player app" or "Admin · Ana Reyes"), conversation, "Next" to continue verifying. **Booking chat expands in place** (built 2026-10-01): the "Booking chat" card is a toggle (chevron flips); open, the two columns stretch to one height and the chat fills what's left of its column, ending level with the bottom card of the other column (one-line header when open, floor 240px; on phones a fixed `min(70vh, 520px)`); the thread scrolls inside, with quick replies, composer and "Open in Messages". Same card on the payment review page |
 | New booking (built 2026-10-01, staff + admin, `/bookings/new`) | Personal booking on site, made under the signed-in staff/admin account. Info banner; activity seg, date, court/table chips, time slots picked like the player app (any open times, gaps allowed; staff see names on taken slots), Rate seg (Member / Non-member), Payment radio (**Paid on site** — counted as revenue / **No charge** — personal use), summary (Booked by "Staff · name" / "Admin · name", Total), **Book & confirm**. Confirmed at once, no GCash proof. "New booking" button on the Bookings list (desktop topbar, "New" on phones) |
 | Messages | Conversation list (Verifying / Unread / All) + thread + "THIS BOOKING" side panel with Review payment. Quick replies. One conversation per booking |
 | Resources | Tabs All / Pickleball courts / Table tennis tables. Cards with status, weekly hours, today's load, Edit / Availability / Disable / End maintenance |
@@ -372,7 +385,10 @@ Each exists once and is reused:
 | User profile | Stats (bookings, upcoming, cancelled, expired, holds), contact, membership (member ID, valid until, rate), bookings list, conversations, Send password reset, Disable account |
 | Settings | Sections: Booking rules (payment window, expiring-soon warning, resubmit window, bookings open N days ahead, cancel until N hours before, default slot length), GCash payments (account name, number, QR image), Pricing per hour (resource type × member/non-member), Admin alerts (In-app always on, Email, SMS + Connect provider), Facility info (name, address, time zone), Staff accounts. "Changes are logged with your name." |
 | Setup checklist (empty facility) | "SET UP BOOKING 1 of 4": add courts/tables → weekly hours & slot length → GCash & prices → open booking to players. "Players see right now: Booking opens soon", Preview player view |
-| Affected bookings dialog (built) | Shown before any facility change that touches active bookings: amber alert tile, "This change affects N bookings", list of ref (mono) · resource · date · time · player · status pill (each opens the booking), "These bookings are kept…", **Apply change, keep these bookings** / Go back. Never cancels anything |
+| Affected bookings dialog (built) | Shown before any facility change that touches active bookings: amber alert tile, "This change affects N bookings", list of ref (mono) · resource · date · time · player · status pill (each opens the booking), **Cancel & credit these bookings…** (2026-10-02; the mock's "Cancel & notify") / **Apply change, keep these bookings** / Go back |
+| Cancel & credit dialog (built 2026-10-02) | Step 1: category chips, "Reason players see", internal note, "Couldn't be played from" (started bookings), Also close these times, No booking credit (admins). Step 2 preview: totals (Bookings, Credit now, After payment check), one card per booking (ref, player, status, affected time, paid, flags, Cancel all / Keep the rest where allowed, credit), New bookings blocked line, not-affected list; red **Cancel N · ₱X credit**. Step 3: Done, follow-ups, Open the record |
+| Disruptions (built 2026-10-02, `/disruptions`) | All / Needs follow-up chips; cards (category pill, "N to finish", scope · date · time, reason, bookings, credited, by whom). **Record a disruption** form: date, where (whole facility / all pickleball / all table tennis / one court or table), From now to closing / All day, From–Until, category, reason, note → preview dialog. Record page: totals, closures, one card per booking with outcome, credit link, Verify payment / Apply now / Review again |
+| Booking credits (built 2026-10-02, `/credits`) | Search (player, email, reference), All / Can be spent, rows with player · amount · origin · state. Detail: amount, reserved banner, player, why, from, disruption, issued, History with staff names; admins: Record a cash refund (amount, GCash/cash, reference, note) and Void credit (reason) |
 | My profile (built, staff + admin) | Avatar, name, role tag, email, mobile; Personal information and Change password (12+ characters for staff and admins); session note (12 hours) |
 | Revenue (built, admin only, `/revenue/`) | Top bar: day, date and time + "Revenue". Four summary cards: Daily (volt tile), Weekly (blue), Monthly (violet), Yearly (amber); calendar icon, uppercase label, navy Bricolage amount `₱28,460.00`, change chip (volt up / red down / neutral "No change") "vs ₱X by this point last week", payment count and range, amber line when verified bookings were cancelled after payment. Note on what counts. **Booking Ledger** panel: search (reference, customer, email, court) + Clear filters; Facility (optgroups per activity), Type, Method, Payment status selects; date period row (7D / 30D / 3M / 1Y chips, Custom + From–To dates; ink chip = active) with the range label "Sep 26 – Oct 2, 2026 · facility time" under it (moved into the ledger 2026-10-02; it only filters the ledger); totals strip (Collected, Pending verification, Cancelled after payment); sortable table (Date & time, Booking ID, User, Facility, Type, Duration, Amount, Payment method, Payment status, action) with short status badges + a detail line; cards with a sort menu below 1024px; pager (Showing 1–10 of N records, Rows 10/25/50, Previous · pages · Next, Page X of Y); Export CSV. Read-only: rows open the booking (or Review for pending proofs) |
 
@@ -395,6 +411,9 @@ alerts, Settings, Log out) · Notifications (with "How you're alerted").
 | No upcoming bookings | Empty state + "How booking works" 1-2-3-4 |
 | No courts/tables on a date | Explanation (holds may reopen), "One of them is yours" if applicable, nearest open times, Choose another date |
 | Resource in maintenance | Reason, back-in-service date, "Staff will message you in that booking's chat to move it" |
+| Booking credit changed while booking | Review step reloads the credit, toast "Your booking credit changed. Check the new total, then book again." (`409 CREDIT_CHANGED`); nothing was held or spent |
+| Disruption preview went stale | Dialog shows the fresh preview with an amber "Bookings changed since your preview" banner (`409 DISRUPTION_CHANGED`) |
+| No credit left | Credits screen shows ₱0, the empty state explains when credit is issued; disrupted bookings show "Book another time" instead of Rebook |
 | Slot just taken (409) | "This slot was just taken… Nothing was held or charged." + open times nearby + Continue with … |
 | Time already started | "This time has already started", Pick a later time. Reserve & pay is off until it's fixed. |
 | Offline | Banner "Showing what was saved at 4:09 PM". Live availability is never shown stale. Saved bookings show "Status as of …" |
@@ -417,7 +436,7 @@ alerts, Settings, Log out) · Notifications (with "How you're alerted").
 
 ---
 
-## 16. Implementation status (as of 2026-10-01)
+## 16. Implementation status (as of 2026-10-02)
 
 Built: player app ([public/js/player/](public/js/player/)) and the staff and admin consoles, which
 share [public/js/admin/](public/js/admin/) (dashboard, verify, bookings, calendar, messages,
@@ -433,7 +452,14 @@ Resources and Availability are built more simply than the mocks: one weekly sche
 facility (no per-resource schedules, second ranges, slot-duration picker or "copy to other
 resources"); closed dates per day or time range, for the facility or one court; a resource card
 with status, upcoming booking count and prices, plus Edit / Maintenance / End maintenance /
-Disable. "Move to …" is not built: affected bookings are listed and kept.
+Disable. "Move to …" is not built: affected bookings are listed, then kept or cancelled & credited.
+
+Built 2026-10-02 without a mock: **disruptions and booking credits** (REBOOKING.md; migration
+`0007_disruptions_credits.sql`): Cancel & credit on booking details, the Disruptions list/form/record, the
+console Booking credits screens with admin void and refund records, Cancel & credit in the affected-bookings
+dialog, the player's cancelled-by-Le-Spinners view, Booking credits screens, credit banners (Home, My bookings,
+Profile row) and Rebook through the wizard with credit at checkout. The player cancel dialog and "Booking cancelled
+· By you" screen from the mocks were removed: players never cancel.
 
 Built 2026-10-01/02 without a mock: bookings of several slots with gaps (migration `0005_booking_slots.sql`:
 `booking_slots` holds the booked ranges, the `booking_times` view is what overlap checks read; one booking,
@@ -463,15 +489,17 @@ This is the initial concept and more features will follow. When a new feature or
 5. Record the change in the changelog below, and update §16.
 
 Ideas mentioned or implied in the mocks for later: tournaments (README), membership request
-approval flow, staff accounts management, SMS provider connection, refunds/credits handled in chat
-(recording a refund would let Revenue net out cancelled-after-payment bookings),
-no-show tracking on user profiles, CSV export of the Bookings list (the revenue ledger has one).
+approval flow, staff accounts management, SMS provider connection, "Move to …" another court
+for affected bookings, booking credit expiry and reminders (policy pending), staff booking for a
+walk-in player with their credit, no-show tracking on user profiles, CSV export of the Bookings
+list (the revenue ledger has one).
 
 ## Changelog
 
 | Date | Change |
 |---|---|
 | 2026-10-01 | Initial design memory created from the 9 mock PDFs. |
+| 2026-10-02 | Disruptions and booking credits (REBOOKING.md): players never cancel; Le Spinners cancels with **Cancel & credit** or a disruption and issues booking credit; Rebook with credit; Booking credits screens; console Disruptions and Booking credits; Cancel & credit in the affected-bookings dialog (§6, §7, §8, §13, §14, §16). |
 | 2026-10-01 | Role-based consoles: separate sign-in pages for players (`/login`), staff (`/staff/login`) and admins (`/admin/login`); the staff console at `/staff/` shares the admin screens without Settings. Added Resources, Availability, the affected-bookings dialog and My profile (§12, §13, §16). |
 | 2026-10-01 | Revenue page at `/revenue/` (admin only): summary cards, booking ledger, CSV export (§12, §13, §14, §16). Toasts gain a ✕ and swipe-to-dismiss (§11). |
 | 2026-10-02 | Open play: a court or table can be set to OPEN PLAY (free for all, shown to players, not bookable) from Resources by staff and admins. Shown on the player Home, date card, court cards and time step, the console calendar, dashboard, New booking and Settings → Pricing (§4, §6, §7). |

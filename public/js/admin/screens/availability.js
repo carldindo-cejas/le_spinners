@@ -5,7 +5,8 @@ import { isoDate, minutesLabel, relTime } from '../../core/format.js';
 import { clearFieldErrors, errorState, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame } from '../shell.js';
 import { API, BASE } from '../console.js';
-import { followUpNote, withImpactCheck } from '../impact.js';
+import { disruptionAsPromise, followUpNote, withImpactCheck } from '../impact.js';
+import { openDisruptionDialog } from '../disrupt.js';
 
 const HALF_HOURS = Array.from({ length: 49 }, (_, i) => i * 30);
 const timeLabel = (m) => (m === 1440 ? '12:00 AM (midnight)' : minutesLabel(m));
@@ -98,7 +99,15 @@ export async function availabilityView() {
     if (body.isOpen && body.open >= body.close) return toast(`${name}: closing time must be after opening time.`, { type: 'error' });
     setBusy(btn, true, 'Saving…');
     try {
-      const res = await withImpactCheck((confirmAffected) => api.put(`${API}/availability/hours/${weekday}`, { ...body, confirmAffected }));
+      const res = await withImpactCheck((confirmAffected) => api.put(`${API}/availability/hours/${weekday}`, { ...body, confirmAffected }), {
+        // Cancel & credit the bookings the new hours leave out, then save the hours.
+        disrupt: (affected) => disruptionAsPromise((finish) => openDisruptionDialog({
+          title: `Cancel & credit · ${name} hours`,
+          scope: { kind: 'bookings', bookingIds: affected.map((b) => b.id) },
+          defaults: { category: 'other', reason: `Opening hours changed on ${name}s`, closeSlots: false },
+          onFinish: finish,
+        })).then((r) => (r ? { done: false } : null)),
+      });
       if (!res) return setBusy(btn, false);
       toast(`${name} hours saved`, { sub: followUpNote(res) || 'Players see the new hours right away.' });
       load();
@@ -131,9 +140,19 @@ export async function availabilityView() {
     const btn = form.querySelector('[type="submit"]');
     setBusy(btn, true, 'Adding…');
     try {
-      const res = await withImpactCheck((confirmAffected) => api.post(`${API}/availability/closures`, { ...body, confirmAffected }));
+      const res = await withImpactCheck((confirmAffected) => api.post(`${API}/availability/closures`, { ...body, confirmAffected }), {
+        // A disruption saves the closure together with the cancellations and credits.
+        disrupt: () => disruptionAsPromise((finish) => openDisruptionDialog({
+          title: 'Close and cancel & credit',
+          intro: 'The closure is saved together with the cancellations: nothing is half done if something fails.',
+          scope: { kind: 'window', date: body.date, start: body.start ?? 0, end: body.end ?? 1440, activity: null, resourceId: body.resourceId },
+          defaults: { category: 'other', reason: body.reason },
+          onFinish: finish,
+        })).then((r) => (r ? { done: true, result: r } : null)),
+      });
       if (!res) return setBusy(btn, false);
-      toast('Closed date added', { sub: followUpNote(res) || 'Those times are no longer bookable.' });
+      if (res.disruption) toast('Closed · bookings cancelled & credited', { sub: `${res.disruption.creditedLabel} credited · players were notified` });
+      else toast('Closed date added', { sub: followUpNote(res) || 'Those times are no longer bookable.' });
       load();
     } catch (err) {
       setBusy(btn, false);

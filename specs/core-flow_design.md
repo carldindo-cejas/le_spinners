@@ -41,9 +41,13 @@ Recreational Hub PWA. The UI follows the design canvas (tokens, statuses, screen
 
 **Cancellation and completion**
 
-- The player may release a `TEMPORARY` hold at any time and cancel a `CONFIRMED`
-  booking up to 24 hours before it starts; staff may cancel any active booking
-  with a reason.
+- The player may release a `TEMPORARY` hold at any time. The player shall never be
+  able to cancel a booking: `POST /api/bookings/:id/cancel` answers `409
+  NOT_CANCELLABLE`, and changes of plan go through the booking chat.
+- Staff may cancel an unpaid hold with a reason. A paid or confirmed booking is
+  cancelled only through a disruption (**Cancel & credit**, or a closure window),
+  which issues the player a booking credit for the value paid for the lost time;
+  see [REBOOKING.md](../REBOOKING.md).
 - After the booked hour ends, a `CONFIRMED` booking becomes `COMPLETED`.
 
 **Chat and notifications**
@@ -63,8 +67,10 @@ Recreational Hub PWA. The UI follows the design canvas (tokens, statuses, screen
   proofs, holds, or expired or released bookings as revenue. Each booking is one
   ledger row, so resubmitted proofs can't double count.
 - When a verified booking is cancelled, the system shall report it separately as
-  "cancelled after payment" and leave it out of collected revenue: refunds happen
-  outside the app and aren't recorded, so whether the money was returned is unknown.
+  "cancelled after payment" and leave it out of collected revenue; when Le Spinners
+  cancelled it with a booking credit, the ledger says "Cancelled · credited".
+- `amount_due` is the cash part of a booking; booking credit used to pay for it
+  (`credit_applied`) shall never count as collected revenue.
 - The summary shall show today, this week (Monday–Sunday), this month and this year,
   each compared with the previous period up to the same point, and no percentage when
   that baseline is zero.
@@ -95,6 +101,8 @@ Money is stored in centavos.
 `users`, `sessions`, `rate_limits`, `resources`, `opening_hours`, `closures`,
 `bookings`, `booking_events`, `payment_proofs`, `messages`, `message_reads`,
 `notifications`, `outbox`, `settings`, `audit_log`. See `migrations/0001_init.sql`.
+Disruptions and booking credits add `disruptions`, `disruption_items`,
+`booking_credits` and `credit_transactions` (`migrations/0007_disruptions_credits.sql`).
 
 Double booking is prevented twice:
 
@@ -111,9 +119,9 @@ never blocks a new booking.
 ```
 TEMPORARY ──proof──▶ PAYMENT_SUBMITTED ──approve──▶ CONFIRMED ──hour over──▶ COMPLETED
     │                     │                              │
-    │ 10 min              │ reject (reason)              │ cancel ≥24 h (player) / staff
+    │ 10 min              │ reject (reason)              │ Le Spinners cancels (disruption)
     ▼                     ▼                              ▼
- EXPIRED ◀──no proof── REJECTED ──new proof──▶ PAYMENT_SUBMITTED        CANCELLED
+ EXPIRED ◀──no proof── REJECTED ──new proof──▶ PAYMENT_SUBMITTED        CANCELLED + booking credit
     ▲
     └── player releases the hold ──▶ CANCELLED
 ```

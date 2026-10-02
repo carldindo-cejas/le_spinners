@@ -17,6 +17,8 @@ import { facilitiesView } from './screens/facilities.js';
 import { availabilityView } from './screens/availability.js';
 import { profileView } from './screens/profile.js';
 import { revenueView } from './screens/revenue.js';
+import { disruptionDetailView, disruptionsView, newDisruptionView } from './screens/disruptions.js';
+import { creditDetailView, creditsView } from './screens/credits.js';
 import { BASE, CONSOLE, HOME, REVENUE, isAdminConsole } from './console.js';
 
 /**
@@ -77,6 +79,11 @@ const routes = [
   { path: '/messages', view: guarded(messagesView) },
   { path: '/messages/:id', view: guarded(messagesView) },
   { path: '/notifications', view: guarded(notificationsView) },
+  { path: '/disruptions', view: guarded(disruptionsView) },
+  { path: '/disruptions/new', view: guarded(newDisruptionView) },
+  { path: '/disruptions/:id', view: guarded(disruptionDetailView) },
+  { path: '/credits', view: guarded(creditsView) },
+  { path: '/credits/:id', view: guarded(creditDetailView) },
   { path: '/calendar', view: guarded(calendarView) },
   { path: '/facilities', view: guarded(facilitiesView) },
   { path: '/availability', view: guarded(availabilityView) },

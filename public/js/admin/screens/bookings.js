@@ -7,6 +7,77 @@ import { frame } from '../shell.js';
 import { openViewer } from './verify.js';
 import { miniChat } from '../minichat.js';
 import { API, BASE } from '../console.js';
+import { newIdempotencyKey, openDisruptionDialog } from '../disrupt.js';
+
+// ── Disruptions and booking credit on the booking page (REBOOKING.md §11) ──
+
+const OUTCOME_TEXT = { cancelled: 'Cancelled', partial: 'Kept · part credited', deferred: 'Waiting for payment verification' };
+
+function disruptionPanel(d) {
+  const rows = d.credit?.disruptions || [];
+  if (!rows.length) return '';
+  return html`<section class="panel panel-body stack stack-12"><p class="eyebrow">Disruption</p>
+    ${rows.map((x) => html`<div class="stack stack-4">
+      <p class="row row-wrap" data-gap="8"><span class="pill sm amber">${x.categoryLabel}</span><span class="strong">${OUTCOME_TEXT[x.outcome] || x.outcome}</span></p>
+      <p class="body">${x.reason}</p>
+      <p class="small">Affected ${x.affectedLabel}${x.credit ? ` · ${x.creditLabel} credit` : ''}${x.by ? ` · by ${x.by}` : ''} · ${dayClock(x.at)}</p>
+      ${x.staffNote ? html`<p class="small">Note: ${x.staffNote}</p>` : ''}
+      <a class="link-sm" href="${BASE}/disruptions/${x.disruptionId}">Open the record</a>
+    </div>`)}
+  </section>`;
+}
+
+function creditPanel(d) {
+  const b = d.booking;
+  const uses = d.credit?.creditUses?.sources || [];
+  const issued = (d.credit?.disruptions || []).filter((x) => x.creditId);
+  if (!uses.length && !issued.length) return '';
+  return html`<section class="panel panel-body stack stack-8"><p class="eyebrow">Booking credit</p>
+    ${issued.map((x) => html`<a class="list-row" href="${BASE}/credits/${x.creditId}"><span class="row-tile">${icon('gift', 18)}</span><span class="grow"><span class="row-title">${x.creditLabel} issued</span><br><span class="row-meta">${x.creditRemainingLabel ?? x.creditLabel} left</span></span>${icon('chevron-right', 18, 2.2, 'chev')}</a>`)}
+    ${uses.map((u) => html`<a class="list-row" href="${BASE}/credits/${u.creditId}"><span class="row-tile">${icon('gift', 18)}</span><span class="grow"><span class="row-title">${u.amountLabel} credit used</span><br><span class="row-meta">From ${u.sourceRef || 'a credit issued by an admin'}${d.credit.creditUses.returned ? ' · returned when the hold ended' : ''}</span></span>${icon('chevron-right', 18, 2.2, 'chev')}</a>`)}
+    ${b.creditApplied ? html`<p class="small">Paid ${b.amountLabel} cash + ${b.creditAppliedLabel} credit (only the cash counts as revenue).</p>` : ''}
+  </section>`;
+}
+
+/** Admins add a credit by hand for this booking's player (goodwill, a payment verified late…). */
+function openIssueCredit(b, onDone) {
+  const key = newIdempotencyKey();
+  let busy = false;
+  const m = openModal({
+    label: 'Issue a booking credit',
+    locked: () => busy,
+    content: () => html`<span class="tile blue">${icon('gift', 24)}</span>
+      <h2 class="dialog-title">Issue a booking credit to ${b.user.name}</h2>
+      <p class="body">For ${b.ref}. ${firstName(b.user.name)} can spend it on any booking. It isn't a cash refund.</p>
+      <div class="field"><label class="label" for="ic-amount">Amount (₱) <span class="req">*</span></label><input class="input mono" id="ic-amount" inputmode="decimal" maxlength="9" placeholder="e.g. 500"></div>
+      <div class="field"><label class="label" for="ic-reason">Reason ${firstName(b.user.name)} sees <span class="req">*</span></label><input class="input" id="ic-reason" maxlength="120" placeholder="e.g. Payment verified after the hold ended"></div>
+      <div class="dialog-actions"><button type="button" class="btn btn-primary btn-block" data-act="go">Issue credit</button><button type="button" class="btn btn-secondary btn-block" data-close>Cancel</button></div>`,
+    onOpen: (panel) => {
+      panel.querySelector('[data-act="go"]').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const pesos = Number(panel.querySelector('#ic-amount').value.replace(/[₱,\s]/g, ''));
+        const reason = panel.querySelector('#ic-reason').value.trim();
+        if (!Number.isFinite(pesos) || pesos <= 0 || reason.length < 3) {
+          toast('Enter an amount and a reason.', { type: 'error' });
+          return;
+        }
+        busy = true;
+        setBusy(btn, true, 'Issuing…');
+        try {
+          await api.post('/api/admin/credits', { userId: b.user.id, amount: Math.round(pesos * 100), reason, sourceBookingId: b.id }, { headers: { 'Idempotency-Key': key } });
+          busy = false;
+          m.close();
+          toast('Credit issued', { sub: `${b.user.name} was notified.` });
+          onDone();
+        } catch (err) {
+          busy = false;
+          setBusy(btn, false);
+          toast(err.message, { type: 'error' });
+        }
+      });
+    },
+  });
+}
 
 const CHIPS = [
   { key: 'all', label: 'All', count: (c) => Object.values(c).reduce((a, b) => a + b, 0) },
@@ -240,13 +311,18 @@ export async function bookingDetailView({ params }) {
       topTitle.classList.add('mono');
     }
     const canCancel = d.actions.canCancel;
+    const canDisrupt = d.actions.canDisrupt;
+    const disruptBtn = (cls) => (canDisrupt
+      ? html`<button type="button" class="btn btn-danger-outline ${cls}" data-act="disrupt">${icon('calendar-x', 18)}Cancel &amp; credit</button>`
+      : d.actions.disruptHint ? html`<span class="small muted row" data-gap="6">${icon('calendar-x', 16)}Cancel &amp; credit: ${d.actions.disruptHint.toLowerCase()}</span>` : '');
+    const issueBtn = (cls) => (d.actions.canIssueCredit ? html`<button type="button" class="btn btn-secondary ${cls}" data-act="issue-credit">${icon('gift', 18)}Issue credit</button>` : '');
     render(body, html`<div class="tb-mobile">
         <div class="row row-between"><a class="icon-btn" href="${BASE}/bookings" data-back aria-label="Back to bookings">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}</div>
         <div><p class="m-title">${b.user.name}</p><p class="small light-text mono">${b.ref}</p></div>
       </div>
       <div class="page no-tabbar">
         <div class="row row-wrap only-desktop" data-gap="12"><a class="icon-btn" href="${BASE}/bookings" data-back aria-label="Back to bookings">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}
-          <span class="ml-auto row" data-gap="8"><button type="button" class="btn btn-tonal btn-sm" data-act="open-chat">${icon('chat', 18)}Open chat</button>${canCancel ? html`<button type="button" class="btn btn-danger-outline btn-sm" data-act="cancel">Cancel booking</button>` : ''}</span></div>
+          <span class="ml-auto row row-wrap" data-gap="8"><button type="button" class="btn btn-tonal btn-sm" data-act="open-chat">${icon('chat', 18)}Open chat</button>${issueBtn('btn-sm')}${disruptBtn('btn-sm')}${canCancel ? html`<button type="button" class="btn btn-danger-outline btn-sm" data-act="cancel">Cancel hold</button>` : ''}</span></div>
         ${b.status === 'PAYMENT_SUBMITTED' ? html`<div class="banner violet">${icon('shield-clock', 20, 2.2)}<div class="grow"><b>Waiting for payment verification.</b> ${b.user.name} sent proof ${b.submittedAt ? `at ${clock(b.submittedAt)}` : ''}.</div><a class="btn btn-violet btn-sm" href="${BASE}/verify/${b.id}">Review payment</a></div>` : ''}
         <div class="cols c-155">
           <div class="stack stack-16">
@@ -282,8 +358,11 @@ export async function bookingDetailView({ params }) {
               <dl class="kv"><div><dt>Phone</dt><dd>${b.user.phone ? html`<a href="tel:${b.user.phone.replace(/[^\d+]/g, '')}" data-native>${b.user.phone}</a>` : '—'}</dd></div><div><dt>Email</dt><dd class="ellipsis"><a href="mailto:${b.user.email}" data-native>${b.user.email}</a></dd></div><div><dt>Rate</dt><dd>${b.rate === 'member' ? 'Member' : 'Non-member'} · ${b.amountLabel}${b.durationMin > 60 ? ` for ${b.durationLabel}` : ''}</dd></div><div><dt>Booked by</dt><dd>${bookedByLabel(b)}</dd></div></dl>
             </section>
             <div data-chat-slot></div>
-            ${canCancel ? html`<button type="button" class="btn btn-danger-outline btn-block only-mobile" data-act="cancel">Cancel booking</button>` : ''}
-            ${b.cancelReason ? html`<section class="panel panel-body"><p class="eyebrow">Cancellation</p><p class="body">${b.cancelReason}</p><p class="meta">${b.cancelledAt ? dayClock(b.cancelledAt) : ''}</p></section>` : ''}
+            ${canCancel ? html`<button type="button" class="btn btn-danger-outline btn-block only-mobile" data-act="cancel">Cancel hold</button>` : ''}
+            <div class="stack stack-8 only-mobile">${disruptBtn('btn-block')}${issueBtn('btn-block')}</div>
+            ${disruptionPanel(d)}
+            ${creditPanel(d)}
+            ${b.cancelReason && !(d.credit?.disruptions || []).length ? html`<section class="panel panel-body"><p class="eyebrow">Cancellation</p><p class="body">${b.cancelReason}</p><p class="meta">${b.cancelledAt ? dayClock(b.cancelledAt) : ''}</p></section>` : ''}
           </div>
         </div>
       </div>`);
@@ -301,6 +380,20 @@ export async function bookingDetailView({ params }) {
   }
 
   on(body, 'click', '[data-act="cancel"]', () => openStaffCancel(d.booking, load));
+  on(body, 'click', '[data-act="disrupt"]', () => {
+    const b = d.booking;
+    const started = b.status === 'COMPLETED' || Date.now() >= b.startsAt;
+    openDisruptionDialog({
+      title: `Cancel & credit ${b.ref}`,
+      intro: started
+        ? `${b.user.name}'s booking has started: only the time that couldn't be played is credited, and the booking is kept.`
+        : `${b.user.name} gets back what they paid as booking credit and can rebook in the app.`,
+      scope: { kind: 'bookings', bookingIds: [b.id] },
+      showFrom: started,
+      onDone: load,
+    });
+  });
+  on(body, 'click', '[data-act="issue-credit"]', () => openIssueCredit(d.booking, load));
   on(body, 'click', '[data-act="open-chat"]', () => chat?.show());
   on(body, 'click', '[data-act="proof"]', () => {
     const p = d.proofs[0];

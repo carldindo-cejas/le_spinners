@@ -32,6 +32,8 @@ const NAV = [
       { key: 'bookings', label: 'Bookings', href: `${BASE}/bookings`, icon: 'ticket' },
       { key: 'messages', label: 'Messages', href: `${BASE}/messages`, icon: 'chat', badge: 'unreadChats' },
       { key: 'notifications', label: 'Notifications', href: `${BASE}/notifications`, icon: 'bell', badge: 'unresolved' },
+      { key: 'disruptions', label: 'Disruptions', href: `${BASE}/disruptions`, icon: 'calendar-x', badge: 'disruptionsOpen' },
+      { key: 'credits', label: 'Booking credits', href: `${BASE}/credits`, icon: 'gift' },
     ],
   },
   {
@@ -130,7 +132,7 @@ export async function refreshBadges() {
   try {
     const b = await api.get(`${API}/badges`);
     const prev = state.badges;
-    const changed = ['unresolved', 'pendingVerification', 'unreadChats'].some((k) => b[k] !== prev[k]);
+    const changed = ['unresolved', 'pendingVerification', 'unreadChats', 'disruptionsOpen'].some((k) => b[k] !== prev[k]);
     if (!firstBadges && b.pendingVerification > prev.pendingVerification && current.key !== 'verify') {
       toast('New payment proof to verify', {
         type: 'info',

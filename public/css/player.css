@@ -493,3 +493,21 @@
 .logout-btn:hover { color: var(--red-700); }
 
 .card-head .mono { white-space: nowrap; }
+
+/* ── Booking credits & rebooking (REBOOKING.md §12) ─────────────────────── */
+.blue-text { color: var(--blue-700); }
+.credit-hero .credit-amount { font-size: 34px; line-height: 1.1; color: var(--ink-900); }
+.credit-hero .tile { flex-shrink: 0; }
+.credit-banner { display: flex; align-items: center; gap: 12px; padding: 14px 16px; margin-bottom: 16px; color: inherit; text-decoration: none; }
+.credit-banner .grow { line-height: 1.4; }
+.rebook-banner { align-items: center; }
+.rebook-banner .btn { margin-left: auto; flex-shrink: 0; }
+.credit-row .row-title { display: inline-flex; align-items: baseline; gap: 6px; }
+.credit-history { list-style: none; padding: 0; }
+.credit-history .list-row { align-items: center; }
+.credit-note .strong { line-height: 1.35; }
+.summary-foot.sub { background: transparent; border-top: 1px solid var(--line-soft); border-radius: 0; padding-top: 10px; padding-bottom: 10px; }
+.summary-foot.sub .mono { font-size: 18px; }
+.summary-foot.sub + .summary-foot:not(.sub) { border-top-style: dashed; }
+.credit-line .check-row.compact { min-height: 32px; font-size: 13.5px; font-weight: 600; gap: 8px; margin-top: 2px; }
+.credit-line .check-row.compact .check-box { width: 20px; height: 20px; }

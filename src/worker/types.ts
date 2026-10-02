@@ -91,6 +91,12 @@ export type BookingRow = {
   source: BookingSource;
   created_by: string | null;
   payment_method: PaymentMethod;
+  /** Credit value used to pay for the booking; amount_due is the cash part. */
+  credit_applied: number;
+  /** Value already credited back for this booking (disruptions). */
+  compensated_amount: number;
+  /** The disruption that last changed this booking. */
+  disruption_id: string | null;
   created_at: number;
   updated_at: number;
 };

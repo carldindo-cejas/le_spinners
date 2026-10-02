@@ -83,6 +83,7 @@ export async function profileView() {
       <button type="button" class="list-row" data-act="edit"><span class="row-tile">${icon('user', 20)}</span><span class="grow row-title">Personal information</span>${icon('chevron-right', 18, 2.2, 'chev')}</button>
       <div class="list-row"><span class="row-tile">${icon('shield-check', 20)}</span><span class="grow row-title">Membership</span><span class="small strong ${u.membership === 'member' ? 'green-text' : ''}">${u.membership === 'member' ? 'Active' : u.membership === 'pending' ? 'Pending' : 'Not a member'}</span></div>
       <a class="list-row" href="/bookings?tab=past"><span class="row-tile">${icon('ticket', 20)}</span><span class="grow row-title">Booking history</span><span class="small" data-count></span>${icon('chevron-right', 18, 2.2, 'chev')}</a>
+      <a class="list-row" href="/credits"><span class="row-tile tile-blue">${icon('gift', 20)}</span><span class="grow row-title">Booking credits</span><span class="small mono" data-credit-total></span>${icon('chevron-right', 18, 2.2, 'chev')}</a>
       <button type="button" class="list-row" data-act="password"><span class="row-tile">${icon('lock', 20)}</span><span class="grow row-title">Change password</span>${icon('chevron-right', 18, 2.2, 'chev')}</button>
       <button type="button" class="list-row" data-act="install"><span class="row-tile tile-blue">${icon('install', 20)}</span><span class="grow row-title">Install the app</span>${icon('chevron-right', 18, 2.2, 'chev')}</button>
     </nav>
@@ -107,6 +108,8 @@ export async function profileView() {
     count = res.bookings.length;
     const el = root.querySelector('[data-count]');
     if (el) el.textContent = `${count} booking${count === 1 ? '' : 's'}`;
+    const credit = root.querySelector('[data-credit-total]');
+    if (credit && res.credits) credit.textContent = res.credits.availableLabel;
   } catch {
     /* optional */
   }

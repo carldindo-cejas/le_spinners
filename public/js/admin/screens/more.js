@@ -23,6 +23,8 @@ export function moreView() {
         ${row(`${BASE}/availability`, 'calendar-clock', 'Availability', 'Weekly hours and closed dates')}
         ${row(`${BASE}/calendar`, 'calendar-grid', 'Calendar', 'Every court and table by the hour')}
         ${row(`${BASE}/bookings`, 'ticket', 'Bookings', 'Search and filter every booking')}
+        ${row(`${BASE}/disruptions`, 'calendar-x', 'Disruptions', 'Cancel & credit, closures with credits', state.badges.disruptionsOpen ? html`<span class="badge inline">${state.badges.disruptionsOpen}</span>` : '')}
+        ${row(`${BASE}/credits`, 'gift', 'Booking credits', 'Credits players can spend')}
       </nav>
       <p class="eyebrow">${isAdminConsole ? 'People & alerts' : 'Alerts & account'}</p>
       <nav class="panel menu" aria-label="${isAdminConsole ? 'People and alerts' : 'Alerts and account'}">

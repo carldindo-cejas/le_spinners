@@ -32,8 +32,8 @@ function toError(status, data) {
   return new ApiError(status, e.code || `HTTP_${status}`, e.message || 'Something went wrong. Please try again.', e.details, e.requestId);
 }
 
-async function request(method, path, { body, signal, quiet401 = false } = {}) {
-  const headers = { Accept: 'application/json' };
+async function request(method, path, { body, signal, quiet401 = false, headers: extra = {} } = {}) {
+  const headers = { ...extra, Accept: 'application/json' };
   let payload;
   if (body !== undefined && method !== 'GET') {
     headers['Content-Type'] = 'application/json';

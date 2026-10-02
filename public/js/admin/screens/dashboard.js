@@ -110,6 +110,7 @@ export async function dashboardView() {
             <a class="attn" href="${BASE}/messages"><span class="eyebrow">Unread messages</span><span class="num">${d.counts.unreadChats}</span><span class="sub">${unreadConvs.length ? `from ${unreadConvs.slice(0, 2).map((c) => firstName(c.userName)).join(' and ')}` : 'all caught up'}</span></a>
             <a class="attn" href="${BASE}/bookings?status=holds"><span class="eyebrow">Active holds</span><span class="num">${d.counts.activeHolds}</span><span class="sub">players paying now</span></a>
             <a class="attn${expiring.length ? ' amber' : ''}" href="${BASE}/calendar"><span class="eyebrow">Holds expiring</span><span class="num">${expiring.length}</span><span class="sub">${nextHold ? `${nextHold.resource.name} · ${minutesLabel(nextHold.start).replace(':00', '')} · ${mmss(nextHold.holdExpiresAt - d.now)} left` : 'none right now'}</span></a>
+            ${d.counts.disruptionsOpen ? html`<a class="attn amber" href="${BASE}/disruptions?filter=open"><span class="eyebrow">Disruption follow-up</span><span class="num">${d.counts.disruptionsOpen}</span><span class="sub">bookings still to finish</span></a>` : ''}
           </div>
         </section>
         ${pvSection(d)}

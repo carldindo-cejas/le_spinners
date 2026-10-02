@@ -7,6 +7,7 @@ import {
 } from './util.js';
 import { errorState, memberTag, openModal, poll, skeletonRows, toast } from '../../core/ui.js';
 import { navigate, show, state, wizardHeader } from '../shell.js';
+import { endRebook, rebookBanner, rebookContext, wireRebookBanner } from '../rebook.js';
 
 const ACTIVITIES = ['pickleball', 'table_tennis'];
 const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
@@ -32,6 +33,7 @@ export function activityStep() {
   const member = state.user.membership === 'member';
   const root = show(html`<div class="screen screen-enter">
     ${wizardHeader({ step: 1, label: 'Activity', sub: 'New booking' })}
+    ${rebookBanner(rebookContext())}
     <h1 class="h1">What would you like to play?</h1>
     <div class="stack stack-16">
       ${f.activities.map((a) => html`<a class="activity-card${a.id === 'table_tennis' ? ' tt' : ''}" href="/book/${a.id}">
@@ -47,6 +49,7 @@ export function activityStep() {
       </a>`)}
     </div>
   </div>`);
+  wireRebookBanner(root);
   for (const a of f.activities) {
     api.get(`/api/availability/days?activity=${a.id}`).then((res) => {
       const el = root.querySelector(`[data-open="${a.id}"]`);
@@ -127,6 +130,7 @@ export function dateStep({ params, query }) {
   let selected = isDate(query.get('date')) ? query.get('date') : null;
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 2, label: 'Date', sub: activityLabel(activity), backHref: '/book' })}
+    ${rebookBanner(rebookContext(activity))}
     <div class="page-title-row"><div><h1 class="h1">Pick a date</h1><p class="small" data-range></p></div>
       <button type="button" class="btn btn-secondary btn-sm" data-act="calendar">${icon('calendar', 18)}Calendar</button></div>
     <div class="date-strip" role="group" aria-label="Dates" data-strip>${skeletonRows(1)}</div>
@@ -135,6 +139,7 @@ export function dateStep({ params, query }) {
   </div>
   <div class="sticky-bar"><div class="sticky-inner"><button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="continue" disabled>Continue</button></div></div>`);
 
+  wireRebookBanner(root);
   const strip = $('[data-strip]', root);
   const cardEl = $('[data-daycard]', root);
   const cta = $('[data-act="continue"]', root);
@@ -336,10 +341,12 @@ export function resourceStep({ params }) {
   const noun = activityNoun(activity);
   const root = show(html`<div class="screen screen-enter">
     ${wizardHeader({ step: 3, label: noun === 'court' ? 'Court' : 'Table', sub: `${activityLabel(activity)} · ${dateLabel(date)}`, backHref: `/book/${activity}?date=${date}` })}
+    ${rebookBanner(rebookContext(activity))}
     <div class="stack stack-8"><h1 class="h1">Choose a ${noun}</h1><p class="row small" data-gap="8"><span class="live-dot"></span><span data-live>Live</span></p></div>
     <div class="res-list" data-list>${skeletonRows(3, 'sk-card')}</div>
     <div class="legend"><span><i class="bar-open"></i>Open</span><span><i class="bar-held"></i>On hold</span><span><i class="bar-open-play"></i>Open play</span><span><i class="bar-taken"></i>Taken or unavailable</span></div>
   </div>`);
+  wireRebookBanner(root);
   const list = $('[data-list]', root);
   let day = null;
 
@@ -443,6 +450,7 @@ export function timeStep({ params, query }) {
   let resource = null;
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 4, label: 'Time', sub: `${dateLabel(date)}`, backHref: `/book/${activity}/${date}` })}
+    ${rebookBanner(rebookContext(activity))}
     <div class="page-title-row"><div><h1 class="h1">Choose your times</h1><p class="small">Tap as many open times as you like. They don't have to be back to back.</p></div>
       <button type="button" class="btn btn-text btn-sm" data-act="clear" hidden>Clear</button></div>
     <div class="legend legend-pills"><span class="lp available">Available</span><span class="lp held">On hold</span><span class="lp booked">Booked</span><span class="lp unavailable">Unavailable</span></div>
@@ -453,6 +461,8 @@ export function timeStep({ params, query }) {
     <div class="sticky-summary" aria-live="polite" data-summary></div>
     <button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="continue" disabled>Continue ${icon('arrow-right', 20, 2.4)}</button>
   </div></div>`);
+  wireRebookBanner(root);
+  const rebook = picked.size ? null : rebookContext(activity);
   const slotsEl = $('[data-slots]', root);
   const summary = $('[data-summary]', root);
   const cta = $('[data-act="continue"]', root);
@@ -537,6 +547,11 @@ export function timeStep({ params, query }) {
     try {
       day = await api.get(`/api/availability?activity=${activity}&date=${date}`);
       resource = day.resources.find((r) => r.id === resourceId) || null;
+      if (initial && rebook && resource && !picked.size) {
+        // Rebooking: start from the original booking's times where they're open here.
+        for (const s of rebook.starts || []) if (resource.slots.find((x) => x.start === s)?.state === 'available') picked.add(s);
+        if (picked.size) syncUrl();
+      }
       if (resource && picked.size) {
         // Drop picked times someone else took meanwhile.
         const lost = sorted().filter((s) => resource.slots.find((x) => x.start === s)?.state !== 'available');
@@ -597,9 +612,39 @@ export function reviewStep({ params }) {
   const amount = rate * n;
   const holdMin = state.facility.rules.holdMinutes;
   const timeHref = `/book/${activity}/${date}/${resourceId}?start=${starts.join(',')}`;
+  const rateNote = `${n > 1 ? `${n} × ${peso(rate)}` : `${durationLabel(slotMin)} ×`} ${user.membership === 'member' ? 'member' : 'non-member'} rate`;
+  // The server's figures for the booking credit this booking would use (amounts never come from here).
+  let quote = null;
+  let useCredit = true;
+  const credit = () => (quote && useCredit ? quote.creditApplied : 0);
+  const due = () => (quote ? (useCredit ? quote.amountDue : quote.price) : amount);
+  const coveredByCredit = () => credit() > 0 && due() === 0;
+
+  const moneyRows = () => {
+    if (!quote || quote.creditApplied === 0) {
+      return html`<div class="summary-foot"><div><div class="strong">Total to pay</div><div class="small">${rateNote}</div></div><span class="mono">${peso(due())}</span></div>`;
+    }
+    return html`<div class="summary-foot sub"><div><div class="strong">Price</div><div class="small">${rateNote}</div></div><span class="mono">${peso(quote.price)}</span></div>
+      <div class="summary-foot sub credit-line"><div><div class="strong">Booking credit</div>
+        <label class="check-row compact"><input type="checkbox" data-use-credit ${useCredit ? 'checked' : ''}><span class="check-box">${icon('check', 14, 3)}</span>Use my credit</label></div>
+        <span class="mono${useCredit ? ' blue-text' : ' muted'}">−${peso(quote.creditApplied)}</span></div>
+      <div class="summary-foot"><div><div class="strong">${coveredByCredit() ? 'Nothing to pay' : 'To pay by GCash'}</div>${useCredit && quote.creditApplied ? html`<div class="small">Not a cash refund: your credit pays first</div>` : ''}</div><span class="mono">${peso(due())}</span></div>`;
+  };
+  const nextSteps = () => coveredByCredit()
+    ? html`<ol class="steps-list">
+        <li><span class="n blue">1</span><span>Your booking credit pays the whole <b>${peso(quote.price)}</b>.</span></li>
+        <li><span class="n green">2</span><span>The booking is <b>confirmed right away</b>. No GCash payment or screenshot needed.</span></li>
+      </ol>`
+    : html`<ol class="steps-list">
+        <li><span class="n amber">1</span><span>We hold ${res.name} for you for <b>${holdMin} minutes</b>${credit() ? ` and set aside ${peso(credit())} of your credit` : ''}.</span></li>
+        <li><span class="n blue">2</span><span>Pay <b>${peso(due())}</b> by GCash and upload your screenshot.</span></li>
+        <li><span class="n violet">3</span><span>Staff verify your payment. Then your booking is <b>confirmed</b>.</span></li>
+      </ol>`;
+  const ctaLabel = () => (coveredByCredit() ? html`${icon('gift', 20)}Book with credit` : html`Reserve &amp; pay ${peso(due())}`);
 
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 5, label: 'Review', sub: 'Almost there', backHref: timeHref, closeable: false })}
+    ${rebookBanner(rebookContext(activity))}
     <h1 class="h1">Booking summary</h1>
     <div data-invalid></div>
     <section class="card summary-card">
@@ -612,30 +657,52 @@ export function reviewStep({ params }) {
         <div><dt>Customer</dt><dd>${user.name}</dd></div>
         <div><dt>Type</dt><dd>${memberTag(user.membership)}</dd></div>
       </dl>
-      <div class="summary-foot"><div><div class="strong">Total to pay</div><div class="small">${n > 1 ? `${n} × ${peso(rate)}` : `${durationLabel(slotMin)} ×`} ${user.membership === 'member' ? 'member' : 'non-member'} rate</div></div><span class="mono">${peso(amount)}</span></div>
+      <div data-money>${moneyRows()}</div>
     </section>
     <section class="section">
       <h2 class="h3">What happens next</h2>
-      <ol class="steps-list">
-        <li><span class="n amber">1</span><span>We hold ${res.name} for you for <b>${holdMin} minutes</b>.</span></li>
-        <li><span class="n blue">2</span><span>Pay <b>${peso(amount)}</b> by GCash and upload your screenshot.</span></li>
-        <li><span class="n violet">3</span><span>Staff verify your payment. Then your booking is <b>confirmed</b>.</span></li>
-      </ol>
+      <div data-next>${nextSteps()}</div>
     </section>
   </div>
   <div class="sticky-bar"><div class="sticky-inner" data-actions>
-    <button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="reserve">Reserve &amp; pay ${peso(amount)}</button>
+    <button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="reserve">${ctaLabel()}</button>
     <a class="btn btn-text btn-block" href="${timeHref}" data-back>Change booking</a>
   </div></div>`);
+  wireRebookBanner(root);
 
   const reserve = $('[data-act="reserve"]', root);
+  const repaint = () => {
+    render($('[data-money]', root), moneyRows());
+    render($('[data-next]', root), nextSteps());
+    if (!reserve.disabled) render(reserve, ctaLabel());
+  };
+  on(root, 'change', '[data-use-credit]', (_e, box) => {
+    useCredit = box.checked;
+    repaint();
+  });
+  const loadQuote = () => api.get(`/api/bookings/quote?resourceId=${encodeURIComponent(resourceId)}&starts=${starts.join(',')}`).then((q) => {
+    quote = q;
+    repaint();
+  });
+  loadQuote().catch(() => {
+    /* without a quote the booking still works; the next screen shows the server's amounts */
+  });
+
   reserve.addEventListener('click', async () => {
-    setBusy(reserve, true, 'Reserving…');
+    setBusy(reserve, true, coveredByCredit() ? 'Booking…' : 'Reserving…');
+    const withCredit = Boolean(quote && quote.creditApplied > 0 && useCredit);
     try {
-      const created = await api.post('/api/bookings', { resourceId, date, starts });
-      navigate(`/bookings/${created.booking.id}/held`, { replace: true });
+      const created = await api.post('/api/bookings', { resourceId, date, starts, useCredit: withCredit, expectedCredit: withCredit ? quote.creditApplied : null });
+      endRebook();
+      const b = created.booking;
+      navigate(b.status === 'CONFIRMED' ? `/bookings/${b.id}/confirmed` : `/bookings/${b.id}/held`, { replace: true });
     } catch (err) {
       setBusy(reserve, false);
+      if (err.code === 'CREDIT_CHANGED') {
+        await loadQuote().catch(() => {});
+        toast(err.message, { type: 'warn', sub: 'Check the new total, then book again.' });
+        return;
+      }
       if (err.code === 'SLOT_TAKEN') return openConflict(err, { activity, date, resourceId, starts, resName: res.name });
       const kind = INVALID[err.code];
       if (!kind) {

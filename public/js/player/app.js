@@ -13,6 +13,7 @@ import { bookingsView } from './screens/bookings.js';
 import { chatView } from './screens/chat.js';
 import { notificationsView } from './screens/notifications.js';
 import { profileView } from './screens/profile.js';
+import { creditDetailView, creditsView } from './screens/credits.js';
 
 const HOME = { player: '/', staff: '/staff/', admin: '/admin/' };
 const isPlayer = (u) => Boolean(u) && u.role === 'player';
@@ -92,6 +93,8 @@ const routes = [
   { path: '/bookings/:id/chat', view: guarded(chatView) },
   { path: '/notifications', view: guarded(notificationsView) },
   { path: '/profile', view: guarded(profileView) },
+  { path: '/credits', view: guarded(creditsView) },
+  { path: '/credits/:id', view: guarded(creditDetailView) },
 ];
 
 function watchConnection() {

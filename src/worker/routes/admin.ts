@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppContext, AppEnv, BookingStatus, ResourceRow } from '../types';
 import { dayAvailability } from '../lib/availability';
-import { audit, requireStaff } from '../lib/auth';
+import { audit, clientIp, requireStaff } from '../lib/auth';
+import { ADMIN_RETRO_DAYS, bookingCreditInfo, openDisruptionItems, resolveDeferredForBooking } from '../lib/disruptions';
 import {
   BOOKING_SELECT, bookingDTO, createConsoleBooking, effectiveStatus, getBooking, PICK_A_TIME, hasSlotPick, listEvents, requestedStarts, slotLabel, sweepExpired,
   isOpenPlay, underMaintenance, zSlotPick, type BookingJoin,
@@ -12,8 +13,10 @@ import { notFound, unprocessable } from '../lib/errors';
 import { lazyMaintenance } from '../lib/maintenance';
 import { approvePayment, listProofs, proofLink, rejectPayment, staffCancel } from '../lib/payments';
 import { loadSettings } from '../lib/settings';
-import { dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso } from '../lib/time';
+import { addDays, dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso } from '../lib/time';
 import { jsonBody, parse, query, zActivity, zDate, zId } from '../lib/validate';
+import { staffCreditRoutes } from './credits';
+import { disruptionRoutes } from './disruptions';
 import { facilityAdminRoutes } from './facilities';
 import { notificationDTO, readSchema } from './notifications';
 
@@ -120,6 +123,8 @@ async function summary(c: AppContext) {
       unresolved: ((notif?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0,
       unreadChats: await staffUnreadChats(db),
       upcomingConfirmed: ((upcoming?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0,
+      /** Bookings a disruption still needs staff for (payment waiting, or changed while applying). */
+      disruptionsOpen: await openDisruptionItems(db),
     },
     // Disabled courts are retired, not out of service: they count in neither number.
     facility: {
@@ -174,10 +179,12 @@ operationsRoutes.get('/badges', async (c) => {
          (SELECT COUNT(*) FROM notifications WHERE audience = 'staff' AND resolved_at IS NULL) AS unresolved,
          (SELECT COUNT(*) FROM notifications WHERE audience = 'staff' AND read_at IS NULL) AS unread,
          (SELECT COUNT(*) FROM bookings WHERE status = 'PAYMENT_SUBMITTED') AS pending,
-         (SELECT COUNT(*) FROM bookings WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1) AS holds`,
+         (SELECT COUNT(*) FROM bookings WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1) AS holds,
+         (SELECT COUNT(*) FROM disruption_items
+           WHERE outcome = 'deferred' OR (outcome = 'skipped' AND skip_reason = 'changed')) AS disruptions`,
     )
     .bind(now)
-    .first<{ unresolved: number; unread: number; pending: number; holds: number }>();
+    .first<{ unresolved: number; unread: number; pending: number; holds: number; disruptions: number }>();
   return c.json({
     now,
     unresolved: row?.unresolved ?? 0,
@@ -185,6 +192,7 @@ operationsRoutes.get('/badges', async (c) => {
     pendingVerification: row?.pending ?? 0,
     activeHolds: row?.holds ?? 0,
     unreadChats: await staffUnreadChats(db),
+    disruptionsOpen: row?.disruptions ?? 0,
   });
 });
 
@@ -313,7 +321,7 @@ async function staffDetail(c: AppContext, bookingId: string, now: number) {
   const db = c.env.DB;
   const { settings, offset } = await staffContext(c);
   const b = await getBooking(db, bookingId);
-  const [proofs, timeline, unreadRow] = await Promise.all([
+  const [proofs, timeline, unreadRow, credit, owner] = await Promise.all([
     listProofs(c.env, bookingId),
     listEvents(db, bookingId, true),
     db
@@ -323,9 +331,15 @@ async function staffDetail(c: AppContext, bookingId: string, now: number) {
       )
       .bind(bookingId)
       .first<{ n: number }>(),
+    bookingCreditInfo(db, bookingId, true),
+    db.prepare('SELECT role FROM users WHERE id = ?').bind(b.user_id).first<{ role: string }>(),
   ]);
   const booking = bookingDTO(b, now, settings, offset, true);
   const latest = proofs[0];
+  const staff = requireStaff(c);
+  const today = localNow(offset, now).date;
+  // Cancel & credit: confirmed bookings, and finished ones today (admins: up to ADMIN_RETRO_DAYS back).
+  const recentlyFinished = booking.status === 'COMPLETED' && (b.date >= today || (staff.role === 'admin' && b.date >= addDays(today, -ADMIN_RETRO_DAYS)));
   return {
     now,
     booking,
@@ -340,10 +354,18 @@ async function staffDetail(c: AppContext, bookingId: string, now: number) {
     amountCheck: latest ? amountCheck(b, latest.amountClaimed) : 'unknown',
     timeline,
     unreadMessages: unreadRow?.n ?? 0,
+    credit,
     actions: {
       canApprove: booking.status === 'PAYMENT_SUBMITTED',
       canReject: booking.status === 'PAYMENT_SUBMITTED',
-      canCancel: ['TEMPORARY', 'REJECTED'].includes(booking.status), // paid or confirmed: never
+      /** Unpaid holds: the plain cancel (nothing to credit). */
+      canCancel: ['TEMPORARY', 'REJECTED'].includes(booking.status),
+      /** Paid or confirmed: "Cancel & credit" (a disruption of this one booking). */
+      canDisrupt: booking.status === 'CONFIRMED' || recentlyFinished,
+      /** Why Cancel & credit isn't offered right now, when it will be later. */
+      disruptHint: booking.status === 'PAYMENT_SUBMITTED' ? 'Verify or reject the payment first.' : null,
+      /** Admins can add a credit by hand for this booking's player (players only). */
+      canIssueCredit: staff.role === 'admin' && owner?.role === 'player',
     },
   };
 }
@@ -389,7 +411,9 @@ operationsRoutes.post('/bookings/:id/approve', async (c) => {
   const now = Date.now();
   await approvePayment(c.env, staff, id, now, body.message || null);
   c.executionCtx.waitUntil(audit(c, staff.id, 'payment_approved', 'booking', id));
-  return c.json(await staffDetail(c, id, now));
+  // A disruption that was waiting on this payment now cancels the booking and issues its credit.
+  const disruptions = await resolveDeferredForBooking(c, staff, id, clientIp(c));
+  return c.json({ ...(await staffDetail(c, id, Date.now())), resolvedDisruptions: disruptions });
 });
 
 const rejectSchema = z.object({
@@ -406,7 +430,9 @@ operationsRoutes.post('/bookings/:id/reject', async (c) => {
   const now = Date.now();
   await rejectPayment(c.env, settings, staff, id, { reason: body.reason, message: body.message || null, keepHold: body.keepHold }, now);
   c.executionCtx.waitUntil(audit(c, staff.id, 'payment_rejected', 'booking', id, body.reason));
-  return c.json(await staffDetail(c, id, now));
+  // Rejected for good: a disruption that was waiting on this payment has nothing to credit.
+  const disruptions = body.keepHold ? [] : await resolveDeferredForBooking(c, staff, id, clientIp(c));
+  return c.json({ ...(await staffDetail(c, id, Date.now())), resolvedDisruptions: disruptions });
 });
 
 operationsRoutes.post('/bookings/:id/cancel', async (c) => {
@@ -534,3 +560,8 @@ operationsRoutes.post('/notifications/:id/resolve', async (c) => {
 // ── Courts and tables, weekly hours, closures ─────────────────────────────
 
 operationsRoutes.route('/', facilityAdminRoutes);
+
+// ── Disruptions (cancel & credit) and booking credits ─────────────────────
+
+operationsRoutes.route('/', disruptionRoutes);
+operationsRoutes.route('/', staffCreditRoutes);

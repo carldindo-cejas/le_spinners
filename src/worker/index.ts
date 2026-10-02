@@ -11,6 +11,7 @@ import { operationsRoutes } from './routes/admin';
 import { adminSettingsRoutes } from './routes/admin-settings';
 import { authRoutes, meRoutes } from './routes/auth';
 import { bookingRoutes } from './routes/bookings';
+import { adminCreditRoutes, creditRoutes } from './routes/credits';
 import { facilityRoutes } from './routes/facility';
 import { fileRoutes, notificationRoutes } from './routes/notifications';
 import { revenueRoutes } from './routes/revenue';
@@ -104,18 +105,20 @@ app.route('/api/auth', authRoutes);
 app.route('/api/me', meRoutes);
 app.route('/api', facilityRoutes);
 app.route('/api/bookings', bookingRoutes);
+app.route('/api/credits', creditRoutes);
 app.route('/api/notifications', notificationRoutes);
 app.route('/api/files', fileRoutes);
 // Role namespaces. The guard runs before any handler; handlers check again.
-//   /api/bookings, /api/notifications, /api/availability*  players (routes call requirePlayer)
-//   /api/staff/*   staff and admins: operations (verification, bookings, chat, facility)
-//   /api/admin/*   admins only: the same operations plus settings, prices, the outbox and revenue
+//   /api/bookings, /api/credits, /api/notifications, /api/availability*  players (routes call requirePlayer)
+//   /api/staff/*   staff and admins: operations (verification, bookings, chat, facility, disruptions, credits)
+//   /api/admin/*   admins only: the same operations plus settings, prices, the outbox, revenue and credit changes
 //   /api/me, /api/files, /api/facility*  shared, checked per route
 app.use('/api/staff/*', roleGuard(requireStaff));
 app.use('/api/admin/*', roleGuard(requireAdmin));
 app.route('/api/staff', operationsRoutes);
 app.route('/api/admin', adminSettingsRoutes);
 app.route('/api/admin/revenue', revenueRoutes);
+app.route('/api/admin/credits', adminCreditRoutes);
 app.route('/api/admin', operationsRoutes);
 app.all('/api/*', () => {
   throw notFound('No such endpoint.');

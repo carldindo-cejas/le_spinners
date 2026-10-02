@@ -24,6 +24,7 @@ const PAY_STATUS = [
   { key: 'paid', label: 'Paid · verified' },
   { key: 'pending', label: 'Pending verification' },
   { key: 'rejected', label: 'Proof rejected' },
+  { key: 'cancelled_credited', label: 'Cancelled · credited' },
   { key: 'cancelled_paid', label: 'Cancelled after payment' },
   { key: 'cancelled_unverified', label: 'Cancelled · not verified' },
 ];
@@ -32,6 +33,7 @@ const STATUS_PILL = {
   paid: { cls: 'green', icon: 'check-circle', short: 'Paid' },
   pending: { cls: 'violet', icon: 'shield-clock', short: 'Pending' },
   rejected: { cls: 'red', icon: 'x-circle', short: 'Rejected' },
+  cancelled_credited: { cls: 'blue', icon: 'gift', short: 'Credited' },
   cancelled_paid: { cls: 'amber', icon: 'alert', short: 'Cancelled' },
   cancelled_unverified: { cls: 'neutral', icon: 'circle-slash', short: 'Cancelled' },
 };
@@ -39,6 +41,7 @@ const statusSub = (r) => ({
   paid: r.verifiedBy ? `Verified by ${r.verifiedBy}` : 'Verified',
   pending: '',
   rejected: 'Proof rejected · not collected',
+  cancelled_credited: 'Cancelled by Le Spinners · value kept as booking credit',
   cancelled_paid: 'After payment · refund not recorded',
   cancelled_unverified: 'Before verification',
 })[r.payStatus] || '';

@@ -2,6 +2,7 @@ import * as z from 'zod';
 import type { Activity, Bindings, BookingRow, BookingSource, BookingStatus, PaymentMethod, ResourceRow, SessionUser } from '../types';
 import { conflict, notFound, unprocessable } from './errors';
 import { newId } from './crypto';
+import { isOverspend, planCreditUse, redeemStmts, releaseStmts, spendableCredits, usesNote, type CreditUse } from './credits';
 import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt, type Guard } from './notify';
 import type { Settings } from './settings';
 import {
@@ -39,6 +40,8 @@ export type BookingJoin = BookingRow & {
   created_by_name?: string | null;
   /** JSON [[start, end], …] from booking_times (SEGMENTS_SQL); see segmentsOf. */
   segments_json?: string | null;
+  /** Booking credit issued because Le Spinners cancelled or cut short this booking. */
+  credit_issued?: number;
 };
 
 const zMinute = z.number().int().min(0).max(1439);
@@ -78,7 +81,8 @@ export const BOOKING_SELECT = `
   SELECT b.*, r.name AS resource_name, r.activity AS activity,
          u.name AS user_name, u.email AS user_email, u.phone AS user_phone, u.membership AS user_membership,
          cu.name AS confirmed_by_name, ru.name AS rejected_by_name, bu.name AS created_by_name,
-         ${SEGMENTS_SQL('b')}
+         ${SEGMENTS_SQL('b')},
+         (SELECT COALESCE(SUM(c.amount), 0) FROM booking_credits c WHERE c.source_booking_id = b.id) AS credit_issued
     FROM bookings b
     JOIN resources r ON r.id = b.resource_id
     JOIN users u ON u.id = b.user_id
@@ -143,7 +147,12 @@ export function durationLabel(minutes: number): string {
 const SOURCE_LABEL: Record<BookingSource, string> = { online: 'Online', staff: 'Staff', admin: 'Admin' };
 const METHOD_LABEL: Record<PaymentMethod, string> = { gcash: 'GCash', on_site: 'Paid on site', none: 'No charge' };
 
-export function paymentMethodLabel(m: PaymentMethod): string {
+/**
+ * How a booking was paid. `payment_method` is how the cash part was paid; credit is separate:
+ * 'none' + credit = "Paid with credit", 'gcash' + credit = "GCash + credit".
+ */
+export function paymentMethodLabel(m: PaymentMethod, creditApplied = 0): string {
+  if (creditApplied > 0) return m === 'none' ? 'Paid with credit' : `${METHOD_LABEL[m]} + credit`;
   return METHOD_LABEL[m];
 }
 
@@ -184,11 +193,23 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     createdAt: b.created_at,
     canSubmitProof: holding && (b.hold_expires_at ?? 0) > now,
     canRelease: holding && (b.hold_expires_at ?? 0) > now,
-    canCancel: false, // booked or paid bookings can't be cancelled
+    canCancel: false, // players never cancel; Le Spinners cancels and issues a credit (REBOOKING.md)
     cancelDeadline,
+    /** Who ended a CANCELLED booking: the player releasing a hold, or Le Spinners. */
+    cancelledBy: status === 'CANCELLED' ? (b.cancelled_by && b.cancelled_by === b.user_id ? 'player' : 'staff') : null,
+    /** Le Spinners cancelled it or cut it short (a disruption). */
+    disrupted: Boolean(b.disruption_id),
     source: b.source,
     paymentMethod: b.payment_method,
-    paymentMethodLabel: METHOD_LABEL[b.payment_method],
+    paymentMethodLabel: paymentMethodLabel(b.payment_method, b.credit_applied ?? 0),
+    /** Credit used to pay; amountDue above is the cash part. */
+    creditApplied: b.credit_applied ?? 0,
+    creditAppliedLabel: peso(b.credit_applied ?? 0),
+    totalValue: b.amount_due + (b.credit_applied ?? 0),
+    totalLabel: peso(b.amount_due + (b.credit_applied ?? 0)),
+    /** Credit issued back because Le Spinners cancelled or cut short this booking. */
+    creditIssued: b.credit_issued ?? 0,
+    creditIssuedLabel: peso(b.credit_issued ?? 0),
   };
   if (!forStaff) return dto;
   return {
@@ -268,14 +289,18 @@ export async function sweepExpired(env: Bindings, now = Date.now()): Promise<num
     .bind(now)
     .first();
   if (!pending) return 0;
-  const { results } = await db
-    .prepare(
-      `UPDATE bookings SET status = 'EXPIRED', updated_at = ?1
-        WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at IS NOT NULL AND hold_expires_at <= ?1
-       RETURNING id, user_id, rejected_at, resource_id, date, start_min`,
-    )
-    .bind(now)
-    .all<ExpiredRow>();
+  // The expiry and the return of any booking credit the holds used commit together.
+  const [expired] = await db.batch([
+    db
+      .prepare(
+        `UPDATE bookings SET status = 'EXPIRED', updated_at = ?1
+          WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at IS NOT NULL AND hold_expires_at <= ?1
+         RETURNING id, user_id, rejected_at, resource_id, date, start_min`,
+      )
+      .bind(now),
+    ...releaseStmts(db, `b.status = 'EXPIRED' AND b.updated_at = ?`, [now], now),
+  ]);
+  const results = (expired?.results ?? []) as ExpiredRow[];
   if (!results.length) return 0;
   const names = await resourceNames(db);
   const stmts: D1PreparedStatement[] = [];
@@ -431,7 +456,10 @@ type NewBooking = {
   date: string;
   segments: Segment[];
   status: 'TEMPORARY' | 'CONFIRMED';
+  /** Cash part (amount_due). */
   amount: number;
+  /** Credit part; the booking's price is amount + creditApplied. */
+  creditApplied: number;
   rate: 'member' | 'non_member';
   holdUntil: number | null;
   source: BookingSource;
@@ -454,10 +482,18 @@ function clashSql(who: string, dateParam: string, segsParam: string, nowParam: s
 /**
  * Inserts the booking and its times in one transaction. The booking row is inserted only
  * if none of its times overlap another active booking on the resource, or another active
- * booking of the same user (INSERT … WHERE NOT EXISTS, evaluated atomically); the times
- * are inserted only if the booking was. Returns rows inserted (0 or 1).
+ * booking of the same user, or a closure, and the court is still bookable (INSERT … WHERE
+ * NOT EXISTS, evaluated atomically, so a closure or maintenance saved a moment earlier still
+ * wins); the times are inserted only if the booking was. `extra` statements (spending booking
+ * credit) run in the same batch: if one fails, nothing is booked. Returns rows inserted (0 or 1).
  */
-async function insertBooking(db: D1Database, row: NewBooking, now: number, maxOpenHolds: number | null): Promise<number> {
+async function insertBooking(
+  db: D1Database,
+  row: NewBooking,
+  now: number,
+  maxOpenHolds: number | null,
+  extra: D1PreparedStatement[] = [],
+): Promise<number> {
   const segs = JSON.stringify(row.segments.map((s) => [s.start, s.end]));
   const start = row.segments[0]!.start;
   const end = row.segments[row.segments.length - 1]!.end;
@@ -467,17 +503,28 @@ async function insertBooking(db: D1Database, row: NewBooking, now: number, maxOp
   const insert = db
     .prepare(
       `INSERT INTO bookings (id, ref, user_id, resource_id, date, start_min, end_min, status, amount_due, rate, hold_expires_at, created_at, updated_at,
-                             source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by)
+                             source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by, credit_applied)
        SELECT ?1,
               'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, -3) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
-              ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17
+              ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?19
         WHERE NOT ${clashSql('t.resource_id = ?3', '?4', '?18', '?10')}
           AND NOT ${clashSql('b.user_id = ?2', '?4', '?18', '?10')}
+          AND NOT EXISTS (
+            SELECT 1 FROM closures c, json_each(?18) n
+             WHERE c.date = ?4 AND (c.resource_id IS NULL OR c.resource_id = ?3)
+               AND (c.start_min IS NULL OR c.end_min IS NULL
+                    OR (c.start_min < json_extract(n.value, '$[1]') AND c.end_min > json_extract(n.value, '$[0]'))))
+          AND EXISTS (
+            SELECT 1 FROM resources r
+             WHERE r.id = ?3
+               AND ((r.status = 'active' AND r.open_play = 0)
+                    OR (r.status = 'maintenance' AND r.maintenance_until IS NOT NULL AND r.maintenance_until <= ?4)))
           ${holdCap}`,
     )
     .bind(
       row.id, row.userId, row.resourceId, row.date, start, end, row.amount, row.rate, row.holdUntil, now,
       row.status, row.source, row.createdBy, row.paymentMethod, row.submittedAt, row.confirmedAt, row.confirmedBy, segs,
+      row.creditApplied,
     );
   const times = db
     .prepare(
@@ -487,7 +534,7 @@ async function insertBooking(db: D1Database, row: NewBooking, now: number, maxOp
     )
     .bind(row.id, row.resourceId, row.date, segs);
   try {
-    const [res] = await db.batch([insert, times]);
+    const [res] = await db.batch([insert, times, ...extra]);
     return res?.meta.changes ?? 0;
   } catch (err) {
     if (!String(err).includes('UNIQUE')) throw err;
@@ -499,10 +546,21 @@ async function insertBooking(db: D1Database, row: NewBooking, now: number, maxOp
 async function explainRefusal(
   db: D1Database,
   userId: string,
-  input: { date: string; segments: Segment[]; slots: number },
+  input: { resourceId: string; date: string; segments: Segment[]; slots: number },
   now: number,
   opts: { checkHolds: boolean; self: boolean },
 ): Promise<never> {
+  // A closure or a status change saved after checkSlots ran (the insert checks both atomically).
+  const [closureRes, resourceRes] = await db.batch([
+    db.prepare('SELECT * FROM closures WHERE date = ?').bind(input.date),
+    db.prepare('SELECT * FROM resources WHERE id = ?').bind(input.resourceId),
+  ]);
+  const closure = ((closureRes?.results ?? []) as ClosureRow[]).find((c) => input.segments.some((s) => closureCovers(c, input.resourceId, s.start, s.end)));
+  if (closure) throw unprocessable('CLOSED', closure.reason ? `Unavailable: ${closure.reason}.` : 'That time is unavailable.');
+  const resource = ((resourceRes?.results ?? []) as ResourceRow[])[0];
+  if (!resource || resource.status === 'disabled') throw unprocessable('RESOURCE_UNAVAILABLE', 'That court or table is not available.');
+  if (underMaintenance(resource, input.date)) throw unprocessable('MAINTENANCE', `${resource.name} is under maintenance.`);
+  if (isOpenPlay(resource)) throw unprocessable('OPEN_PLAY', `${resource.name} is open play: free for all, so it can't be booked.`);
   const own = await db
     .prepare(
       `SELECT b.id FROM booking_times t JOIN bookings b ON b.id = t.booking_id, json_each(?3) n
@@ -531,36 +589,114 @@ function whenLabel(segments: Segment[], slots: number): string {
   return segments.map((s) => `${minutesLabel(s.start)} – ${minutesLabel(s.end)}`).join(', ');
 }
 
-export async function createHold(env: Bindings, settings: Settings, user: SessionUser, input: SlotInput, now = Date.now()) {
+/** What a player's booking credit would cover for a price (the server's figures; nothing is held). */
+export async function creditQuote(db: D1Database, userId: string, price: number, now: number) {
+  const plan = planCreditUse(await spendableCredits(db, userId, now), price);
+  return { price, creditApplied: plan.total, amountDue: price - plan.total, uses: plan.uses };
+}
+
+function creditChanged(quote: { price: number; creditApplied: number; amountDue: number }) {
+  return conflict('CREDIT_CHANGED', 'Your booking credit changed. Check the new total, then book again.', {
+    price: quote.price,
+    creditApplied: quote.creditApplied,
+    amountDue: quote.amountDue,
+    priceLabel: peso(quote.price),
+    creditAppliedLabel: peso(quote.creditApplied),
+    amountDueLabel: peso(quote.amountDue),
+  });
+}
+
+/**
+ * Reserve a booking. With `useCredit`, the player's booking credit pays first (soonest-expiring,
+ * then oldest): when it covers the whole price the booking is confirmed at once; otherwise a hold
+ * for the difference is paid by GCash as usual, and the credit comes back if that hold ends unpaid.
+ * `expectedCredit` is what the app showed; it never sets an amount, a mismatch answers 409.
+ */
+export async function createHold(
+  env: Bindings,
+  settings: Settings,
+  user: SessionUser,
+  input: SlotInput & { useCredit?: boolean; expectedCredit?: number | null },
+  now = Date.now(),
+) {
   const db = env.DB;
   const { resourceId, date } = input;
   const { resource, segments, slots } = await checkSlots(env, settings, input, now);
 
   const rate = user.membership === 'member' ? 'member' : 'non_member';
-  const amount = (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+  const price = (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+  const quote = input.useCredit ? await creditQuote(db, user.id, price, now) : { price, creditApplied: 0, amountDue: price, uses: [] as CreditUse[] };
+  if (input.useCredit && input.expectedCredit != null && input.expectedCredit !== quote.creditApplied) throw creditChanged(quote);
+  const paidByCredit = quote.creditApplied > 0 && quote.amountDue === 0;
   const id = newId('b_');
-  const changes = await insertBooking(db, {
-    id, userId: user.id, resourceId, date, segments, status: 'TEMPORARY', amount, rate,
-    holdUntil: now + settings.holdMinutes * 60_000, source: 'online', createdBy: user.id, paymentMethod: 'gcash',
-    submittedAt: null, confirmedAt: null, confirmedBy: null,
-  }, now, MAX_OPEN_HOLDS);
-  if (changes === 0) await explainRefusal(db, user.id, { date, segments, slots }, now, { checkHolds: true, self: true });
+  let changes: number;
+  try {
+    changes = await insertBooking(db, {
+      id, userId: user.id, resourceId, date, segments,
+      status: paidByCredit ? 'CONFIRMED' : 'TEMPORARY',
+      amount: quote.amountDue,
+      creditApplied: quote.creditApplied,
+      rate,
+      holdUntil: paidByCredit ? null : now + settings.holdMinutes * 60_000,
+      source: 'online',
+      createdBy: user.id,
+      paymentMethod: paidByCredit ? 'none' : 'gcash',
+      submittedAt: null,
+      confirmedAt: paidByCredit ? now : null,
+      confirmedBy: null,
+    }, now, paidByCredit ? null : MAX_OPEN_HOLDS, redeemStmts(db, { bookingId: id, userId: user.id, uses: quote.uses, now }));
+  } catch (err) {
+    // Another booking spent the same credit a moment earlier: nothing was booked or spent.
+    if (isOverspend(err)) throw creditChanged(await creditQuote(db, user.id, price, now));
+    throw err;
+  }
+  if (changes === 0) await explainRefusal(db, user.id, { resourceId, date, segments, slots }, now, { checkHolds: !paidByCredit, self: true });
 
   const where = `${resource.name} · ${dateLabel(date)} · ${whenLabel(segments, slots)}`;
+  const credit = quote.uses.length ? usesNote(quote.uses) : null;
+  if (paidByCredit) {
+    await db.batch([
+      eventStmt(db, id, 'credit_booked', user.id, 'player', `Paid with ${credit}`, now),
+      systemMessageStmt(db, id, 'Booked with booking credit · confirmed', now),
+      userNoticeStmt(db, user.id, {
+        type: 'credit_booking_confirmed',
+        title: 'Booking confirmed',
+        body: `${where} · paid with ${peso(quote.creditApplied)} booking credit`,
+        link: `/bookings/${id}`,
+        bookingId: id,
+      }, now),
+      staffNoticeStmt(db, {
+        type: 'new_booking',
+        title: 'New booking · paid with credit',
+        body: `${user.name} · ${where} · confirmed`,
+        link: `/admin/bookings/${id}`,
+        bookingId: id,
+      }, now),
+      // Nothing for staff to do: the notice is informational.
+      resolveStaffStmt(db, id, ['new_booking'], now),
+      outboxStmt(db, 'email', user.email, 'Le Spinners — Booking confirmed',
+        `Hi ${user.name},\n\nYour booking is confirmed, paid with ${peso(quote.creditApplied)} booking credit.\n\n${activityLabel(resource.activity)} · ${where}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${id}\n\nSee you on court!\nLe Spinners Recreational Hub`,
+        id, now),
+    ]);
+    return getBooking(db, id);
+  }
+
+  const pay = credit ? `pay ${peso(quote.amountDue)} within ${settings.holdMinutes} minutes (${peso(quote.creditApplied)} credit applied)` : `pay within ${settings.holdMinutes} minutes`;
   await db.batch([
     eventStmt(db, id, 'created', user.id, 'player', null, now),
-    systemMessageStmt(db, id, 'Temporary booking created', now),
+    ...(credit ? [eventStmt(db, id, 'credit_applied', user.id, 'player', credit, now)] : []),
+    systemMessageStmt(db, id, credit ? `Temporary booking created · ${credit} applied` : 'Temporary booking created', now),
     userNoticeStmt(db, user.id, {
       type: 'hold_created',
       title: 'Slot held for you',
-      body: `${where} · pay within ${settings.holdMinutes} minutes`,
+      body: `${where} · ${pay}`,
       link: `/bookings/${id}/pay`,
       bookingId: id,
     }, now),
     staffNoticeStmt(db, {
       type: 'new_booking',
       title: 'New booking created',
-      body: `${user.name} · ${where} · temporary hold`,
+      body: `${user.name} · ${where} · temporary hold${credit ? ` · ${peso(quote.creditApplied)} credit applied` : ''}`,
       link: `/admin/bookings/${id}`,
       bookingId: id,
     }, now),
@@ -587,14 +723,14 @@ export async function createConsoleBooking(
   const amount = payment === 'none' ? 0 : (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
   const id = newId('b_');
   const changes = await insertBooking(db, {
-    id, userId: staff.id, resourceId, date, segments, status: 'CONFIRMED', amount, rate, holdUntil: null,
+    id, userId: staff.id, resourceId, date, segments, status: 'CONFIRMED', amount, creditApplied: 0, rate, holdUntil: null,
     source, createdBy: staff.id, paymentMethod: payment,
     // Paid at the desk counts as a verified payment for revenue; a free booking has no payment.
     submittedAt: payment === 'on_site' ? now : null,
     confirmedAt: now,
     confirmedBy: staff.id,
   }, now, null);
-  if (changes === 0) await explainRefusal(db, staff.id, { date, segments, slots }, now, { checkHolds: false, self: false });
+  if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false, self: false });
 
   await db.batch([
     eventStmt(db, id, 'console_booked', staff.id, 'staff', payment === 'on_site' ? `Paid on site · ${peso(amount)}` : 'No charge', now),
@@ -618,13 +754,16 @@ export async function releaseHold(env: Bindings, user: SessionUser, bookingId: s
     eventStmt(db, bookingId, 'released', user.id, 'player', null, now, g),
     systemMessageStmt(db, bookingId, 'Hold released by the player', now, g),
     resolveStaffStmt(db, bookingId, ['new_booking', 'hold_expiring', 'proof_submitted'], now, g),
+    // A hold paid partly with booking credit gives that credit back.
+    ...releaseStmts(db, 'b.id = ? AND b.cancelled_at = ?', [bookingId, now], now),
   ]);
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This hold has already ended.');
 }
 
 /**
- * Policy: a booking with a submitted payment or a confirmation can't be cancelled
- * (by the player or by staff). Unpaid holds are released instead (releaseHold).
+ * Policy (REBOOKING.md §4): players never cancel a booking. Unpaid holds can be released
+ * (releaseHold); everything else goes through the booking chat, and only Le Spinners cancels,
+ * issuing a booking credit (lib/disruptions.ts).
  */
 export async function cancelByPlayer(env: Bindings, user: SessionUser, bookingId: string): Promise<never> {
   const b = await getBooking(env.DB, bookingId);
@@ -644,6 +783,11 @@ const EVENT_LABELS: Record<string, string> = {
   released: 'Hold released',
   cancelled: 'Booking cancelled',
   completed: 'Booking completed',
+  disrupted: 'Cancelled by Le Spinners',
+  partially_disrupted: 'Part of the booking credited',
+  credit_booked: 'Booked with booking credit · confirmed',
+  credit_applied: 'Booking credit applied',
+  credit_restored: 'Booking credit returned',
 };
 
 type EventRow = { id: number; type: string; actor_id: string | null; actor_role: 'player' | 'staff' | 'system'; note: string | null; created_at: number; actor_name: string | null };
