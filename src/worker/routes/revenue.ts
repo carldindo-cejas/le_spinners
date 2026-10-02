@@ -207,7 +207,7 @@ const LEDGER_CTE = `
            ${SEGMENTS_SQL('b')},
            (SELECT COALESCE(SUM(t.end_min - t.start_min), 0) FROM booking_times t WHERE t.booking_id = b.id) AS booked_min,
            b.submitted_at, b.confirmed_at, b.rejected_at, b.cancelled_at, b.updated_at, b.resource_id,
-           r.name AS resource_name, r.activity, u.name AS user_name, u.email AS user_email,
+           r.name AS resource_name, r.activity, u.name AS user_name, u.email AS user_email, b.booker_name,
            cu.name AS verified_by,
            CASE WHEN b.confirmed_at IS NOT NULL AND b.status IN ('CONFIRMED', 'COMPLETED') THEN 'paid'
                 WHEN b.confirmed_at IS NOT NULL AND EXISTS (SELECT 1 FROM booking_credits c WHERE c.source_booking_id = b.id) THEN 'cancelled_credited'
@@ -229,7 +229,7 @@ const LEDGER_CTE = `
 const SORT_SQL: Record<(typeof SORTS)[number], string> = {
   date: 'pay_at',
   ref: 'ref',
-  user: 'user_name COLLATE NOCASE',
+  user: 'COALESCE(booker_name, user_name) COLLATE NOCASE',
   facility: 'resource_name COLLATE NOCASE',
   type: 'activity',
   duration: 'booked_min',
@@ -260,6 +260,7 @@ type LedgerRow = {
   activity: 'pickleball' | 'table_tennis';
   user_name: string;
   user_email: string;
+  booker_name: string | null;
   verified_by: string | null;
   pay_status: PayStatus;
   pay_at: number;
@@ -280,8 +281,8 @@ function ledgerFilter(c: AppContext, raw: LedgerQuery) {
   const params: (string | number)[] = [localToMs(from, 0, offset), localToMs(addDays(to, 1), 0, offset)];
   if (raw.q) {
     const like = `%${raw.q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-    where.push(`(ref LIKE ? ESCAPE '\\' OR id = ? OR user_name LIKE ? ESCAPE '\\' OR user_email LIKE ? ESCAPE '\\' OR resource_name LIKE ? ESCAPE '\\')`);
-    params.push(like, raw.q, like, like, like);
+    where.push(`(ref LIKE ? ESCAPE '\\' OR id = ? OR user_name LIKE ? ESCAPE '\\' OR user_email LIKE ? ESCAPE '\\' OR booker_name LIKE ? ESCAPE '\\' OR resource_name LIKE ? ESCAPE '\\')`);
+    params.push(like, raw.q, like, like, like, like);
   }
   if (raw.resource) {
     where.push('resource_id = ?');
@@ -349,6 +350,8 @@ function rowDTO(r: LedgerRow) {
     segments: segmentsOf(r),
     durationMin: bookedMinutes(r),
     user: { name: r.user_name, email: r.user_email },
+    /** Console bookings: who it's for (user is the staff account it's booked under). */
+    bookerName: r.booker_name,
     resource: { id: r.resource_id, name: r.resource_name },
     activity: r.activity,
     activityLabel: activityLabel(r.activity),
@@ -474,7 +477,8 @@ revenueRoutes.get('/export', async (c) => {
   const lines = part === 1 ? [EXPORT_HEADER.map(csvCell).join(',')] : [];
   for (const r of (rowsRes?.results ?? []) as LedgerRow[]) {
     lines.push([
-      localStamp(r.pay_at, f.offset), AT_KIND[r.pay_status], r.ref, r.user_name, r.user_email, r.resource_name, activityLabel(r.activity),
+      // A console booking's customer is its booker (no email); "Verified by" names the staff member who booked it.
+      localStamp(r.pay_at, f.offset), AT_KIND[r.pay_status], r.ref, r.booker_name ?? r.user_name, r.booker_name ? '' : r.user_email, r.resource_name, activityLabel(r.activity),
       r.date, slotLabel(r), bookedMinutes(r), (r.amount_due / 100).toFixed(2), paymentMethodLabel(r.payment_method), r.gcash_ref,
       PAY_LABEL[r.pay_status], r.pay_status === 'paid' ? 'Yes' : 'No', r.verified_by, r.status, localStamp(r.cancelled_at, f.offset),
     ].map(csvCell).join(','));

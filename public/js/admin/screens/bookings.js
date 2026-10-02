@@ -116,10 +116,21 @@ export function bookedByLabel(b, { short = false } = {}) {
   return name ? `${by.label} · ${name}` : by.label;
 }
 
+/** Who the booking is for: the booker's name on console bookings, otherwise the player. */
+export function customerName(b) {
+  return b.bookerName || b.user.name;
+}
+
+function customerSub(b) {
+  // A console booking's account is the staff member's, so show the rate it was booked at instead.
+  if (b.bookerName) return html`<span class="sub ${b.rate === 'member' ? 'green-text' : ''}">${b.rate === 'member' ? 'Member rate' : 'Non-member rate'}</span>`;
+  return html`<span class="sub ${b.user.membership === 'member' ? 'green-text' : ''}">${b.user.membership === 'member' ? 'Member' : b.user.membership === 'pending' ? 'Membership pending' : 'Non-member'}</span>`;
+}
+
 function tableRow(b) {
   return html`<tr>
     <td><a class="ref" href="${BASE}/bookings/${b.id}">${b.ref}</a><span class="sub">${bookedByLabel(b, { short: true })}</span></td>
-    <td><span class="strong">${b.user.name}</span><span class="sub ${b.user.membership === 'member' ? 'green-text' : ''}">${b.user.membership === 'member' ? 'Member' : b.user.membership === 'pending' ? 'Membership pending' : 'Non-member'}</span></td>
+    <td><span class="strong">${customerName(b)}</span>${customerSub(b)}</td>
     <td>${b.resource.name}<span class="sub">${b.activityLabel}</span></td>
     <td>${weekdayShort(b.date)}, ${shortDate(b.date)}<span class="sub">${bookingTime(b)}${b.durationMin > 60 ? ` · ${b.durationLabel}` : ''}</span></td>
     <td class="r mono">${b.amountLabel}</td>
@@ -137,7 +148,7 @@ function mobileCard(b) {
   return html`<a class="m-card" href="${b.status === 'PAYMENT_SUBMITTED' ? `${BASE}/verify/${b.id}` : `${BASE}/bookings/${b.id}`}">
     <div class="row" data-gap="12">
       <span class="m-time">${h}<br><span class="meta">${ap}</span></span>
-      <span class="grow"><span class="strong">${b.user.name}</span><br><span class="small">${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)}${b.durationMin > 60 ? ` · ${b.durationLabel}` : ''} · ${bookedByLabel(b, { short: true })}</span></span>
+      <span class="grow"><span class="strong">${customerName(b)}</span><br><span class="small">${b.resource.name} · ${weekdayShort(b.date)}, ${shortDate(b.date)}${b.durationMin > 60 ? ` · ${b.durationLabel}` : ''} · ${bookedByLabel(b, { short: true })}</span></span>
       ${b.status === 'TEMPORARY' && b.holdExpiresAt ? html`<span class="pill amber sm">${icon('hourglass', 12, 2.4)}On hold</span>` : statusPill(b.status, { small: true })}
     </div>
   </a>`;
@@ -318,7 +329,7 @@ export async function bookingDetailView({ params }) {
     const issueBtn = (cls) => (d.actions.canIssueCredit ? html`<button type="button" class="btn btn-secondary ${cls}" data-act="issue-credit">${icon('gift', 18)}Issue credit</button>` : '');
     render(body, html`<div class="tb-mobile">
         <div class="row row-between"><a class="icon-btn" href="${BASE}/bookings" data-back aria-label="Back to bookings">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}</div>
-        <div><p class="m-title">${b.user.name}</p><p class="small light-text mono">${b.ref}</p></div>
+        <div><p class="m-title">${customerName(b)}</p><p class="small light-text mono">${b.ref}</p></div>
       </div>
       <div class="page no-tabbar">
         <div class="row row-wrap only-desktop" data-gap="12"><a class="icon-btn" href="${BASE}/bookings" data-back aria-label="Back to bookings">${icon('chevron-left', 22, 2.2)}</a>${statusPill(b.status, { small: true })}
@@ -354,8 +365,9 @@ export async function bookingDetailView({ params }) {
           </div>
           <div class="stack stack-16">
             <section class="panel panel-body stack stack-12"><p class="eyebrow">Customer</p>
-              <div class="row" data-gap="12"><span class="avatar">${initials(b.user.name)}</span><span class="grow strong">${b.user.name}</span>${memberTag(b.user.membership, { small: true })}</div>
-              <dl class="kv"><div><dt>Phone</dt><dd>${b.user.phone ? html`<a href="tel:${b.user.phone.replace(/[^\d+]/g, '')}" data-native>${b.user.phone}</a>` : '—'}</dd></div><div><dt>Email</dt><dd class="ellipsis"><a href="mailto:${b.user.email}" data-native>${b.user.email}</a></dd></div><div><dt>Rate</dt><dd>${b.rate === 'member' ? 'Member' : 'Non-member'} · ${b.amountLabel}${b.durationMin > 60 ? ` for ${b.durationLabel}` : ''}</dd></div><div><dt>Booked by</dt><dd>${bookedByLabel(b)}</dd></div></dl>
+              ${b.bookerName ? html`<div class="row" data-gap="12"><span class="avatar">${initials(b.bookerName)}</span><span class="grow strong">${b.bookerName}</span></div>
+              <dl class="kv"><div><dt>Rate</dt><dd>${b.rate === 'member' ? 'Member' : 'Non-member'} · ${b.amountLabel}${b.durationMin > 60 ? ` for ${b.durationLabel}` : ''}</dd></div><div><dt>Booked by</dt><dd>${bookedByLabel(b)}</dd></div></dl>` : html`<div class="row" data-gap="12"><span class="avatar">${initials(b.user.name)}</span><span class="grow strong">${b.user.name}</span>${memberTag(b.user.membership, { small: true })}</div>
+              <dl class="kv"><div><dt>Phone</dt><dd>${b.user.phone ? html`<a href="tel:${b.user.phone.replace(/[^\d+]/g, '')}" data-native>${b.user.phone}</a>` : '—'}</dd></div><div><dt>Email</dt><dd class="ellipsis"><a href="mailto:${b.user.email}" data-native>${b.user.email}</a></dd></div><div><dt>Rate</dt><dd>${b.rate === 'member' ? 'Member' : 'Non-member'} · ${b.amountLabel}${b.durationMin > 60 ? ` for ${b.durationLabel}` : ''}</dd></div><div><dt>Booked by</dt><dd>${bookedByLabel(b)}</dd></div></dl>`}
             </section>
             <div data-chat-slot></div>
             ${canCancel ? html`<button type="button" class="btn btn-danger-outline btn-block only-mobile" data-act="cancel">Cancel hold</button>` : ''}

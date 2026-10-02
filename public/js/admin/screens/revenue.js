@@ -211,7 +211,7 @@ function tableRow(r, thisYear) {
   return html`<tr>
     <td class="nowrap">${whenCell(r, thisYear)}</td>
     <td class="nowrap"><a class="ref" href="${BASE}/bookings/${r.id}">${r.ref}</a></td>
-    <td class="cell-user"><span class="strong">${r.user.name}</span><span class="sub">${emailCell(r.user.email)}</span></td>
+    <td class="cell-user"><span class="strong">${r.bookerName || r.user.name}</span><span class="sub">${r.bookerName ? `On site · ${r.user.name}` : emailCell(r.user.email)}</span></td>
     <td>${r.resource.name}<span class="sub">${shortDate(r.date)} · ${bookingTime(r)}</span></td>
     <td>${r.activityLabel}</td>
     <td class="nowrap">${durationLabel(r.durationMin)}</td>
@@ -228,7 +228,7 @@ function mobileCard(r, thisYear) {
   return html`<a class="m-card ledger-card" href="${r.payStatus === 'pending' ? `${BASE}/verify/${r.id}` : `${BASE}/bookings/${r.id}`}">
     <div class="row row-between" data-gap="8"><span class="mono meta nowrap">${r.ref}</span>${statusPill(r, { short: true })}</div>
     <div class="row row-between row-top" data-gap="12">
-      <span class="grow"><span class="strong">${r.user.name}</span><br><span class="small">${r.resource.name} · ${r.activityLabel} · ${durationLabel(r.durationMin)}</span></span>
+      <span class="grow"><span class="strong">${r.bookerName || r.user.name}</span><br><span class="small">${r.resource.name} · ${r.activityLabel} · ${durationLabel(r.durationMin)}</span></span>
       <span class="mono strong nowrap${r.countsAsRevenue ? '' : ' amt-muted'}">${money(r.amount)}</span>
     </div>
     <span class="meta">${r.atKind} · ${dayClock(r.at)}${isoDate(r.at).slice(0, 4) !== thisYear ? `, ${isoDate(r.at).slice(0, 4)}` : ''} · ${r.methodLabel}${r.gcashRef ? ` · Ref ${r.gcashRef}` : ''}</span>

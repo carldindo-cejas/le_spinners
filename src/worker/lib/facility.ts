@@ -54,7 +54,7 @@ export async function affectedBookings(c: AppContext, scope: ImpactScope, now = 
     params = [scope.weekday, scope.isOpen ? 1 : 0, scope.open, scope.close, scope.slotMinutes];
   }
   const { results } = await c.env.DB.prepare(
-    `SELECT b.id, b.ref, b.status, b.date, b.start_min, b.end_min, ${SEGMENTS_SQL('b')}, r.name AS resource_name, u.name AS user_name
+    `SELECT b.id, b.ref, b.status, b.date, b.start_min, b.end_min, ${SEGMENTS_SQL('b')}, r.name AS resource_name, COALESCE(b.booker_name, u.name) AS user_name
        FROM bookings b JOIN resources r ON r.id = b.resource_id JOIN users u ON u.id = b.user_id
       WHERE ${OCCUPYING('b', '?1')} AND (b.date > ?2 OR (b.date = ?2 AND b.end_min > ?3)) AND ${where}
       ORDER BY b.date, b.start_min, r.sort_order

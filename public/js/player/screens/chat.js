@@ -2,7 +2,7 @@ import { api } from '../../core/api.js';
 import { $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, shortDate } from './util.js';
-import { messageList, openImage } from '../../core/chatview.js';
+import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { refreshBadges, show } from '../shell.js';
 
@@ -20,7 +20,7 @@ export function chatView({ params }) {
     <form class="composer" data-form>
       <span data-attach></span>
       <label class="sr-only" for="chat-input">Message</label>
-      <textarea id="chat-input" class="composer-input" name="body" rows="1" maxlength="1000" placeholder="Type a message…" required></textarea>
+      <textarea id="chat-input" class="composer-input" name="body" rows="1" maxlength="${MESSAGE_MAX_CHARS}" placeholder="Type a message…" required></textarea>
       <button type="submit" class="send-btn" aria-label="Send">${icon('send', 20, 2.2)}</button>
     </form>
   </div>`);
@@ -28,6 +28,7 @@ export function chatView({ params }) {
   const log = $('[data-log]', root);
   const form = $('[data-form]', root);
   const input = $('#chat-input', root);
+  const syncCount = charCounter(input);
 
   function paintHead() {
     const b = data.booking;
@@ -92,6 +93,7 @@ export function chatView({ params }) {
       const res = await api.post(`/api/bookings/${encodeURIComponent(id)}/messages`, { body });
       input.value = '';
       input.style.removeProperty('height');
+      syncCount();
       data.messages = res.messages;
       paintLog(true);
     } catch (err) {

@@ -2,7 +2,7 @@ import { api } from '../../core/api.js';
 import { $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, firstName, initials, relTime, shortDate } from '../../core/format.js';
-import { messageList, openImage } from '../../core/chatview.js';
+import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { frame, refreshBadges } from '../shell.js';
 import { API, BASE } from '../console.js';
@@ -85,7 +85,7 @@ export function messagesView({ params }) {
         <ol class="thread-log" role="log" aria-live="polite" data-log></ol>
         <div class="thread-compose">
           <div class="quick-replies">${QUICK.map((q) => html`<button type="button" class="chip" data-quick="${q}">${q}</button>`)}</div>
-          <form data-form><label class="sr-only" for="reply">Reply</label><textarea id="reply" class="composer-input" rows="1" maxlength="1000" placeholder="Reply to ${firstName(b.user.name)}…"></textarea><button type="submit" class="send-btn" aria-label="Send">${icon('send', 20, 2.2)}</button></form>
+          <form data-form><label class="sr-only" for="reply">Reply</label><textarea id="reply" class="composer-input" rows="1" maxlength="${MESSAGE_MAX_CHARS}" placeholder="Reply to ${firstName(b.user.name)}…"></textarea><button type="submit" class="send-btn" aria-label="Send">${icon('send', 20, 2.2)}</button></form>
         </div>`);
       wireComposer(threadEl);
       force = true;
@@ -124,6 +124,7 @@ export function messagesView({ params }) {
   function wireComposer(threadEl) {
     const form = threadEl.querySelector('[data-form]');
     const input = threadEl.querySelector('#reply');
+    const syncCount = charCounter(input);
     input.addEventListener('input', () => {
       input.style.setProperty('height', 'auto');
       input.style.setProperty('height', `${Math.min(input.scrollHeight, 140)}px`);
@@ -136,6 +137,7 @@ export function messagesView({ params }) {
     });
     on(threadEl, 'click', '[data-quick]', (_e, btn) => {
       input.value = btn.dataset.quick;
+      syncCount();
       input.focus();
     });
     on(threadEl, 'click', '[data-proof]', (_e, btn) => openImage(btn.dataset.proof));
@@ -149,6 +151,7 @@ export function messagesView({ params }) {
         const res = await api.post(`${API}/bookings/${encodeURIComponent(activeId)}/messages`, { body });
         input.value = '';
         input.style.removeProperty('height');
+        syncCount();
         thread.messages = res.messages;
         paintThread(true);
         loadList();

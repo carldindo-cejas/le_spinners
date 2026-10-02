@@ -856,8 +856,10 @@ section('Reject, resubmit, reject and release');
 
 section('Booking chat');
 {
-  const long = await juan.post(`/api/bookings/${juanBooking.id}/messages`, { body: 'x'.repeat(1001) });
-  check('message over 1000 chars → 422', long.status === 422);
+  const long = await juan.post(`/api/bookings/${juanBooking.id}/messages`, { body: 'x'.repeat(121) });
+  check('message over 120 chars → 422', long.status === 422);
+  const atLimit = await juan.post(`/api/bookings/${juanBooking.id}/messages`, { body: 'x'.repeat(120) });
+  check('message of exactly 120 chars → 201', atLimit.status === 201, atLimit.data);
   const blank = await juan.post(`/api/bookings/${juanBooking.id}/messages`, { body: '   ' });
   check('blank message → 422', blank.status === 422);
   const sent = await juan.post(`/api/bookings/${juanBooking.id}/messages`, { body: 'Can I bring a guest? <b>hi</b>' });
@@ -866,7 +868,7 @@ section('Booking chat');
 
   const inbox = await ana.get('/api/admin/messages');
   const conv = inbox.data.conversations.find((x) => x.bookingId === juanBooking.id);
-  check('staff inbox shows the thread as unread', conv?.unread === 1, conv);
+  check('staff inbox shows the thread as unread', conv?.unread === 2, conv);
   const badges = await ana.get('/api/admin/badges');
   check('staff badge counts unread chats', badges.data.unreadChats >= 1, badges.data);
   const opened = await ana.get(`/api/admin/bookings/${juanBooking.id}/messages`);
@@ -1071,13 +1073,22 @@ section('Console bookings (personal bookings on site)');
 
   const asPlayer = await juan.post('/api/staff/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'none' });
   check('player cannot make a console booking → 403', asPlayer.status === 403, asPlayer.status);
-  const badPay = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'gcash' });
+  const badPay = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'gcash', bookerName: 'Lito Ramos' });
   check('console booking must be paid on site or free → 422', badPay.status === 422, badPay.data);
+  const noName = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'none' });
+  check('console booking needs the booker\'s name → 422', noName.status === 422 && Boolean(noName.data.error?.details?.bookerName), noName.data);
+  const blankName = await rhea.post('/api/staff/bookings', { resourceId: 'table-1', date: CD, start, rate: 'member', payment: 'none', bookerName: '   ' });
+  check('a blank booker name → 422', blankName.status === 422 && Boolean(blankName.data.error?.details?.bookerName), blankName.data);
 
-  const paid = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, starts: [start, start + 60], rate: 'non_member', payment: 'on_site' });
+  const paid = await ana.post('/api/admin/bookings', { resourceId: 'table-1', date: CD, starts: [start, start + 60], rate: 'non_member', payment: 'on_site', bookerName: '  Lito Ramos ' });
   const b = paid.data.booking;
   check('admin books on site → 201 CONFIRMED', paid.status === 201 && b?.status === 'CONFIRMED', paid.data);
   check('booked under the admin\'s own account', b?.user?.name === 'Ana Reyes');
+  check('records the booker\'s name, trimmed', b?.bookerName === 'Lito Ramos', b?.bookerName);
+  const grid = await ana.get(`/api/admin/schedule?date=${CD}&activity=table_tennis`);
+  check('staff schedule shows the booker\'s name on the slot', grid.data.resources.find((x) => x.id === 'table-1').slots.find((s) => s.start === start)?.booking?.userName === 'Lito Ramos');
+  const found = await ana.get('/api/admin/bookings?scope=all&q=Lito%20Ram');
+  check('bookings search finds the booker\'s name', found.data.bookings.some((x) => x.id === b.id), found.data.bookings?.map((x) => x.ref));
   check('records the author: Admin · Ana Reyes', b?.bookedBy?.source === 'admin' && b.bookedBy.label === 'Admin' && b.bookedBy.name === 'Ana Reyes', b?.bookedBy);
   check('paid on site, 2 × ₱300', b?.paymentMethod === 'on_site' && b?.amountDue === 60000, { m: b?.paymentMethod, a: b?.amountDue });
   check('no approval step: confirmed by the author', b?.confirmedBy === 'Ana Reyes' && paid.data.actions?.canApprove === false);
@@ -1085,24 +1096,27 @@ section('Console bookings (personal bookings on site)');
 
   const pv = await pedro.get(`/api/availability?activity=table_tennis&date=${CD}`);
   const ps = pv.data.resources.find((x) => x.id === 'table-1').slots;
-  check('players see both hours as booked, with no name', ps.find((s) => s.start === start)?.state === 'booked' && ps.find((s) => s.start === start + 60)?.state === 'booked' && !/Ana/.test(JSON.stringify(pv.data)));
+  check('players see both hours as booked, with no name', ps.find((s) => s.start === start)?.state === 'booked' && ps.find((s) => s.start === start + 60)?.state === 'booked' && !/Ana|Lito/.test(JSON.stringify(pv.data)));
   const clash = await pedro.post('/api/bookings', { resourceId: 'table-1', date: CD, start: start + 60 });
   check('players cannot book over it → 409', clash.status === 409, clash.data);
 
   const dayCard = async () => (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
   const beforeFree = await dayCard();
-  const staffFree = await rhea.post('/api/staff/bookings', { resourceId: 'table-2', date: CD, start, rate: 'member', payment: 'none' });
+  const staffFree = await rhea.post('/api/staff/bookings', { resourceId: 'table-2', date: CD, start, rate: 'member', payment: 'none', bookerName: 'Rhea Lim' });
   const afterFree = await dayCard();
   check('a free console booking is not counted as a payment on the revenue cards', afterFree.payments === beforeFree.payments && afterFree.collected === beforeFree.collected, { before: beforeFree, after: afterFree });
   const fb = staffFree.data.booking;
   check('staff book on site free of charge → 201', staffFree.status === 201 && fb?.status === 'CONFIRMED' && fb?.amountDue === 0 && fb?.paymentMethod === 'none', staffFree.data);
   check('records the author: Staff · name', fb?.bookedBy?.source === 'staff' && Boolean(fb.bookedBy.name), fb?.bookedBy);
-  const sameTime = await rhea.post('/api/staff/bookings', { resourceId: 'table-3', date: CD, start, rate: 'member', payment: 'none' });
+  const sameTime = await rhea.post('/api/staff/bookings', { resourceId: 'table-3', date: CD, start, rate: 'member', payment: 'none', bookerName: 'Rhea Lim' });
   check('staff cannot double-book themselves → 422 OVERLAP_OWN', sameTime.status === 422 && sameTime.data.error.code === 'OVERLAP_OWN', sameTime.data);
 
   const ledger = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${b.ref}`);
   const row = ledger.data.rows?.find((r) => r.id === b.id);
   check('paid-on-site booking is revenue, method "Paid on site"', row?.payStatus === 'paid' && row?.methodLabel === 'Paid on site' && row?.amount === 60000, ledger.data);
+  check('ledger row carries the booker\'s name', row?.bookerName === 'Lito Ramos', row);
+  const byBooker = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=Lito`);
+  check('ledger search finds the booker\'s name', byBooker.data.rows?.some((r) => r.id === b.id), byBooker.data.rows);
   const free = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${fb.ref}`);
   check('free console booking is not in the ledger', !free.data.rows?.some((r) => r.id === fb.id), free.data.rows);
   const onSite = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&method=on_site`);
@@ -1434,7 +1448,7 @@ let windowDisruption;
   const bHold = (await maria.post('/api/bookings', { resourceId: 'court-2', date: DW, starts: [s0] })).data.booking;
   const subHold = (await kim.post('/api/bookings', { resourceId: 'court-3', date: DW, starts: [s0] })).data.booking;
   await kim.req('POST', `/api/bookings/${subHold.id}/proof`, { form: proofForm(pngFile('k.png', PAY_PNG), { amountPesos: (subHold.amountDue / 100).toFixed(2) }) });
-  const free = (await rhea.post('/api/staff/bookings', { resourceId: 'court-2', date: DW, starts: [s1], rate: 'member', payment: 'none' })).data.booking;
+  const free = (await rhea.post('/api/staff/bookings', { resourceId: 'court-2', date: DW, starts: [s1], rate: 'member', payment: 'none', bookerName: 'Rhea Lim' })).data.booking;
   check('setup: seven bookings on the day', [bConf, bGap, bAfter, bTable, bHold, subHold, free].every((b) => b?.id), [bConf, bGap, bAfter, bTable, bHold, subHold, free].map((b) => b?.status));
 
   const body = { scope: { kind: 'window', date: DW, start: s0, end: s3, activity: 'pickleball' }, category: 'weather', reason: 'Heavy rain', staffNote: 'Gutter overflow on Court 2' };

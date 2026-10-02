@@ -431,7 +431,7 @@ export function previewDTO(plan: Plan) {
     items: plan.items.map((i) => ({
       bookingId: i.booking.id,
       ref: i.booking.ref,
-      userName: i.booking.user_name,
+      userName: i.booking.booker_name ?? i.booking.user_name,
       resourceName: i.booking.resource_name,
       activity: i.booking.activity,
       date: i.booking.date,
@@ -455,7 +455,7 @@ export function previewDTO(plan: Plan) {
     notAffected: plan.notAffected.map((n) => ({
       bookingId: n.booking.id,
       ref: n.booking.ref,
-      userName: n.booking.user_name,
+      userName: n.booking.booker_name ?? n.booking.user_name,
       label: `${n.booking.resource_name} · ${dateLabel(n.booking.date)} · ${rangesLabel(segmentsOf(n.booking))}`,
       reason: n.reason,
       reasonLabel: NOT_AFFECTED_LABEL[n.reason],
@@ -1109,7 +1109,7 @@ export async function disruptionDetail(db: D1Database, id: string, now: number) 
   const [items, closures] = await db.batch([
     db
       .prepare(
-        `SELECT di.*, b.ref, b.status AS booking_status, b.hold_expires_at, u.name AS user_name, c.id AS credit_id, c.remaining AS credit_remaining
+        `SELECT di.*, b.ref, b.status AS booking_status, b.hold_expires_at, COALESCE(b.booker_name, u.name) AS user_name, c.id AS credit_id, c.remaining AS credit_remaining
            FROM disruption_items di
            JOIN bookings b ON b.id = di.booking_id
            JOIN users u ON u.id = di.user_id

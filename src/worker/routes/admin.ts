@@ -289,8 +289,8 @@ operationsRoutes.get('/bookings', async (c) => {
   }
   if (q.q) {
     const like = `%${q.q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-    where.push(`(b.ref LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\')`);
-    params.push(like, like, like);
+    where.push(`(b.ref LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR b.booker_name LIKE ? ESCAPE '\\')`);
+    params.push(like, like, like, like);
   }
   if (q.scope === 'upcoming') {
     where.push('b.date >= ?');
@@ -370,7 +370,7 @@ async function staffDetail(c: AppContext, bookingId: string, now: number) {
   };
 }
 
-/** A personal booking made on site by the signed-in staff member or admin: confirmed at once. */
+/** A booking made on site, under the signed-in staff member's or admin's account: confirmed at once. */
 const consoleBookingSchema = z
   .object({
     resourceId: zId,
@@ -378,6 +378,11 @@ const consoleBookingSchema = z
     ...zSlotPick,
     rate: z.enum(['member', 'non_member']),
     payment: z.enum(['on_site', 'none']),
+    bookerName: z
+      .string({ error: "Enter the booker's name." })
+      .trim()
+      .min(2, "Enter the booker's name.")
+      .max(80, 'Use at most 80 characters.'),
   })
   .refine(hasSlotPick, PICK_A_TIME);
 
@@ -387,7 +392,7 @@ operationsRoutes.post('/bookings', async (c) => {
   const { settings } = await staffContext(c);
   const starts = requestedStarts(body, settings.slotMinutes);
   const now = Date.now();
-  const b = await createConsoleBooking(c.env, settings, staff, { resourceId: body.resourceId, date: body.date, starts, rate: body.rate, payment: body.payment }, now);
+  const b = await createConsoleBooking(c.env, settings, staff, { resourceId: body.resourceId, date: body.date, starts, rate: body.rate, payment: body.payment, bookerName: body.bookerName }, now);
   c.executionCtx.waitUntil(audit(c, staff.id, 'booking_created_on_site', 'booking', b.id, JSON.stringify({ payment: body.payment, slots: starts.length })));
   return c.json(await staffDetail(c, b.id, now), 201);
 });
@@ -403,7 +408,7 @@ operationsRoutes.post('/bookings/:id/approve', async (c) => {
   const body = await jsonBody(
     c,
     z.object({
-      message: z.string().trim().max(MESSAGE_MAX_CHARS).optional(),
+      message: z.string().trim().max(1000).optional(),
       // The "Before you approve" checklist: every item has to be ticked.
       checklist: z.literal(true, { error: 'Tick every item on the "Before you approve" checklist first.' }),
     }),
@@ -418,7 +423,8 @@ operationsRoutes.post('/bookings/:id/approve', async (c) => {
 
 const rejectSchema = z.object({
   reason: z.string().trim().min(3, 'Tell the player why the proof was rejected.').max(300, 'Keep the reason under 300 characters.'),
-  message: z.string().trim().max(MESSAGE_MAX_CHARS).optional(),
+  // The prefilled rejection note runs past the typed-chat limit, so it keeps its own cap.
+  message: z.string().trim().max(1000).optional(),
   keepHold: z.boolean().default(true),
 });
 
@@ -499,7 +505,7 @@ operationsRoutes.post('/bookings/:id/messages', async (c) => {
   const id = parse(zId, c.req.param('id'));
   const body = await jsonBody(
     c,
-    z.object({ body: z.string().trim().min(1, 'Write a message first.').max(MESSAGE_MAX_CHARS, `Keep messages under ${MESSAGE_MAX_CHARS} characters.`) }),
+    z.object({ body: z.string().trim().min(1, 'Write a message first.').max(MESSAGE_MAX_CHARS, `Messages can be up to ${MESSAGE_MAX_CHARS} characters.`) }),
   );
   const b = await getBooking(c.env.DB, id);
   const now = Date.now();

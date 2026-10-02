@@ -2,7 +2,7 @@ import { api } from '../../core/api.js';
 import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, durationLabel, isoDate, longDate, mergeStarts, minutesLabel, peso, rangeLabel, rangeLabelFull } from '../../core/format.js';
-import { errorState, poll, skeletonRows, toast } from '../../core/ui.js';
+import { clearFieldErrors, errorState, poll, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame, navigate, state } from '../shell.js';
 import { API, BASE, CONSOLE } from '../console.js';
 
@@ -31,10 +31,11 @@ async function rules() {
 }
 
 /**
- * A personal booking made on site by the signed-in staff member or admin (A-NB).
+ * A booking made on site by the signed-in staff member or admin (A-NB).
  * It is booked under their own account, skips the GCash proof step and is confirmed
  * at once. Like the player app, any open times on one court or table can be picked,
- * gaps allowed. The booking records who made it ("Staff · Ana Reyes" / "Admin · …").
+ * gaps allowed. The booking records who made it ("Staff · Ana Reyes" / "Admin · …")
+ * and, required, the booker's name for reference.
  */
 export async function newBookingView({ query }) {
   const r = await rules();
@@ -47,6 +48,7 @@ export async function newBookingView({ query }) {
     resourceId: query.get('resource') || null,
     rate: me.membership === 'member' ? 'member' : 'non_member',
     payment: 'on_site',
+    bookerName: '',
   };
   const picked = new Set();
   let day = null;
@@ -61,7 +63,7 @@ export async function newBookingView({ query }) {
         <div class="row" data-gap="8"><a class="icon-btn" href="${BASE}/bookings" aria-label="Back to bookings">${icon('chevron-left', 22, 2.2)}</a><p class="m-title">New booking</p></div>
       </div>
       <div class="page no-tabbar">
-        <p class="banner neutral compact">${icon('info', 18, 2.2)}<span>For <b>personal bookings on site</b>. It's booked under your account (${me.name}), confirmed right away with no GCash proof, and recorded as <b>booked by ${CONSOLE.roleLabel.toLowerCase()}</b>. Players book in the app.</span></p>
+        <p class="banner neutral compact">${icon('info', 18, 2.2)}<span>For <b>bookings made on site</b>. It's booked under your account (${me.name}) with the booker's name for reference, confirmed right away with no GCash proof, and recorded as <b>booked by ${CONSOLE.roleLabel.toLowerCase()}</b>. Players book in the app.</span></p>
         <div class="cols c-155">
           <div class="stack stack-16">
             <section class="panel panel-body stack stack-12">
@@ -79,6 +81,7 @@ export async function newBookingView({ query }) {
           <div class="stack stack-16">
             <section class="panel panel-body stack stack-12" data-summary-panel>
               <p class="eyebrow">Your booking</p>
+              <div class="field"><label class="label" for="nb-name">Name <span class="req">*</span></label><input class="input" id="nb-name" name="bookerName" maxlength="80" autocomplete="off" required aria-required="true" placeholder="Booker's full name" data-booker></div>
               <div class="stack stack-8"><span class="label" id="nb-rate">Rate</span><div class="seg" role="group" aria-labelledby="nb-rate" data-rate></div></div>
               <div class="stack stack-8" role="radiogroup" aria-labelledby="nb-pay"><span class="label" id="nb-pay">Payment</span><div class="stack stack-8" data-payment></div></div>
               <dl class="kv" data-summary></dl>
@@ -123,8 +126,9 @@ export async function newBookingView({ query }) {
       <div><dt>Booked by</dt><dd>${CONSOLE.role === 'admin' ? 'Admin' : 'Staff'} · ${me.name}</dd></div>
       <div><dt>Total</dt><dd class="mono big-amt">${f.payment === 'none' ? 'No charge' : n && total != null ? peso(total) : '—'}</dd></div>
       ${f.payment === 'on_site' && price != null && n > 1 ? html`<div><dt></dt><dd class="small">${n} × ${peso(price)} ${f.rate === 'member' ? 'member' : 'non-member'} rate</dd></div>` : ''}`);
-    bookBtn.disabled = !res || !n;
-    bookBtn.textContent = !res ? 'Pick a court or table' : !n ? 'Pick a time' : `Book & confirm${f.payment === 'on_site' && total != null ? ` · ${peso(total)}` : ''}`;
+    const named = f.bookerName.trim().length >= 2;
+    bookBtn.disabled = !res || !n || !named;
+    bookBtn.textContent = !res ? 'Pick a court or table' : !n ? 'Pick a time' : !named ? "Enter the booker's name" : `Book & confirm${f.payment === 'on_site' && total != null ? ` · ${peso(total)}` : ''}`;
   }
 
   function paintDay() {
@@ -216,20 +220,28 @@ export async function newBookingView({ query }) {
     paintControls();
     paintSummary();
   });
+  const summaryPanel = $('[data-summary-panel]', root);
+  on(root, 'input', '[data-booker]', (_e, el) => {
+    f.bookerName = el.value;
+    clearFieldErrors(summaryPanel);
+    paintSummary();
+  });
   bookBtn.addEventListener('click', async () => {
-    if (!picked.size || !f.resourceId) return;
+    const bookerName = f.bookerName.trim();
+    if (!picked.size || !f.resourceId || bookerName.length < 2) return;
     setBusy(bookBtn, true, 'Booking…');
     try {
       const res = await api.post(`${API}/bookings`, {
-        resourceId: f.resourceId, date: f.date, starts: sorted(), rate: f.rate, payment: f.payment,
+        resourceId: f.resourceId, date: f.date, starts: sorted(), rate: f.rate, payment: f.payment, bookerName,
       });
-      toast('Booking confirmed', { sub: `${res.booking.resource.name} · ${res.booking.timeLabel} · ${res.booking.ref}` });
+      toast('Booking confirmed', { sub: `${res.booking.bookerName || res.booking.user.name} · ${res.booking.resource.name} · ${res.booking.timeLabel} · ${res.booking.ref}` });
       navigate(`${BASE}/bookings/${res.booking.id}`, { replace: true });
     } catch (err) {
       setBusy(bookBtn, false);
       toast(err.message, { type: 'error' });
       if (err.code === 'SLOT_TAKEN' || err.code === 'TIME_STARTED' || err.code === 'CLOSED') load();
       else paintSummary();
+      if (err.details) showFieldErrors(summaryPanel, err.details);
     }
   });
 

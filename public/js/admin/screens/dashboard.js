@@ -54,7 +54,7 @@ function todayList(d) {
     const done = b.end <= nowMin;
     out.push(html`<a class="dl-row${done ? ' done' : ''}" href="${BASE}/bookings/${b.id}">
       <span class="dl-time">${minutesLabel(b.start)}</span>
-      <span><span class="strong">${b.resource.name} — ${b.activityLabel}</span><br><span class="small">${b.user.name}${b.segments?.length > 1 ? ` · ${bookingTime(b)}` : ''}${b.status === 'TEMPORARY' ? ' · paying now' : ''}</span></span>
+      <span><span class="strong">${b.resource.name} — ${b.activityLabel}</span><br><span class="small">${b.bookerName || b.user.name}${b.segments?.length > 1 ? ` · ${bookingTime(b)}` : ''}${b.status === 'TEMPORARY' ? ' · paying now' : ''}</span></span>
       ${playing ? html`<span class="pill blue sm">${icon('play-circle', 12, 2.4)}Playing now</span>` : b.status === 'TEMPORARY' && b.holdExpiresAt ? html`<span class="pill amber sm">${icon('hourglass', 12, 2.4)}Held · ${mmss(b.holdExpiresAt - d.now)} left</span>` : statusPill(b.status, { small: true })}
     </a>`);
   }

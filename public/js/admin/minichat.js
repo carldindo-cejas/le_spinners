@@ -2,7 +2,7 @@ import { api } from '../core/api.js';
 import { html, on, render } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { firstName } from '../core/format.js';
-import { messageList, openImage } from '../core/chatview.js';
+import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../core/chatview.js';
 import { poll, skeletonRows, toast } from '../core/ui.js';
 import { refreshBadges } from './shell.js';
 import { API, BASE } from './console.js';
@@ -34,7 +34,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
       <ol class="thread-log mini-log" role="log" aria-live="polite" data-log>${skeletonRows(3)}</ol>
       <div class="mini-compose">
         <div class="quick-replies">${QUICK.map((q) => html`<button type="button" class="chip" data-quick="${q}">${q}</button>`)}</div>
-        <form data-form><label class="sr-only" for="mini-reply-${bookingId}">Reply to ${first}</label><textarea id="mini-reply-${bookingId}" class="composer-input" rows="1" maxlength="1000" placeholder="Reply to ${first}…"></textarea><button type="submit" class="send-btn" aria-label="Send">${icon('send', 20, 2.2)}</button></form>
+        <form data-form><label class="sr-only" for="mini-reply-${bookingId}">Reply to ${first}</label><textarea id="mini-reply-${bookingId}" class="composer-input" rows="1" maxlength="${MESSAGE_MAX_CHARS}" placeholder="Reply to ${first}…"></textarea><button type="submit" class="send-btn" aria-label="Send">${icon('send', 20, 2.2)}</button></form>
         <p class="small mini-foot">${icon('lock', 13, 2.4)}<span>Private to ${first} &amp; staff · <a href="${BASE}/messages/${bookingId}">Open in Messages</a></span></p>
       </div>
     </div>`);
@@ -44,6 +44,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
   const log = el.querySelector('[data-log]');
   const form = el.querySelector('[data-form]');
   const input = form.querySelector('textarea');
+  const syncCount = charCounter(input);
 
   function paintHead() {
     el.querySelector('[data-meta]').textContent = open
@@ -104,6 +105,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
   });
   on(el, 'click', '[data-quick]', (_e, btn) => {
     input.value = btn.dataset.quick;
+    syncCount();
     input.focus();
   });
   on(el, 'click', '[data-proof]', (_e, btn) => openImage(btn.dataset.proof));
@@ -117,6 +119,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
       const res = await api.post(`${API}/bookings/${encodeURIComponent(bookingId)}/messages`, { body: text });
       input.value = '';
       input.style.removeProperty('height');
+      syncCount();
       messages = res.messages;
       paintLog(true);
     } catch (err) {

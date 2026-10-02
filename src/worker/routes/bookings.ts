@@ -229,7 +229,7 @@ bookingRoutes.post('/:id/messages', async (c) => {
   const b = await ownBooking(c, user);
   const body = await jsonBody(
     c,
-    z.object({ body: z.string().trim().min(1, 'Write a message first.').max(MESSAGE_MAX_CHARS, `Keep messages under ${MESSAGE_MAX_CHARS} characters.`) }),
+    z.object({ body: z.string().trim().min(1, 'Write a message first.').max(MESSAGE_MAX_CHARS, `Messages can be up to ${MESSAGE_MAX_CHARS} characters.`) }),
   );
   await enforceRateLimit(c.env.DB, `message:user:${user.id}`, 30, 5 * MINUTE);
   const now = Date.now();

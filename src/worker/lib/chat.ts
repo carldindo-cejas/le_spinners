@@ -10,7 +10,8 @@ import { proofLink } from './payments';
  */
 
 export type ChatSide = 'player' | 'staff';
-export const MESSAGE_MAX_CHARS = 1000;
+/** Per typed chat message, player or staff. Mirrored by MESSAGE_MAX_CHARS in public/js/core/chatview.js. */
+export const MESSAGE_MAX_CHARS = 120;
 
 type MessageRow = {
   id: string;

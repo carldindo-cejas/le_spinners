@@ -90,6 +90,8 @@ export type BookingRow = {
   cancel_reason: string | null;
   source: BookingSource;
   created_by: string | null;
+  /** Console bookings: who the booking is for, as typed by staff (the account is still the staff member's). */
+  booker_name: string | null;
   payment_method: PaymentMethod;
   /** Credit value used to pay for the booking; amount_due is the cash part. */
   credit_applied: number;

@@ -138,6 +138,7 @@ App icons: 512, 192 and maskable. Keep the ball inside the 80% safe circle.
 | `COMPLETED` | COMPLETED | Neutral | The booked hour is over. Shown under Past. Final. |
 
 **Booked by** (built 2026-10-01, staff only): every booking records its author — `online` (player app) or made in a console by `staff` / `admin` (with the name). Shown as a sub-line under the reference in the Bookings list and a "Booked by" row on booking details. Console bookings skip `TEMPORARY`/`PAYMENT_SUBMITTED` and start `CONFIRMED`; payment method `on_site` (revenue, ledger method "Paid on site") or `none` (no charge, not in the ledger). Players still see only "Booked".
+Console bookings also record the **booker's name** (required "Name" field, built 2026-10-02, `bookings.booker_name`, migration `0008_booker_name.sql`). It is a reference only: the booking still belongs to the staff account. Staff see it as the customer wherever the booking is listed (Bookings list with "Member rate" / "Non-member rate" under it, booking details Customer card, calendar and New booking slot names, dashboard today list, Revenue ledger with "On site · staff name" under it and the CSV "Customer" column, disruption and affected-bookings lists), and Bookings and Revenue search match it.
 
 **Transitions:** reserve → `TEMPORARY` → (proof uploaded) `PAYMENT_SUBMITTED` → (staff approve)
 `CONFIRMED` → (hour is over) `COMPLETED`. `TEMPORARY` goes to `EXPIRED` after 10 min with no proof,
@@ -264,7 +265,7 @@ Each exists once and is reused:
 - **Notification row:** title, context line, status badge, relative time.
 - **Payment countdown:** PAYMENT WINDOW 09:42 · "Slot held until 4:12 PM". At 2:00 it becomes EXPIRING SOON 01:48 (amber), and at 0:00 it shows WINDOW CLOSED · Slot released.
 - **Payment proof upload:** empty ("JPG, PNG or WEBP · up to 10 MB", "Choose screenshot"), uploading (64%, "Keep this screen open"), ready ("1.2 MB · ready to submit", Replace / Remove), and error (HEIC not supported → "Choose another file").
-- **Booking chat:** system events inline ("Payment proof submitted · 4:07 PM"), staff bubbles signed "Le Spinners · Ana", read receipts ("Seen" / "Sent" / "New"), proof thumbnail card, and the header "Private · you & staff".
+- **Booking chat:** system events inline ("Payment proof submitted · 4:07 PM"), staff bubbles signed "Le Spinners · Ana", read receipts ("Seen" / "Sent" / "New"), proof thumbnail card, and the header "Private · you & staff". Typed messages (player and staff) are capped at **120 characters**: every composer shows a live `n/120` under the text box, right-aligned in ink-500, which turns red-700 and bold at 120 while typing stops there; screen readers hear "Limit reached" once. The server enforces the same cap. Staff approve/reject notes posted into the chat are not typed in a composer and keep their own longer cap.
 
 ---
 
@@ -374,7 +375,7 @@ Each exists once and is reused:
 | Reject dialog | Required reason radio (amount mismatch / unclear proof / ref not found / wrong account / other), message to player, keep slot on hold 10 min for corrected proof |
 | Bookings | Tabs All / Needs verification / Temporary / Confirmed / Cancelled & expired, search, date range, Activity/Resource/Status filters, Export CSV, paginated table |
 | Booking details | Header with status + Open chat + **Cancel & credit** (paid/confirmed; "verify the payment first" hint while a proof waits) + Cancel hold (unpaid holds) + Issue credit (admins), Disruption and Booking credit panels (built 2026-10-02), timeline ("Verified by Ana Reyes"), payment, customer card (bookings count, no-shows, **Booked by**: "Online · player app" or "Admin · Ana Reyes"), conversation, "Next" to continue verifying. **Booking chat expands in place** (built 2026-10-01): the "Booking chat" card is a toggle (chevron flips); open, the two columns stretch to one height and the chat fills what's left of its column, ending level with the bottom card of the other column (one-line header when open, floor 240px; on phones a fixed `min(70vh, 520px)`); the thread scrolls inside, with quick replies, composer and "Open in Messages". Same card on the payment review page |
-| New booking (built 2026-10-01, staff + admin, `/bookings/new`) | Personal booking on site, made under the signed-in staff/admin account. Info banner; activity seg, date, court/table chips, time slots picked like the player app (any open times, gaps allowed; staff see names on taken slots), Rate seg (Member / Non-member), Payment radio (**Paid on site** — counted as revenue / **No charge** — personal use), summary (Booked by "Staff · name" / "Admin · name", Total), **Book & confirm**. Confirmed at once, no GCash proof. "New booking" button on the Bookings list (desktop topbar, "New" on phones) |
+| New booking (built 2026-10-01, staff + admin, `/bookings/new`) | Personal booking on site, made under the signed-in staff/admin account. Info banner; activity seg, date, court/table chips, time slots picked like the player app (any open times, gaps allowed; staff see names on taken slots), **Name** (required, the booker's name; "Book & confirm" reads "Enter the booker's name" until it's filled), Rate seg (Member / Non-member), Payment radio (**Paid on site** — counted as revenue / **No charge** — personal use), summary (Booked by "Staff · name" / "Admin · name", Total), **Book & confirm**. Confirmed at once, no GCash proof. "New booking" button on the Bookings list (desktop topbar, "New" on phones) |
 | Messages | Conversation list (Verifying / Unread / All) + thread + "THIS BOOKING" side panel with Review payment. Quick replies. One conversation per booking |
 | Resources | Tabs All / Pickleball courts / Table tennis tables. Cards with status, weekly hours, today's load, Edit / Availability / Disable / End maintenance |
 | Add resource | Type, name, description, Active/Disabled, copy starting schedule from an existing resource |
@@ -468,7 +469,8 @@ console "New booking" with booked-by tracking (migration `0004_booking_source.sq
 checklist, and the in-place booking chat ([public/js/admin/minichat.js](public/js/admin/minichat.js)).
 When a picked slot was just taken: one slot → nearby open times; several → the same times on another
 court or table, or "Keep the N of your M times still open".
-Not built: booking on behalf of a walk-in player (console bookings belong to the staff account), and
+Not built: booking on behalf of a walk-in player (console bookings belong to the staff account and only
+record the booker's name), and
 console bookings for a slot that has already started.
 
 Designed but **not built yet** (per the README's "Not in this version"): the Users list and
@@ -504,4 +506,6 @@ list (the revenue ledger has one).
 | 2026-10-01 | Revenue page at `/revenue/` (admin only): summary cards, booking ledger, CSV export (§12, §13, §14, §16). Toasts gain a ✕ and swipe-to-dismiss (§11). |
 | 2026-10-02 | Open play: a court or table can be set to OPEN PLAY (free for all, shown to players, not bookable) from Resources by staff and admins. Shown on the player Home, date card, court cards and time step, the console calendar, dashboard, New booking and Settings → Pricing (§4, §6, §7). |
 | 2026-10-02 | The time step picks any number of open slots, gaps allowed (replaces "How long?"); the console New booking picks the same way. Open booking chat is compact (one-line header, 240px floor) so it ends level with the other column on the payment review page too. Dialogs now open above the full-screen proof viewer. Free console bookings no longer count as payments on the Revenue cards (§2, §13, §16). |
+| 2026-10-02 | Console New booking requires the booker's **Name**; staff see it as the customer on console bookings (Bookings, booking details, calendar, dashboard, Revenue, disruptions) and can search it (§2, §13, §16). |
 | 2026-10-01 | Multi-hour bookings (How long? control, price × hours), console New booking (personal bookings on site, paid on site or free), Booked by (online / staff / admin), required "Before you approve" checklist, booking chat expanding in place on booking details and payment review (§2, §6, §13, §16). |
+| 2026-10-02 | Chat messages capped at 120 characters with a live `n/120` counter under every composer (red at the limit, typing stops) in the player chat, staff Messages and the booking chat card (§10). |

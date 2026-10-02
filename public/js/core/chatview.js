@@ -3,6 +3,40 @@ import { icon } from './icons.js';
 import { clock, dayClock, initials, isoDate } from './format.js';
 import { openModal } from './ui.js';
 
+/** Per typed chat message. The server enforces the same limit (src/worker/lib/chat.ts). */
+export const MESSAGE_MAX_CHARS = 120;
+
+/**
+ * Adds a live "n/120" line under a chat composer's textarea. At the limit the count
+ * turns red, maxlength stops further typing, and screen readers hear it once.
+ * Call the returned function after changing the text in code (quick reply, sent).
+ */
+export function charCounter(input) {
+  const el = document.createElement('p');
+  el.className = 'char-count';
+  el.id = `${input.id}-count`;
+  const count = document.createElement('span');
+  const status = document.createElement('span');
+  status.className = 'sr-only';
+  status.setAttribute('role', 'status');
+  el.append(count, status);
+  input.after(el);
+  input.setAttribute('aria-describedby', el.id);
+  let full = false;
+  const sync = () => {
+    const n = input.value.length;
+    count.textContent = `${n}/${MESSAGE_MAX_CHARS}`;
+    if (full !== (n >= MESSAGE_MAX_CHARS)) {
+      full = !full;
+      el.classList.toggle('at-limit', full);
+      status.textContent = full ? `Limit reached: messages can be up to ${MESSAGE_MAX_CHARS} characters.` : '';
+    }
+  };
+  input.addEventListener('input', sync);
+  sync();
+  return sync;
+}
+
 /** Colour for a system line in the booking chat. */
 export function systemTint(body) {
   const t = body.toLowerCase();

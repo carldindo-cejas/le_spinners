@@ -221,6 +221,8 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
       phone: b.user_phone ?? null,
       membership: b.user_membership ?? 'none',
     },
+    /** Console bookings: who it's for (user is the staff account it's booked under). */
+    bookerName: b.booker_name ?? null,
     confirmedBy: b.confirmed_by_name ?? null,
     rejectedBy: b.rejected_by_name ?? null,
     // "Online", or "Staff · Ana Reyes" / "Admin · Ana Reyes" for console bookings.
@@ -464,6 +466,8 @@ type NewBooking = {
   holdUntil: number | null;
   source: BookingSource;
   createdBy: string;
+  /** Console bookings: who it's for, as typed by staff. */
+  bookerName: string | null;
   paymentMethod: PaymentMethod;
   submittedAt: number | null;
   confirmedAt: number | null;
@@ -503,10 +507,10 @@ async function insertBooking(
   const insert = db
     .prepare(
       `INSERT INTO bookings (id, ref, user_id, resource_id, date, start_min, end_min, status, amount_due, rate, hold_expires_at, created_at, updated_at,
-                             source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by, credit_applied)
+                             source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by, credit_applied, booker_name)
        SELECT ?1,
               'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, -3) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
-              ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?19
+              ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?19, ?20
         WHERE NOT ${clashSql('t.resource_id = ?3', '?4', '?18', '?10')}
           AND NOT ${clashSql('b.user_id = ?2', '?4', '?18', '?10')}
           AND NOT EXISTS (
@@ -524,7 +528,7 @@ async function insertBooking(
     .bind(
       row.id, row.userId, row.resourceId, row.date, start, end, row.amount, row.rate, row.holdUntil, now,
       row.status, row.source, row.createdBy, row.paymentMethod, row.submittedAt, row.confirmedAt, row.confirmedBy, segs,
-      row.creditApplied,
+      row.creditApplied, row.bookerName,
     );
   const times = db
     .prepare(
@@ -640,6 +644,7 @@ export async function createHold(
       holdUntil: paidByCredit ? null : now + settings.holdMinutes * 60_000,
       source: 'online',
       createdBy: user.id,
+      bookerName: null,
       paymentMethod: paidByCredit ? 'none' : 'gcash',
       submittedAt: null,
       confirmedAt: paidByCredit ? now : null,
@@ -705,26 +710,27 @@ export async function createHold(
 }
 
 /**
- * Staff or an admin books a court or table for themselves from the console (a personal
- * booking on site). There is no GCash step: it is confirmed at once, either paid at the
- * front desk (counted as revenue) or free of charge.
+ * Staff or an admin books a court or table from the console (a booking on site). It is
+ * booked under their own account and records `bookerName`, who it's for. There is no
+ * GCash step: it is confirmed at once, either paid at the front desk (counted as revenue)
+ * or free of charge.
  */
 export async function createConsoleBooking(
   env: Bindings,
   settings: Settings,
   staff: SessionUser,
-  input: SlotInput & { rate: 'member' | 'non_member'; payment: 'on_site' | 'none' },
+  input: SlotInput & { rate: 'member' | 'non_member'; payment: 'on_site' | 'none'; bookerName: string },
   now = Date.now(),
 ) {
   const db = env.DB;
-  const { resourceId, date, rate, payment } = input;
+  const { resourceId, date, rate, payment, bookerName } = input;
   const { resource, segments, slots } = await checkSlots(env, settings, input, now);
   const source: BookingSource = staff.role === 'admin' ? 'admin' : 'staff';
   const amount = payment === 'none' ? 0 : (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
   const id = newId('b_');
   const changes = await insertBooking(db, {
     id, userId: staff.id, resourceId, date, segments, status: 'CONFIRMED', amount, creditApplied: 0, rate, holdUntil: null,
-    source, createdBy: staff.id, paymentMethod: payment,
+    source, createdBy: staff.id, bookerName, paymentMethod: payment,
     // Paid at the desk counts as a verified payment for revenue; a free booking has no payment.
     submittedAt: payment === 'on_site' ? now : null,
     confirmedAt: now,

@@ -59,7 +59,7 @@ async function loadCtx(db: D1Database, activity: Activity | null, from: string, 
     db
       .prepare(
         `SELECT b.id, b.ref, b.user_id, t.resource_id, t.date, t.start_min, t.end_min, b.status, b.hold_expires_at,
-                u.name AS user_name, u.membership AS user_membership
+                COALESCE(b.booker_name, u.name) AS user_name, u.membership AS user_membership
            FROM booking_times t JOIN bookings b ON b.id = t.booking_id JOIN users u ON u.id = b.user_id
           WHERE t.date BETWEEN ?1 AND ?2 AND ${OCCUPYING('b', '?3')}`,
       )
