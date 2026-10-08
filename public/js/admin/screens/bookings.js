@@ -360,7 +360,7 @@ export async function bookingDetailView({ params }) {
               ${p ? html`<div class="row row-top" data-gap="16">
                 <button type="button" class="vq-thumb" data-act="proof" aria-label="Open payment proof"><img src="${p.url}" alt=""><span class="view-chip">View</span></button>
                 <dl class="kv grow">
-                  <div><dt>Method</dt><dd>GCash · proof</dd></div>
+                  <div><dt>Method</dt><dd>${p.paymentMethodName || b.paymentMethodName || 'GCash'} · proof</dd></div>
                   <div><dt>Reference</dt><dd class="mono">${p.gcashRef || 'Not provided'}</dd></div>
                   <div><dt>Amount</dt><dd>${p.amountClaimedLabel ? `${p.amountClaimedLabel} claimed` : 'Not entered'} · ${b.amountLabel} due</dd></div>
                   <div><dt>${b.status === 'CONFIRMED' || b.status === 'COMPLETED' ? 'Verified by' : 'Proof status'}</dt><dd>${b.confirmedBy || (p.status === 'rejected' ? `Rejected${b.rejectedBy ? ` by ${b.rejectedBy}` : ''}` : p.status === 'submitted' ? 'Waiting for verification' : p.status)}</dd></div>

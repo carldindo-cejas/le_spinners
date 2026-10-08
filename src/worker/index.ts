@@ -15,6 +15,7 @@ import { adminCreditRoutes, creditRoutes } from './routes/credits';
 import { facilityRoutes } from './routes/facility';
 import { fileRoutes, notificationRoutes } from './routes/notifications';
 import { revenueRoutes } from './routes/revenue';
+import { adminStaffRoutes } from './routes/admin-staff';
 
 /**
  * Page security headers for responses the Worker itself serves (the console shells).
@@ -51,7 +52,7 @@ const API_HEADERS: Record<string, string> = {
 
 const JSON_LIMIT = 64 * 1024;
 const UPLOAD_LIMIT = MAX_UPLOAD_BYTES + 256 * 1024; // the file plus multipart overhead
-const UPLOAD_PATHS = [/^\/api\/bookings\/[^/]+\/proof$/, /^\/api\/admin\/settings\/gcash-qr$/];
+const UPLOAD_PATHS = [/^\/api\/bookings\/[^/]+\/proof$/, /^\/api\/admin\/settings\/gcash-qr$/, /^\/api\/admin\/payment-methods\/[^/]+\/qr$/];
 
 function errorJson(c: Context<AppEnv>, status: ContentfulStatusCode, code: string, message: string, details?: Record<string, unknown>) {
   return c.json({ error: { code, message, ...(details ? { details } : {}), requestId: c.get('requestId') ?? null } }, status);
@@ -111,7 +112,7 @@ app.route('/api/files', fileRoutes);
 // Role namespaces. The guard runs before any handler; handlers check again.
 //   /api/bookings, /api/credits, /api/notifications, /api/availability*  players (routes call requirePlayer)
 //   /api/staff/*   staff and admins: operations (verification, bookings, chat, facility, disruptions, credits)
-//   /api/admin/*   admins only: the same operations plus settings, prices, the outbox, revenue and credit changes
+//   /api/admin/*   admins only: the same operations plus staff accounts, settings, prices, the outbox, revenue and credit changes
 //   /api/me, /api/files, /api/facility*  shared, checked per route
 app.use('/api/staff/*', roleGuard(requireStaff));
 app.use('/api/admin/*', roleGuard(requireAdmin));
@@ -119,6 +120,7 @@ app.route('/api/staff', operationsRoutes);
 app.route('/api/admin', adminSettingsRoutes);
 app.route('/api/admin/revenue', revenueRoutes);
 app.route('/api/admin/credits', adminCreditRoutes);
+app.route('/api/admin/staff', adminStaffRoutes);
 app.route('/api/admin', operationsRoutes);
 app.all('/api/*', () => {
   throw notFound('No such endpoint.');

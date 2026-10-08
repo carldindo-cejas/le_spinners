@@ -50,6 +50,22 @@ try {
   }
   assert.equal(health.cleanupPending,0);assert.equal(health.needsReview,0);assert.equal(health.deleteFailures,0);
   console.log('Real local D1/R2 passed: malformed rejection, image round-trip, overlapping QR replacements, atomic removal and cron cleanup.');
+  const created=await request('POST','/api/admin/payment-methods',{name:'Runtime Bank',accountNumber:'SYNTHETIC-123'},true);
+  assert.equal(created.status,201);const methodId=(await created.json()).id;
+  try {
+    const methodUpload=()=>{const form=new FormData();form.set('file',new File([png],'synthetic-method.png'));return request('PUT',`/api/admin/payment-methods/${methodId}/qr`,form);};
+    assert.equal((await methodUpload()).status,200);
+    const qr=await request('GET',`/api/facility/payment-methods/${methodId}/qr`);assert.equal(qr.status,200);
+    assert.equal(qr.headers.get('Cache-Control'),'private, no-store');
+    assert.deepEqual(new Uint8Array(await qr.arrayBuffer()),app.stripMetadata(png,app.sniffImage(png)));
+    assert.equal((await fetch(base+`/api/facility/payment-methods/${methodId}/qr`)).status,401);
+    const enabled=await (await request('GET','/api/facility')).json();assert.ok(enabled.paymentMethods.some(method=>method.id===methodId));
+    assert.equal((await request('PUT',`/api/admin/payment-methods/${methodId}`,{name:'Runtime Bank',enabled:false},true)).status,200);
+    const disabled=await (await request('GET','/api/facility')).json();assert.equal(disabled.paymentMethods.some(method=>method.id===methodId),false);
+    assert.equal((await request('DELETE',`/api/admin/payment-methods/${methodId}/qr`)).status,200);
+    assert.equal((await request('GET',`/api/facility/payment-methods/${methodId}/qr`)).status,404);
+    console.log('Real configurable-method D1/R2 passed: CRUD, optional details, private QR round-trip, disabled filtering and QR removal.');
+  } finally { assert.equal((await request('DELETE',`/api/admin/payment-methods/${methodId}`)).status,200); }
 } finally {
   const form=new FormData();form.set('file',new File([originalBytes],'restored-qr',{type:originalType}));
   assert.equal((await request('PUT','/api/admin/settings/gcash-qr',form)).status,200,'Restore the synthetic QR image');

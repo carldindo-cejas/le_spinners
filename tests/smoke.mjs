@@ -800,11 +800,11 @@ section('Staff verification');
   check('approve without the checklist → 422', unchecked.status === 422 && unchecked.data.error.details?.checklist, unchecked.data);
   const halfChecked = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: false });
   check('approve with the checklist unticked → 422', halfChecked.status === 422, halfChecked.data);
-  const ok = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true });
+  const ok = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true, proofId: detail.data.proofs[0].id });
   check('approve → CONFIRMED', ok.status === 200 && ok.data.booking.status === 'CONFIRMED', ok.data);
   check('records who approved', ok.data.booking.confirmedBy === 'Ana Reyes');
   check('online booking is marked "Online"', ok.data.booking.bookedBy?.source === 'online' && ok.data.booking.bookedBy?.name === null, ok.data.booking.bookedBy);
-  const twice = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true });
+  const twice = await ana.post(`/api/admin/bookings/${juanBooking.id}/approve`, { checklist: true, proofId: detail.data.proofs[0].id });
   check('approving twice → 409 INVALID_STATUS', twice.status === 409 && twice.data.error.code === 'INVALID_STATUS');
 
   const jb = await juan.get(`/api/bookings/${juanBooking.id}`);
@@ -824,7 +824,7 @@ section('Reject, resubmit, reject and release');
   const id = hold.data.booking.id;
   const png = readFileSync(join(ROOT, 'db/seed-proofs/pedro.png'));
   await pedro.req('POST', `/api/bookings/${id}/proof`, { form: proofForm(pngFile('p.png', png), { amountPesos: '250' }) });
-  const rej = await rhea.post(`/api/staff/bookings/${id}/reject`, { reason: 'Amount does not match the booking total.', keepHold: true });
+  const rej = await rhea.post(`/api/staff/bookings/${id}/reject`, { proofId: await latestProofId(rhea,id), reason: 'Amount does not match the booking total.', keepHold: true });
   check('staff reject with resubmit window → REJECTED', rej.status === 200 && rej.data.booking.status === 'REJECTED', rej.data);
   check('the rejection is recorded with the staff member', rej.data.booking.rejectedBy === 'Rhea Lim' && rej.data.timeline.some((e) => e.type === 'rejected' && e.actor === 'Rhea Lim'), rej.data.booking);
   const left = rej.data.booking.holdExpiresAt - rej.data.now;
@@ -849,7 +849,7 @@ section('Reject, resubmit, reject and release');
   check('staff can view the payment screenshot', staffProof.status === 200);
   const otherPlayer = await juan.get(stillPending.data.proofs[0].url);
   check("another player can't view it", otherPlayer.status === 404);
-  const rej2 = await ana.post(`/api/admin/bookings/${id}/reject`, { reason: 'Screenshot is not readable.', keepHold: false });
+  const rej2 = await ana.post(`/api/admin/bookings/${id}/reject`, { proofId: stillPending.data.proofs[0].id, reason: 'Screenshot is not readable.', keepHold: false });
   check('reject and release → EXPIRED', rej2.data.booking.status === 'EXPIRED', rej2.data);
   const free = await maria.get(`/api/availability?activity=table_tennis&date=${D}`);
   check('slot is free again', free.data.resources.find((r) => r.id === 'table-3').slots.find((x) => x.start === s.start)?.state === 'available');
@@ -986,11 +986,11 @@ section('Revenue (admin only)');
   await pedro.req('POST', `/api/bookings/${bid}/proof`, { form: proofForm(pngFile('a.png', png), { amountPesos: '1' }) });
   const mid = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
   check('a proof waiting for verification adds nothing', mid.collected === before.collected);
-  await ana.post(`/api/admin/bookings/${bid}/reject`, { reason: 'Amount does not match.', keepHold: true });
+  await ana.post(`/api/admin/bookings/${bid}/reject`, { proofId: await latestProofId(ana,bid), reason: 'Amount does not match.', keepHold: true });
   const rej = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
   check('a rejected proof adds nothing', rej.collected === before.collected);
   await pedro.req('POST', `/api/bookings/${bid}/proof`, { form: proofForm(pngFile('b.png', png), { amountPesos: '300' }) });
-  const approved = await ana.post(`/api/admin/bookings/${bid}/approve`, { checklist: true });
+  const approved = await ana.post(`/api/admin/bookings/${bid}/approve`, { checklist: true, proofId: await latestProofId(ana,bid) });
   const after = (await ana.get('/api/admin/revenue/summary')).data.periods.find((p) => p.key === 'day');
   check('two proofs, one approval → counted once', approved.status === 200 && after.collected === before.collected + hold.data.booking.amountDue && after.payments === before.payments + 1, { before: before.collected, after: after.collected, due: hold.data.booking.amountDue });
 
@@ -1269,10 +1269,13 @@ const startsOpen = async (client, activity, date, resourceId) => {
   return res.data.resources.find((x) => x.id === resourceId).slots.filter((s) => s.state === 'available').map((s) => s.start);
 };
 const PAY_PNG = readFileSync(join(ROOT, 'db/seed-proofs/juan.png'));
+async function latestProofId(client,bookingId) {
+  return (await client.get(`/api/${client === rhea ? 'staff' : 'admin'}/bookings/${bookingId}`)).data.proofs[0].id;
+}
 async function payAndConfirm(player, booking) {
   const up = await player.req('POST', `/api/bookings/${booking.id}/proof`, { form: proofForm(pngFile('pay.png', PAY_PNG), { amountPesos: (booking.amountDue / 100).toFixed(2) }) });
   if (up.status !== 201) throw new Error(`proof upload failed: ${up.status} ${JSON.stringify(up.data)}`);
-  const ok = await ana.post(`/api/admin/bookings/${booking.id}/approve`, { checklist: true });
+  const ok = await ana.post(`/api/admin/bookings/${booking.id}/approve`, { checklist: true, proofId: up.data.proofs[0].id });
   if (ok.status !== 200) throw new Error(`approve failed: ${ok.status} ${JSON.stringify(ok.data)}`);
   return ok.data;
 }
@@ -1494,7 +1497,7 @@ let windowDisruption;
   check('staff summary notice stays open while one is pending', note && note.resolved_at === null, note);
 
   // Verifying the waiting payment finishes the job: cancelled, ₱600 credit.
-  const approved = await rhea.post(`/api/staff/bookings/${subHold.id}/approve`, { checklist: true });
+  const approved = await rhea.post(`/api/staff/bookings/${subHold.id}/approve`, { checklist: true, proofId: await latestProofId(rhea,subHold.id) });
   check('approving the waiting payment cancels it with its credit', approved.status === 200 && approved.data.resolvedDisruptions?.[0]?.outcome === 'cancelled' && approved.data.resolvedDisruptions[0].credit === 60000 && approved.data.booking.status === 'CANCELLED', approved.data.resolvedDisruptions ?? approved.data);
   const after = await rhea.get(`/api/staff/disruptions/${windowDisruption}`);
   check('disruption detail: five bookings, nothing left open', after.data.items?.length === 5 && after.data.disruption.openCount === 0 && after.data.disruption.creditedTotal === 170000, after.data.disruption);

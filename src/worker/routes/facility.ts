@@ -7,7 +7,8 @@ import { activityLabel, isOpenPlay, underMaintenance, type HoursRow } from '../l
 import { notFound, unprocessable } from '../lib/errors';
 import { publicSettings, loadSettings } from '../lib/settings';
 import { addDays, dateLabel, daysBetween, hoursLabel, isValidDate, localNow, offsetMinutes, peso } from '../lib/time';
-import { query, zActivity, zDate } from '../lib/validate';
+import { parse, query, zActivity, zDate, zId } from '../lib/validate';
+import { listPaymentMethods, type PaymentMethodRow } from '../lib/payment-methods';
 
 export const facilityRoutes = new Hono<AppEnv>();
 
@@ -46,8 +47,9 @@ facilityRoutes.get('/facility', async (c) => {
     today: local.date,
     todayLabel: dateLabel(local.date),
     tzOffsetMinutes: offset,
-    facility: { name: pub.facilityName, address: pub.facilityAddress },
+    facility: { name: pub.facilityName, address: pub.facilityAddress, mapsUrl: pub.facilityMapsUrl },
     gcash: c.get('user') ? pub.gcash : null,
+    paymentMethods: c.get('user') ? await listPaymentMethods(db, true) : [],
     rules: pub.rules,
     hours: ((hours?.results ?? []) as HoursRow[]).map((h) => ({
       weekday: h.weekday,
@@ -71,6 +73,20 @@ facilityRoutes.get('/facility', async (c) => {
       };
     }),
   });
+});
+
+facilityRoutes.get('/facility/payment-methods/:id/qr', async (c) => {
+  const user = requireUser(c);
+  const id = parse(zId, c.req.param('id'));
+  const method = await c.env.DB.prepare(`SELECT * FROM payment_methods WHERE id=? AND deleted_at IS NULL ${user.role === 'admin' ? '' : 'AND enabled=1'}`)
+    .bind(id).first<PaymentMethodRow>();
+  if (!method?.qr_key) throw notFound('QR image not found.');
+  const obj = await c.env.PROOFS.get(method.qr_key);
+  if (!obj) throw notFound('QR image not found.');
+  return new Response(obj.body, { headers: {
+    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+    'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+  } });
 });
 
 /** The GCash QR image. Any signed-in role: players on the payment screen, admins in Settings. */

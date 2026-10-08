@@ -12,6 +12,7 @@ import { newBookingView } from './screens/newbooking.js';
 import { messagesView } from './screens/messages.js';
 import { notificationsView } from './screens/notifications.js';
 import { settingsView } from './screens/settings.js';
+import { staffView } from './screens/staff.js';
 import { calendarView } from './screens/calendar.js';
 import { moreView } from './screens/more.js';
 import { facilitiesView } from './screens/facilities.js';
@@ -27,14 +28,15 @@ import { BASE, CONSOLE, HOME, REVENUE, isAdminConsole } from './console.js';
  * console land on the same page in their own (old /admin/ links in emails and
  * bookmarks keep working for staff). The API enforces roles regardless.
  */
-function guarded(view) {
+function guarded(view, { administratorOnly = false } = {}) {
   return (ctx) => {
     if (!state.user) {
       state.router.navigate(`${BASE}/login?next=${encodeURIComponent(ctx.path + location.search + location.hash)}`, { replace: true });
       return undefined;
     }
+    if (state.user.role === 'staff' && administratorOnly) return adminOnly('Staff Management');
     if (state.user.role === CONSOLE.role) return view(ctx);
-    if (state.user.role === 'staff' && ctx.path.startsWith(REVENUE.slice(0, -1))) return adminOnly();
+    if (state.user.role === 'staff' && ctx.path.startsWith(REVENUE.slice(0, -1))) return adminOnly('Revenue');
     if (state.user.role === 'staff' || state.user.role === 'admin') {
       const home = HOME[state.user.role].replace(/\/$/, '');
       const rest = location.pathname.slice(BASE.length);
@@ -56,11 +58,11 @@ function noAccess() {
 }
 
 /** Staff opening an admin-only page (the API refuses them too). */
-function adminOnly() {
+function adminOnly(title) {
   bare(html`<div class="page"><div class="empty">
     <span class="tile red lg">${icon('lock', 26)}</span>
-    <p class="empty-title">Revenue is for administrators</p>
-    <p class="empty-body">You're signed in as ${state.user.email}, a staff account. Ask an administrator if you need revenue figures.</p>
+    <p class="empty-title">${title} is for administrators</p>
+    <p class="empty-body">You're signed in as ${state.user.email}, a staff account. Ask an administrator if you need access to this section.</p>
     <div class="row" data-gap="8"><a class="btn btn-primary btn-md" href="${HOME.staff}" data-native>Go to the staff console</a></div>
   </div></div>`);
 }
@@ -89,7 +91,7 @@ const routes = [
   { path: '/facilities', view: guarded(facilitiesView) },
   { path: '/availability', view: guarded(availabilityView) },
   { path: '/profile', view: guarded(profileView) },
-  ...(isAdminConsole ? [{ path: '/settings', view: guarded(settingsView) }, { path: REVENUE, absolute: true, view: guarded(revenueView) }] : []),
+  ...(isAdminConsole ? [{ path: '/staff', view: guarded(staffView, { administratorOnly: true }) }, { path: '/settings', view: guarded(settingsView) }, { path: REVENUE, absolute: true, view: guarded(revenueView) }] : []),
   { path: '/more', view: guarded(moreView) },
 ];
 

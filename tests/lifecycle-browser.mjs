@@ -155,6 +155,7 @@ try {
         if(path==='/api/admin/revenue/ledger'){await route.fulfill({status:503,json:{error:{message:'Synthetic ledger unavailable'}}});return true;}
       }});
       await page.goto(base+'/revenue/');await page.locator('[data-act="export"]').click();
+      await page.getByRole('dialog', { name: 'Export booking ledger' }).locator('[data-confirm-export]').click();
       for(let n=0;n<100&&!pending;n++)await page.waitForTimeout(10);assert.ok(pending);
       await navigate(page,'admin','/admin/profile');await pending.fulfill({status:401,json:{error:{code:'UNAUTHORIZED'}}}).catch(()=>{});await page.waitForTimeout(50);
       assert.equal(downloads,0);assert.equal(new URL(page.url()).pathname,'/admin/profile');assert.equal(await page.locator('.scrim').count(),0);assert.deepEqual(errors,[]);

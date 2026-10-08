@@ -29,8 +29,8 @@ async function staffSettings() {
 function checklistItems(b, p) {
   return [
     `Amount on the screenshot is ${b.amountLabel}`,
-    `Sent to Le Spinners' GCash (${(state.settings && state.settings.gcashNumber) || 'your number'})`,
-    p && p.gcashRef ? `Reference ${p.gcashRef} is in our GCash history` : 'Reference is in our GCash history',
+    `Sent using ${p?.paymentMethodName || b.paymentMethodName || 'GCash'} to ${[p?.accountName, p?.accountNumber].filter(Boolean).join(' · ') || 'the configured recipient'}`,
+    p && p.gcashRef ? `Reference ${p.gcashRef} is in our payment history` : 'Reference is in our payment history',
     `Paid after the booking was made (${clock(b.createdAt)})`,
   ];
 }
@@ -57,7 +57,8 @@ function pendingCard(b, i, now) {
     <dl class="vq-details">
       <div><dt>Amount due</dt><dd class="mono">${b.amountLabel}</dd><dd class="small">${b.rate === 'member' ? 'member rate' : 'non-member rate'}</dd></div>
       <div><dt>Paid (claimed)</dt><dd><span class="mono">${p && p.amountClaimedLabel ? p.amountClaimedLabel : '—'}</span>${amountPill(p ? p.amountCheck : 'unknown')}</dd></div>
-      <div><dt>GCash ref.</dt><dd class="${p && p.gcashRef ? 'mono' : 'amber-text'}">${p && p.gcashRef ? p.gcashRef : 'Not provided'}</dd></div>
+      <div><dt>Method</dt><dd>${b.paymentMethodLabel || 'GCash'}</dd></div>
+      <div><dt>Payment ref.</dt><dd class="${p && p.gcashRef ? 'mono' : 'amber-text'}">${p && p.gcashRef ? p.gcashRef : 'Not provided'}</dd></div>
       <div><dt>Submitted</dt><dd>${waitLabel(b.submittedAt, now, i === 0)}</dd></div>
     </dl>
     <div class="vq-actions">
@@ -110,8 +111,8 @@ export async function queueView({ query }) {
           <section class="panel panel-body stack stack-12"><p class="eyebrow">Before you approve</p>
             <ol class="checklist">
               <li>Amount on the screenshot equals the amount due.</li>
-              <li>Recipient is Le Spinners' GCash (${s.gcashNumber || 'your GCash number'}).</li>
-              <li>Reference number appears in the GCash app history.</li>
+              <li>Recipient matches the selected payment method.</li>
+              <li>Reference number appears in the payment method history.</li>
               <li>Payment time is after the booking was created.</li>
             </ol></section>
           <section class="dark-card"><p class="eyebrow">While pending</p><p>Slots stay blocked for other players and don't expire on the ${s.holdMinutes ?? 10}-minute timer. Decide quickly — players see "Waiting for admin verification" until you do.</p></section>
@@ -294,7 +295,8 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
         <div><dt>Customer</dt><dd>${b.user.name} · ${b.user.membership === 'member' ? 'Member' : 'Non-member'}</dd></div>
         <div><dt>Amount due</dt><dd class="mono">${b.amountLabel}</dd></div>
         <div><dt>Claimed paid</dt><dd>${proof && proof.amountClaimed != null ? peso(proof.amountClaimed) : 'Not entered'}${proof && proof.amountCheck === 'match' ? ' ✓' : ''}</dd></div>
-        <div><dt>GCash ref.</dt><dd class="mono">${proof && proof.gcashRef ? proof.gcashRef : 'Not provided'}</dd></div>
+        <div><dt>Method</dt><dd>${proof?.paymentMethodName || b.paymentMethodName || 'GCash'}</dd></div>
+        <div><dt>Payment ref.</dt><dd class="mono">${proof && proof.gcashRef ? proof.gcashRef : 'Not provided'}</dd></div>
       </dl>
       <p class="note">Only staff can open this image. Links are signed, expire after 5–10 minutes, and every view is logged.</p>
       ${canDecide && b.status === 'PAYMENT_SUBMITTED' ? html`<button type="button" class="btn btn-volt btn-block" data-decide="approve">Approve payment</button><button type="button" class="btn btn-ghost-light btn-block" data-decide="reject">Reject payment</button>` : ''}
@@ -331,7 +333,7 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
       if (onDecision) onDecision();
     };
     if (btn.dataset.decide === 'approve') openApprove(b, proof, after, { checklistDone });
-    else openReject(b, after);
+    else openReject(b, proof, after);
   });
   $('[data-close]', host).focus();
   return close;
@@ -365,7 +367,7 @@ function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
       <dl class="kv card-soft">
         <div><dt>Booking</dt><dd>${b.resource.name} · ${monthDayYear(b.date).replace(/, \d{4}$/, '')} · ${bookingTime(b)}</dd></div>
         <div><dt>Customer</dt><dd>${b.user.name} · ${b.user.membership === 'member' ? 'Member' : 'Non-member'}</dd></div>
-        <div><dt>Payment</dt><dd>${b.amountLabel} · ${proof && proof.gcashRef ? `GCash ref ${proof.gcashRef}` : 'no ref. entered'}</dd></div>
+        <div><dt>Payment</dt><dd>${b.amountLabel} · ${proof?.paymentMethodName || b.paymentMethodName || 'GCash'} · ${proof && proof.gcashRef ? `Payment ref ${proof.gcashRef}` : 'no ref. entered'}</dd></div>
       </dl>
       ${proof && proof.amountCheck === 'differs' ? html`<p class="banner warn compact">${icon('alert', 18, 2.2)}<span>${first} entered <b>${peso(proof.amountClaimed)}</b> but <b>${b.amountLabel}</b> is due. Approve only if the screenshot shows the full amount.</span></p>` : ''}
       ${checklistDone ? '' : html`<fieldset class="fieldset stack stack-4"><legend class="label">Before you approve <span class="req">*</span> <span class="opt">— tick every check</span></legend>
@@ -388,7 +390,7 @@ function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
         setBusy(btn, true, 'Approving…');
         try {
           const post = panel.querySelector('[name="post"]').checked;
-          const res = await api.post(`${API}/bookings/${b.id}/approve`, post ? { message: chatText, checklist: true } : { checklist: true });
+          const res = await api.post(`${API}/bookings/${b.id}/approve`, { proofId: proof.id, checklist: true, ...(post ? { message: chatText } : {}) });
           busy = false;
           m.close();
           await refreshBadges();
@@ -419,11 +421,11 @@ function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
 const REASONS = [
   'Payment amount does not match booking amount.',
   'Uploaded proof does not clearly show the transaction.',
-  'Reference number not found in our GCash history.',
+  'Reference number not found in our payment history.',
   'Payment was sent to a different account.',
 ];
 
-function openReject(b, onDone) {
+function openReject(b, proof, onDone) {
   const { listen, openModal, on, setBusy, api, refreshBadges, toast, navigate } = viewTools();
   const first = firstName(b.user.name);
   const minutes = (state.settings && state.settings.resubmitMinutes) || 10;
@@ -468,7 +470,7 @@ function openReject(b, onDone) {
         busy = true;
         setBusy(submit, true, 'Rejecting…');
         try {
-          await api.post(`${API}/bookings/${b.id}/reject`, { reason, message: message || undefined, keepHold });
+          await api.post(`${API}/bookings/${b.id}/reject`, { proofId: proof.id, reason, message: message || undefined, keepHold });
           busy = false;
           m.close();
           refreshBadges();
@@ -484,7 +486,7 @@ function openReject(b, onDone) {
           busy = false;
           setBusy(submit, false);
           toast(err.message, { type: 'error' });
-          if (err.code === 'INVALID_STATUS') {
+          if (err.code === 'INVALID_STATUS' || err.code === 'PROOF_CHANGED') {
             m.close();
             onDone();
           }
@@ -555,11 +557,14 @@ export async function verifyDetailView({ params }) {
               </dl></section>
             <section class="panel panel-body stack stack-8"><p class="eyebrow">What ${first} submitted</p>
               ${p ? html`<dl class="kv">
-                <div><dt>GCash reference</dt><dd class="row" data-gap="6"><span class="mono">${p.gcashRef || 'Not provided'}</span>${p.gcashRef ? html`<button type="button" class="icon-btn sm flat" data-copy="${p.gcashRef}" aria-label="Copy reference">${icon('copy', 16)}</button>` : ''}</dd></div>
+                <div><dt>Method</dt><dd>${p.paymentMethodName || b.paymentMethodName || 'GCash'}</dd></div>
+                ${p.accountName ? html`<div><dt>Account name</dt><dd>${p.accountName}</dd></div>` : ''}
+                ${p.accountNumber ? html`<div><dt>Account number</dt><dd class="mono">${p.accountNumber}</dd></div>` : ''}
+                <div><dt>Payment reference</dt><dd class="row" data-gap="6"><span class="mono">${p.gcashRef || 'Not provided'}</span>${p.gcashRef ? html`<button type="button" class="icon-btn sm flat" data-copy="${p.gcashRef}" aria-label="Copy reference">${icon('copy', 16)}</button>` : ''}</dd></div>
                 <div><dt>Amount paid</dt><dd class="row" data-gap="8"><span class="mono">${p.amountClaimedLabel || '—'}</span>${amountPill(p.amountCheck)}</dd></div>
                 <div><dt>Submitted</dt><dd>${dayClock(p.createdAt)}</dd></div>
               </dl>
-              <p class="small">These are the details ${first} typed. Match them against the screenshot and your GCash history before approving.</p>` : html`<p class="small">No payment proof yet.</p>`}
+              <p class="small">These are the details ${first} typed. Match them against the screenshot and your payment history before approving.</p>` : html`<p class="small">No payment proof yet.</p>`}
             </section>
             <section class="panel panel-body stack stack-4 checklist-panel" data-checklist>
               <div class="row row-between"><p class="eyebrow">Before you approve <span class="req" aria-hidden="true">*</span></p><span class="small" data-checked aria-live="polite"></span></div>
@@ -644,7 +649,7 @@ export async function verifyDetailView({ params }) {
     }
     openApprove(d.booking, proofWithCheck(), load, { checklistDone: true });
   });
-  on(body, 'click', '[data-act="reject"]', () => openReject(d.booking, load));
+  on(body, 'click', '[data-act="reject"]', () => openReject(d.booking, proofWithCheck(), load));
   on(body, 'click', '[data-act="full"]', () => openViewer({
     url: d.proofs[0].url,
     booking: d.booking,

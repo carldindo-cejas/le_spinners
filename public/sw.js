@@ -2,7 +2,7 @@
    - API calls are never cached: availability, holds and payments are live.
    - Pages and static files are network-first with an offline fallback. */
 
-const VERSION = 'ls-2026-10-07-readiness-history-1';
+const VERSION = 'ls-2026-10-09-staff-management-1';
 const SHELL = [
   '/',
   '/admin/',

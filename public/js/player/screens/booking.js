@@ -78,6 +78,7 @@ function proofCard(d) {
       <button type="button" class="proof-thumb" data-act="view-proof" aria-label="View your payment screenshot"><img src="${p.url}" alt="" loading="lazy"></button>
       <dl class="kv grow compact-kv">
         <div><dt>Screenshot</dt><dd class="ellipsis">${p.fileName || 'Payment screenshot'}</dd></div>
+        <div><dt>Payment method</dt><dd>${p.paymentMethodName || 'GCash'}</dd></div>
         <div><dt>Reference no.</dt><dd class="mono">${p.gcashRef || 'Not entered'}</dd></div>
         <div><dt>Amount paid</dt><dd>${p.amountClaimed != null ? peso(p.amountClaimed, { decimals: true }) : 'Not entered'}</dd></div>
       </dl>
@@ -114,10 +115,10 @@ function viewProof(d) {
 
 /** "₱1,000 · GCash · verified", "₱1,000 · Paid with credit", "₱1,200 · ₱600 GCash + ₱600 credit". */
 function paymentLine(b) {
-  if (b.creditApplied > 0 && b.amountDue > 0) return `${b.totalLabel} · ${b.amountLabel} GCash + ${b.creditAppliedLabel} booking credit`;
+  if (b.creditApplied > 0 && b.amountDue > 0) return `${b.totalLabel} · ${b.amountLabel} ${b.paymentMethodName || 'GCash'} + ${b.creditAppliedLabel} booking credit`;
   if (b.creditApplied > 0) return `${b.totalLabel} · paid with booking credit`;
   if (b.paymentMethod === 'on_site') return `${b.amountLabel} · paid on site`;
-  return `${b.amountLabel} · GCash · verified`;
+  return `${b.amountLabel} · ${b.paymentMethodName || 'GCash'} · verified`;
 }
 
 /** Where the booking credit that paid for this booking came from. */
@@ -408,7 +409,7 @@ export async function confirmedView({ params }) {
       <div class="tk-bottom">
         <div class="row row-between"><div><p class="overline">Booking reference</p><p class="mono tk-ref">${b.ref}</p></div>
           <button type="button" class="icon-btn tonal" data-copy="${b.ref}" aria-label="Copy booking reference">${icon('copy', 20)}</button></div>
-        <div class="grid-2"><div><p class="meta">Payment</p><p class="strong green-text">${b.creditApplied > 0 ? (b.amountDue > 0 ? `${b.amountLabel} GCash + ${b.creditAppliedLabel} credit` : `Booking credit · ${b.creditAppliedLabel}`) : `Verified · ${b.amountLabel}`}</p></div><div><p class="meta">Player</p><p class="strong">${state.user.name}</p></div></div>
+        <div class="grid-2"><div><p class="meta">Payment</p><p class="strong green-text">${b.creditApplied > 0 ? (b.amountDue > 0 ? `${b.amountLabel} ${b.paymentMethodName || 'GCash'} + ${b.creditAppliedLabel} credit` : `Booking credit · ${b.creditAppliedLabel}`) : `Verified · ${b.amountLabel}`}</p></div><div><p class="meta">Player</p><p class="strong">${state.user.name}</p></div></div>
         <p class="small">Show this reference at the front desk when you arrive.</p>
       </div>
     </section>
@@ -430,4 +431,3 @@ export function cancelledView({ params }) {
   const { navigate } = viewTools();
   navigate(`/bookings/${encodeURIComponent(params.id)}`, { replace: true });
 }
-

@@ -5,12 +5,13 @@ import { icon } from '../../core/icons.js';
 import { dayClock, relTime } from '../../core/format.js';
 import { clearFieldErrors, errorState, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame, state } from '../shell.js';
+import { paymentMethodSettings } from '../payment-methods.js';
 
 const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, showFieldErrors, toast, frame });
 
 const SECTIONS = [
   { id: 'rules', label: 'Booking rules' },
-  { id: 'gcash', label: 'GCash payments' },
+  { id: 'payment-methods', label: 'Payment methods' },
   { id: 'pricing', label: 'Pricing' },
   { id: 'alerts', label: 'Admin alerts' },
   { id: 'facility', label: 'Facility info' },
@@ -28,7 +29,7 @@ function toCentavos(v) {
 }
 
 export async function settingsView() {
-  const { listen, frame, api, render, setBusy, toast, on, clearFieldErrors, showFieldErrors } = viewTools();
+  const { scope, listen, frame, api, render, setBusy, toast, on, clearFieldErrors, showFieldErrors } = viewTools();
   const root = frame({
     key: 'settings',
     eyebrow: 'Admin',
@@ -72,19 +73,7 @@ export async function settingsView() {
         <p class="small">"Expiring soon" warning at ${s.warnMinutes} minutes left · slot length ${s.slotMinutes} minutes.</p>
       </section>
 
-      <section class="panel panel-body stack stack-16 set-card" id="gcash"><div><h2 class="h3">GCash payments</h2><p class="small">Exactly what players see on the payment screen.</p></div>
-        <div class="cols c-160-1">
-          <div class="stack stack-16">
-            ${field('gcashName', 'Account name', s.gcashName)}
-            ${field('gcashNumber', 'GCash number', s.gcashNumber, { mono: true, inputmode: 'tel', help: 'Like 0917 123 4567' })}
-          </div>
-          <div class="stack stack-8"><span class="label">QR code image</span>
-            <div data-qr>${s.hasQr ? html`<img class="qr-preview" src="${s.qrUrl}?v=${Date.now()}" alt="Current GCash QR code">` : html`<div class="qr-preview"><span class="small center">No QR yet</span></div>`}</div>
-            ${ro ? '' : html`<div class="row row-wrap" data-gap="8"><label class="btn btn-secondary btn-xs" for="qr-file">${icon('upload', 16)}${s.hasQr ? 'Replace image' : 'Upload image'}</label>${s.hasQr ? html`<button type="button" class="btn btn-text btn-xs danger-text" data-act="qr-remove">Remove</button>` : ''}</div>
-              <input class="sr-only" id="qr-file" type="file" accept="image/png,image/jpeg,image/webp" data-qr-file>`}
-          </div>
-        </div>
-      </section>
+      <section class="panel panel-body stack stack-16 set-card" id="payment-methods"><div><h2 class="h3">Payment methods</h2><p class="small">Configure the methods bookers can use. Account details and QR codes are optional.</p></div><div data-payment-methods></div></section>
 
       <section class="panel panel-body stack stack-16 set-card" id="pricing"><div><h2 class="h3">Pricing <span class="small">per hour</span></h2><p class="small">New prices apply to bookings made after you save.</p></div>
         <div class="table-wrap"><table class="grid price-table"><thead><tr><th>Court / table</th><th>Member</th><th>Non-member</th></tr></thead><tbody>
@@ -105,6 +94,7 @@ export async function settingsView() {
       <section class="panel panel-body stack stack-16 set-card" id="facility"><h2 class="h3">Facility info</h2>
         ${field('facilityName', 'Facility name', s.facilityName)}
         ${field('facilityAddress', 'Address', s.facilityAddress, { help: 'Shown on the player home screen with a Directions link.' })}
+        ${field('facilityMapsUrl', 'Maps location link', s.facilityMapsUrl || '', { type: 'url', help: 'Paste the HTTPS share link for your location in Google Maps or another map app. Leave blank to use the address for Directions.' })}
         <div class="field"><span class="label">Time zone</span><p class="body">Asia/Manila (UTC+8)</p></div>
       </section>
 
@@ -145,6 +135,7 @@ export async function settingsView() {
   listen($('[data-act="delivery-refresh"]', body), 'click', refreshDelivery);
 
   const form = $('[data-form]', body);
+  paymentMethodSettings($('[data-payment-methods]', body), d.paymentMethods || [], ro, scope);
   if (ro) return undefined;
   const val = (n) => form.elements.namedItem(n).value.trim();
 
@@ -155,7 +146,7 @@ export async function settingsView() {
     const payload = {};
     const num = (n) => Number(val(n));
     for (const n of ['holdMinutes', 'resubmitMinutes', 'bookingWindowDays', 'cancelCutoffHours']) if (num(n) !== s[n]) payload[n] = num(n);
-    for (const n of ['gcashName', 'gcashNumber', 'facilityName', 'facilityAddress']) if (val(n) !== s[n]) payload[n] = val(n);
+    for (const n of ['facilityName', 'facilityAddress', 'facilityMapsUrl']) if (val(n) !== (s[n] || '')) payload[n] = val(n);
     const list = (n) => val(n).split(',').map((x) => x.trim()).filter(Boolean);
     if (list('staffAlertEmails').join(',') !== s.staffAlertEmails.join(',')) payload.staffAlertEmails = list('staffAlertEmails');
     if (list('staffAlertSms').join(',') !== s.staffAlertSms.join(',')) payload.staffAlertSms = list('staffAlertSms');
@@ -196,30 +187,6 @@ export async function settingsView() {
     }
   });
 
-  const qrInput = $('[data-qr-file]', body);
-  listen(qrInput, 'change', async () => {
-    const file = qrInput.files && qrInput.files[0];
-    qrInput.value = '';
-    if (!file) return;
-    const fd = new FormData();
-    fd.append('file', file, file.name);
-    try {
-      await api.upload('/api/admin/settings/gcash-qr', fd, { method: 'PUT' });
-      toast('GCash QR updated', { sub: 'Players see the new QR on the payment screen.' });
-      state.router.refresh();
-    } catch (err) {
-      toast(err.message, { type: 'error' });
-    }
-  });
-  on(body, 'click', '[data-act="qr-remove"]', async () => {
-    try {
-      await api.delete('/api/admin/settings/gcash-qr');
-      toast('QR removed', { sub: 'Players pay using the GCash number.' });
-      state.router.refresh();
-    } catch (err) {
-      toast(err.message, { type: 'error' });
-    }
-  });
   return undefined;
 }
 

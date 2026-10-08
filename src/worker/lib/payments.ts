@@ -8,6 +8,8 @@ import { dateLabel, minutesLabel, peso } from './time';
 import { activityLabel, bookingTransition, effectiveStatus, eventStmt, getBooking, slotLabel, systemMessageStmt, type BookingJoin } from './bookings';
 import { releaseStmts } from './credits';
 import { attachUploadStmt, beginUpload, markUploadStored, recoverUploadFailure } from './storage';
+import { selectedPaymentMethod } from './payment-methods';
+import { authorizedBatch } from './authorized-mutations';
 
 /**
  * Proof links are signed for a 5-minute bucket and stay valid for 5–10 minutes.
@@ -21,14 +23,14 @@ function amountMatches(b: BookingJoin, claimed: number | null): 'match' | 'diffe
   return claimed === b.amount_due ? 'match' : 'differs';
 }
 
-/** Player uploads a GCash screenshot for a running hold (or during a resubmit window). */
+/** Player uploads payment proof for a running hold (or during a resubmit window). */
 export async function submitProof(
   env: Bindings,
   settings: Settings,
   user: SessionUser,
   bookingId: string,
   file: File,
-  fields: { gcashRef: string | null; amount: number | null },
+  fields: { gcashRef: string | null; amount: number | null; paymentMethodId?: string },
   now = Date.now(),
 ) {
   const db = env.DB;
@@ -38,12 +40,13 @@ export async function submitProof(
   if (status === 'PAYMENT_SUBMITTED') throw conflict('ALREADY_SUBMITTED', 'Payment proof was already submitted for this booking.');
   if (status === 'EXPIRED') throw conflict('HOLD_EXPIRED', 'Your temporary reservation expired before the proof arrived, so the slot was released.');
   if (status !== 'TEMPORARY' && status !== 'REJECTED') throw conflict('INVALID_STATUS', 'This booking is not waiting for payment.');
+  const method = await selectedPaymentMethod(env, fields.paymentMethodId);
 
   if (file.size > MAX_UPLOAD_BYTES) {
     throw new ApiError(413, 'FILE_TOO_LARGE', 'This image is too large. The limit is 10 MB — a screenshot is usually well under that.');
   }
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes.length === 0) throw unprocessable('EMPTY_FILE', 'That file is empty. Choose your GCash screenshot again.');
+  if (bytes.length === 0) throw unprocessable('EMPTY_FILE', 'That file is empty. Choose your payment screenshot again.');
   const kind = sniffImage(bytes);
   if (!kind) throw unprocessable('UNSUPPORTED_FILE_TYPE', "That file type isn't supported. Upload a JPG, PNG or WEBP screenshot.");
   const clean = stripMetadata(bytes, kind);
@@ -66,20 +69,29 @@ export async function submitProof(
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const match = amountMatches(b, fields.amount);
   const resubmitted = b.status === 'REJECTED';
+  // Initial holds never return to TEMPORARY, so a warning may safely advance
+  // their transition token during upload. REJECTED can recur: fence that exact
+  // rejection cycle to stop an old upload from becoming a later resubmission.
   const stmts: D1PreparedStatement[] = [
     db
       .prepare(
-        `UPDATE bookings SET status = 'PAYMENT_SUBMITTED', submitted_at = ?1, hold_expires_at = NULL, updated_at = ?1, transition_id = ?4
+        `UPDATE bookings SET status = 'PAYMENT_SUBMITTED', submitted_at = ?1, hold_expires_at = NULL, updated_at = ?1, transition_id = ?4,
+            payment_method_id=?9, payment_method_name=?10
           WHERE id = ?2 AND user_id = ?3 AND status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1
-            AND EXISTS (SELECT 1 FROM storage_uploads WHERE id = ?5 AND state='staged' AND claim_id = ?6 AND lease_until > ?1)`,
+            AND status = ?7 AND (?7 = 'TEMPORARY' OR transition_id IS ?8)
+            AND EXISTS (SELECT 1 FROM storage_uploads WHERE id = ?5 AND state='staged' AND claim_id = ?6 AND lease_until > ?1)
+            AND EXISTS (SELECT 1 FROM payment_methods WHERE id=?9 AND enabled=1 AND deleted_at IS NULL
+              AND name=?10 AND account_name IS ?11 AND account_number IS ?12 AND qr_key IS ?13)`,
       )
-      .bind(now, bookingId, user.id, g.id,upload.id,upload.token),
+      .bind(now, bookingId, user.id, g.id,upload.id,upload.token,b.status,b.transition_id, method.id, method.name, method.account_name, method.account_number, method.qr_key),
     db
       .prepare(
-        `INSERT INTO payment_proofs (id, booking_id, user_id, r2_key, content_type, size, original_name, gcash_ref, amount_claimed, status, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ? WHERE ${g.sql}`,
+        `INSERT INTO payment_proofs (id, booking_id, user_id, r2_key, content_type, size, original_name, gcash_ref, amount_claimed, status, created_at,
+          payment_method_id, payment_method_name, account_name, account_number)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ? WHERE ${g.sql}`,
       )
-      .bind(proofId, bookingId, user.id, key, kind.type, clean.length, (file.name || '').slice(0, 120) || null, fields.gcashRef, fields.amount, now, ...g.params),
+      .bind(proofId, bookingId, user.id, key, kind.type, clean.length, (file.name || '').slice(0, 120) || null, fields.gcashRef, fields.amount, now,
+        method.id, method.name, method.account_name, method.account_number, ...g.params),
     eventStmt(db, bookingId, 'proof_submitted', user.id, 'player', resubmitted ? 'New proof after rejection' : null, now, g),
     db
       .prepare(
@@ -115,7 +127,8 @@ export async function submitProof(
     `Time: ${slotLabel(b)}`,
     `Amount due: ${peso(b.amount_due)}`,
     `Amount entered: ${fields.amount != null ? peso(fields.amount) : 'not entered'}${match === 'differs' ? ' (DIFFERS)' : ''}`,
-    `GCash reference: ${fields.gcashRef ?? 'not entered'}`,
+    `Payment method: ${method.name}`,
+    `Payment reference: ${fields.gcashRef ?? 'not entered'}`,
     `Booking: ${b.ref}`,
     '',
     `Review Booking: ${env.APP_ORIGIN}/admin/verify/${bookingId}`,
@@ -147,13 +160,18 @@ export async function submitProof(
     const current = await getBooking(db,bookingId);
     if (current.status === 'PAYMENT_SUBMITTED') throw conflict('ALREADY_SUBMITTED','Payment proof was already submitted for this booking.');
     if (effectiveStatus(current,Date.now()) === 'EXPIRED') throw conflict('HOLD_EXPIRED', 'Your temporary reservation expired before the proof arrived, so the slot was released.');
+    if (current.status !== b.status || current.transition_id !== b.transition_id) throw conflict('BOOKING_CHANGED','This booking changed while the image was uploading. Refresh it and submit the current payment proof.');
+    const currentMethod = await selectedPaymentMethod(env, method.id);
+    if (currentMethod.name !== method.name || currentMethod.account_name !== method.account_name || currentMethod.account_number !== method.account_number || currentMethod.qr_key !== method.qr_key) {
+      throw conflict('PAYMENT_METHOD_UNAVAILABLE', 'Payment instructions changed during the upload. Refresh the payment methods before submitting again.');
+    }
     throw conflict('UPLOAD_EXPIRED','The image could not be saved. Refresh this booking and upload the screenshot again.');
   }
   return getBooking(db, bookingId);
 }
 
 /** Staff approve a submitted proof → CONFIRMED. */
-export async function approvePayment(env: Bindings, staff: SessionUser, bookingId: string, now = Date.now(), chatMessage: string | null = null) {
+export async function approvePayment(env: Bindings, staff: SessionUser, bookingId: string, now = Date.now(), chatMessage: string | null = null, proofId: string | null = null) {
   const db = env.DB;
   const b = await getBooking(db, bookingId);
   const g = bookingTransition(bookingId);
@@ -168,10 +186,12 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
           .bind(newId('m_'), bookingId, staff.id, chatMessage.slice(0, 1000), now + 1, ...g.params),
       ]
     : [];
-  const [update] = await db.batch([
+  const [update] = await authorizedBatch(db, staff, [
     db
-      .prepare(`UPDATE bookings SET status = 'CONFIRMED', confirmed_at = ?1, confirmed_by = ?2, updated_at = ?1, transition_id = ?4 WHERE id = ?3 AND status = 'PAYMENT_SUBMITTED'`)
-      .bind(now, staff.id, bookingId, g.id),
+      .prepare(`UPDATE bookings SET status = 'CONFIRMED', confirmed_at = ?1, confirmed_by = ?2, updated_at = ?1, transition_id = ?4
+        WHERE id = ?3 AND status = 'PAYMENT_SUBMITTED' AND transition_id IS ?5
+          AND (?6 IS NULL OR EXISTS (SELECT 1 FROM payment_proofs WHERE id = ?6 AND booking_id = ?3 AND status = 'submitted'))`)
+      .bind(now, staff.id, bookingId, g.id,b.transition_id,proofId),
     db
       .prepare(`UPDATE payment_proofs SET status = 'approved' WHERE booking_id = ? AND status = 'submitted' AND ${g.sql}`)
       .bind(bookingId, ...g.params),
@@ -181,10 +201,14 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
     userNoticeStmt(db, b.user_id, { type: 'payment_verified', title: 'Payment verified', body: `Booking confirmed · ${where}`, link: `/bookings/${bookingId}`, bookingId }, now, g),
     resolveStaffStmt(db, bookingId, ['proof_submitted', 'new_booking', 'hold_expiring'], now, g),
     outboxStmt(db, 'email', b.user_email ?? '', 'Le Spinners — Booking confirmed',
-      `Hi ${b.user_name},\n\nPayment verified. Your booking is confirmed.\n\n${activityLabel(b.activity)} · ${where}\nReference: ${b.ref}\nAmount: ${peso(b.amount_due)}${b.credit_applied > 0 ? ` GCash + ${peso(b.credit_applied)} booking credit` : ''}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${bookingId}\n\nSee you on court!\nLe Spinners Recreational Hub`,
+      `Hi ${b.user_name},\n\nPayment verified. Your booking is confirmed.\n\n${activityLabel(b.activity)} · ${where}\nReference: ${b.ref}\nAmount: ${peso(b.amount_due)}${b.credit_applied > 0 ? ` ${b.payment_method_name || 'GCash'} + ${peso(b.credit_applied)} booking credit` : ''}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${bookingId}\n\nSee you on court!\nLe Spinners Recreational Hub`,
       bookingId, now, g),
   ]);
-  if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
+  if (!update?.meta.changes) {
+    const current = await getBooking(db,bookingId);
+    if (current.status === 'PAYMENT_SUBMITTED') throw conflict('PROOF_CHANGED','The payment proof changed. Refresh this booking and review the current screenshot before deciding.');
+    throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
+  }
 }
 
 /** Staff reject a submitted proof. With keepHold the player gets a resubmit window. */
@@ -193,7 +217,7 @@ export async function rejectPayment(
   settings: Settings,
   staff: SessionUser,
   bookingId: string,
-  input: { reason: string; message: string | null; keepHold: boolean },
+  input: { reason: string; message: string | null; keepHold: boolean; proofId?: string },
   now = Date.now(),
 ) {
   const db = env.DB;
@@ -204,13 +228,14 @@ export async function rejectPayment(
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const chatText = input.message?.trim() ||
     `${input.reason}${input.keepHold ? ` Please send a new screenshot within ${settings.resubmitMinutes} minutes.` : ''}`;
-  const [update] = await db.batch([
+  const [update] = await authorizedBatch(db, staff, [
     db
       .prepare(
         `UPDATE bookings SET status = ?1, rejected_at = ?2, rejected_by = ?3, reject_reason = ?4, hold_expires_at = ?5, warned_at = NULL, updated_at = ?2, transition_id = ?7
-          WHERE id = ?6 AND status = 'PAYMENT_SUBMITTED'`,
+          WHERE id = ?6 AND status = 'PAYMENT_SUBMITTED' AND transition_id IS ?8
+            AND (?9 IS NULL OR EXISTS (SELECT 1 FROM payment_proofs WHERE id = ?9 AND booking_id = ?6 AND status = 'submitted'))`,
       )
-      .bind(nextStatus, now, staff.id, input.reason, holdUntil, bookingId, g.id),
+      .bind(nextStatus, now, staff.id, input.reason, holdUntil, bookingId, g.id,b.transition_id,input.proofId ?? null),
     db
       .prepare(`UPDATE payment_proofs SET status = 'rejected' WHERE booking_id = ? AND status = 'submitted' AND ${g.sql}`)
       .bind(bookingId, ...g.params),
@@ -236,7 +261,11 @@ export async function rejectPayment(
     // Without a resubmit window the booking is over: any booking credit it used comes back.
     ...releaseStmts(db, 'b.id = ? AND b.transition_id = ?', [bookingId, g.id], now),
   ]);
-  if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
+  if (!update?.meta.changes) {
+    const current = await getBooking(db,bookingId);
+    if (current.status === 'PAYMENT_SUBMITTED') throw conflict('PROOF_CHANGED','The payment proof changed. Refresh this booking and review the current screenshot before deciding.');
+    throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
+  }
 }
 
 /** Staff cancel any active booking with a reason. */
@@ -245,7 +274,7 @@ export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: 
   const b = await getBooking(db, bookingId);
   const g = bookingTransition(bookingId);
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
-  const [update] = await db.batch([
+  const [update] = await authorizedBatch(db, staff, [
     db
       .prepare(
         `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = ?3, hold_expires_at = NULL, updated_at = ?1, transition_id = ?5
@@ -291,7 +320,7 @@ export async function getProof(db: D1Database, proofId: string): Promise<ProofRo
 
 export async function listProofs(env: Bindings, bookingId: string) {
   const { results } = await env.DB.prepare(
-    'SELECT id, content_type, size, original_name, gcash_ref, amount_claimed, status, created_at FROM payment_proofs WHERE booking_id = ? ORDER BY created_at DESC',
+    'SELECT id, content_type, size, original_name, gcash_ref, amount_claimed, status, created_at, payment_method_id, payment_method_name, account_name, account_number FROM payment_proofs WHERE booking_id = ? ORDER BY created_at DESC, rowid DESC',
   )
     .bind(bookingId)
     .all<Omit<ProofRow, 'booking_id' | 'user_id' | 'r2_key'>>();
@@ -301,6 +330,10 @@ export async function listProofs(env: Bindings, bookingId: string) {
     size: p.size,
     fileName: p.original_name,
     gcashRef: p.gcash_ref,
+    paymentMethodId: p.payment_method_id ?? 'gcash',
+    paymentMethodName: p.payment_method_name ?? 'GCash',
+    accountName: p.account_name ?? null,
+    accountNumber: p.account_number ?? null,
     amountClaimed: p.amount_claimed,
     status: p.status,
     createdAt: p.created_at,

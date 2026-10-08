@@ -7,6 +7,8 @@ import { unprocessable } from '../lib/errors';
 import { addDays, dateLabel, daysBetween, isValidDate, localNow, localToMs, MINUTE_MS, offsetMinutes, peso, weekdayOf } from '../lib/time';
 import { query, zActivity, zDate, zId } from '../lib/validate';
 import { creditAccounting } from '../lib/credits';
+import { listPaymentMethods } from '../lib/payment-methods';
+import { collectedPaymentSql } from '../lib/revenue';
 
 /**
  * Revenue reporting for the admin console (/revenue/). Read-only: nothing here
@@ -34,10 +36,20 @@ revenueRoutes.use('*', async (c, next) => {
   await next();
 });
 
-const COLLECTED = `status IN ('CONFIRMED', 'COMPLETED')`;
+const COLLECTED = collectedPaymentSql();
 const CANCELLED_PAID = `status = 'CANCELLED'`;
 const EXPORT_PART_ROWS = 1000; // ~4 ms of CPU per part (measured), inside the Free plan's 10 ms
 const EXPORT_MAX_ROWS = 50_000;
+
+async function revenueMethods(db: D1Database) {
+  const configured = await listPaymentMethods(db);
+  const { results } = await db.prepare(`SELECT DISTINCT payment_method_id AS id, payment_method_name AS name
+    FROM bookings WHERE payment_method_id IS NOT NULL AND submitted_at IS NOT NULL`).all<{ id: string; name: string }>();
+  const methods = new Map([['gcash', 'GCash'], ['on_site', 'Paid on site']]);
+  for (const row of results) methods.set(row.id, row.name);
+  for (const row of configured) methods.set(row.id, row.name);
+  return [...methods].map(([value, label]) => ({ value, label }));
+}
 
 // ── Calendar helpers (facility-local YYYY-MM-DD) ───────────────────────────
 
@@ -172,7 +184,7 @@ revenueRoutes.get('/summary', async (c) => {
       name: r.name,
       activity: r.activity,
     })),
-    methods: [{ value: 'gcash', label: 'GCash' }, { value: 'on_site', label: 'Paid on site' }],
+    methods: await revenueMethods(db),
   });
 });
 
@@ -191,7 +203,7 @@ const ledgerSchema = z.object({
   q: opt(z.string().trim().max(80)),
   resource: opt(zId),
   type: opt(zActivity),
-  method: opt(z.enum(['gcash', 'on_site'])),
+  method: opt(zId),
   status: opt(z.enum(PAY_STATUSES)),
   sort: opt(z.enum(SORTS)),
   dir: opt(z.enum(['asc', 'desc'])),
@@ -212,6 +224,7 @@ type LedgerQuery = z.infer<typeof ledgerSchema>;
 const LEDGER_CTE = `
   WITH ledger AS (
     SELECT b.id, b.ref, b.status, b.date, b.start_min, b.end_min, b.amount_due, b.rate, b.payment_method, b.credit_applied,
+           b.payment_method_id, b.payment_method_name,
            ${SEGMENTS_SQL('b')},
            (SELECT COALESCE(SUM(t.end_min - t.start_min), 0) FROM booking_times t WHERE t.booking_id = b.id) AS booked_min,
            b.submitted_at, b.confirmed_at, b.rejected_at, b.cancelled_at, b.updated_at, b.resource_id,
@@ -242,7 +255,7 @@ const SORT_SQL: Record<(typeof SORTS)[number], string> = {
   type: 'activity',
   duration: 'booked_min',
   amount: 'amount_due',
-  method: 'payment_method',
+  method: 'COALESCE(payment_method_name, payment_method) COLLATE NOCASE',
   status: `CASE pay_status WHEN 'paid' THEN 1 WHEN 'pending' THEN 2 WHEN 'rejected' THEN 3 WHEN 'cancelled_credited' THEN 4 WHEN 'cancelled_paid' THEN 5 ELSE 6 END`,
 };
 
@@ -258,6 +271,8 @@ type LedgerRow = {
   amount_due: number;
   rate: 'member' | 'non_member';
   payment_method: PaymentMethod;
+  payment_method_id: string | null;
+  payment_method_name: string | null;
   credit_applied: number;
   submitted_at: number;
   confirmed_at: number | null;
@@ -276,7 +291,11 @@ type LedgerRow = {
 };
 
 /** Validates the filters and turns them into a WHERE clause over the ledger CTE. */
-function ledgerFilter(c: AppContext, raw: LedgerQuery) {
+async function ledgerFilter(c: AppContext, raw: LedgerQuery) {
+  if (raw.method && raw.method !== 'gcash' && raw.method !== 'on_site'
+    && !await c.env.DB.prepare('SELECT id FROM payment_methods WHERE id=?').bind(raw.method).first()) {
+    throw unprocessable('VALIDATION_ERROR', 'Choose a configured or historical payment method.');
+  }
   const offset = offsetMinutes(c.env.TZ_OFFSET_MINUTES);
   const today = localNow(offset).date;
   const to = raw.to ?? today;
@@ -301,7 +320,7 @@ function ledgerFilter(c: AppContext, raw: LedgerQuery) {
     params.push(raw.type);
   }
   if (raw.method) {
-    where.push('payment_method = ?');
+    where.push('COALESCE(payment_method_id, payment_method) = ?');
     params.push(raw.method);
   }
   if (raw.status) {
@@ -366,8 +385,8 @@ function rowDTO(r: LedgerRow) {
     rate: r.rate,
     amount: r.amount_due,
     amountLabel: peso(r.amount_due),
-    method: r.payment_method,
-    methodLabel: paymentMethodLabel(r.payment_method, r.credit_applied),
+    method: r.payment_method_id ?? r.payment_method,
+    methodLabel: paymentMethodLabel(r.payment_method, r.credit_applied, r.payment_method_name),
     /** Booking credit that paid the rest (never cash collected). */
     creditApplied: r.credit_applied,
     gcashRef: r.gcash_ref,
@@ -376,12 +395,12 @@ function rowDTO(r: LedgerRow) {
   };
 }
 
-const ROW_SELECT = `SELECT l.*, (SELECT p.gcash_ref FROM payment_proofs p WHERE p.booking_id = l.id ORDER BY p.created_at DESC LIMIT 1) AS gcash_ref FROM ledger l`;
+const ROW_SELECT = `SELECT l.*, (SELECT p.gcash_ref FROM payment_proofs p WHERE p.booking_id = l.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1) AS gcash_ref FROM ledger l`;
 
 revenueRoutes.get('/ledger', async (c) => {
   const db = c.env.DB;
   const q = query(c, ledgerSchema);
-  const f = ledgerFilter(c, q);
+  const f = await ledgerFilter(c, q);
   const size = q.size ?? 10;
   let page = q.page ?? 1;
 
@@ -455,24 +474,24 @@ const exportSchema = ledgerSchema.extend({
 
 const EXPORT_HEADER = [
   'Payment date (Asia/Manila)', 'Recorded as', 'Booking reference', 'Customer', 'Email', 'Facility', 'Type',
-  'Booking date', 'Booking time', 'Duration (min)', 'Amount (PHP)', 'Payment method', 'GCash reference',
+  'Booking date', 'Booking time', 'Duration (min)', 'Amount (PHP)', 'Payment method', 'Payment reference',
   'Payment status', 'Counts as collected revenue', 'Verified by', 'Booking status', 'Cancelled at (Asia/Manila)',
 ];
 
 /**
  * The CSV comes in parts of EXPORT_PART_ROWS rows so each request stays well inside the
  * Workers Free CPU limit; the page fetches every part and saves one file. Part 1 carries
- * the byte-order mark and the header row. X-Export-Version (row count + latest change)
- * lets the page restart if payments change between parts, so no row is skipped or repeated.
+ * the byte-order mark and the header row. X-Export-Version (row count + database revision)
+ * lets the page restart if any ledger source changes between parts, so no row is skipped or repeated.
  */
 revenueRoutes.get('/export', async (c) => {
   const admin = requireAdmin(c);
   const db = c.env.DB;
   const q = query(c, exportSchema);
-  const f = ledgerFilter(c, q);
+  const f = await ledgerFilter(c, q);
   const part = q.part ?? 1;
   const [metaRes, rowsRes] = await db.batch([
-    db.prepare(`${LEDGER_CTE} SELECT COUNT(*) AS n, COALESCE(MAX(updated_at), 0) AS v FROM ledger ${f.sql}`).bind(...f.params),
+    db.prepare(`${LEDGER_CTE} SELECT COUNT(*) AS n, (SELECT revision FROM revenue_export_revision WHERE id = 1) AS v FROM ledger ${f.sql}`).bind(...f.params),
     db.prepare(`${LEDGER_CTE} ${ROW_SELECT} ${f.sql} ${f.order} LIMIT ? OFFSET ?`).bind(...f.params, EXPORT_PART_ROWS, (part - 1) * EXPORT_PART_ROWS),
   ]);
   const meta = ((metaRes?.results ?? [])[0] ?? { n: 0, v: 0 }) as { n: number; v: number };
@@ -487,7 +506,7 @@ revenueRoutes.get('/export', async (c) => {
     lines.push([
       // A console booking's customer is its booker (no email); "Verified by" names the staff member who booked it.
       localStamp(r.pay_at, f.offset), AT_KIND[r.pay_status], r.ref, r.booker_name ?? r.user_name, r.booker_name ? '' : r.user_email, r.resource_name, activityLabel(r.activity),
-      r.date, slotLabel(r), bookedMinutes(r), (r.amount_due / 100).toFixed(2), paymentMethodLabel(r.payment_method), r.gcash_ref,
+      r.date, slotLabel(r), bookedMinutes(r), (r.amount_due / 100).toFixed(2), paymentMethodLabel(r.payment_method, 0, r.payment_method_name), r.gcash_ref,
       PAY_LABEL[r.pay_status], r.pay_status === 'paid' ? 'Yes' : 'No', r.verified_by, r.status, localStamp(r.cancelled_at, f.offset),
     ].map(csvCell).join(','));
   }

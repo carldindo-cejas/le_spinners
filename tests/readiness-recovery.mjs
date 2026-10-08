@@ -72,7 +72,7 @@ test('creation replay survives another request committing during validation', as
   const input = { ...request, useCredit: true, expectedCredit: 50000 };
   let winner;
   f.DB.beforeRead = async stmt => {
-    if (/SELECT version FROM schedule_revision/.test(stmt.sql)) {
+    if (/SELECT version FROM booking_configuration_revision/.test(stmt.sql)) {
       f.DB.beforeRead = null;
       winner = await app.createHold(f.env, s, f.player, input, NOW);
     }
@@ -263,6 +263,7 @@ test('housekeeping deletes at most 250 expired sessions and rate limits per hour
   }
   const report = await app.runMaintenance(f.env, NOW, { cron: true });
   assert.equal(report.housekeeping, 'ok');
-  assert.equal(f.DB.count('sessions'), 350);
+  assert.equal(f.DB.count('sessions', 'expires_at <= ' + NOW), 350);
+  assert.equal(f.DB.count('sessions', 'expires_at > ' + NOW), 2);
   assert.equal(f.DB.count('rate_limits'), 350);
 });

@@ -641,16 +641,16 @@ export function reviewStep({ params }) {
       <div class="summary-foot sub credit-line"><div><div class="strong">Booking credit</div>
         <label class="check-row compact"><input type="checkbox" data-use-credit ${useCredit ? 'checked' : ''}><span class="check-box">${icon('check', 14, 3)}</span>Use my credit</label></div>
         <span class="mono${useCredit ? ' blue-text' : ' muted'}">−${peso(quote.creditApplied)}</span></div>
-      <div class="summary-foot"><div><div class="strong">${coveredByCredit() ? 'Nothing to pay' : 'To pay by GCash'}</div>${useCredit && quote.creditApplied ? html`<div class="small">Not a cash refund: your credit pays first</div>` : ''}</div><span class="mono">${peso(due())}</span></div>`;
+      <div class="summary-foot"><div><div class="strong">${coveredByCredit() ? 'Nothing to pay' : 'To pay'}</div>${useCredit && quote.creditApplied ? html`<div class="small">Not a cash refund: your credit pays first</div>` : ''}</div><span class="mono">${peso(due())}</span></div>`;
   };
   const nextSteps = () => coveredByCredit()
     ? html`<ol class="steps-list">
         <li><span class="n blue">1</span><span>Your booking credit pays the whole <b>${peso(quote.price)}</b>.</span></li>
-        <li><span class="n green">2</span><span>The booking is <b>confirmed right away</b>. No GCash payment or screenshot needed.</span></li>
+        <li><span class="n green">2</span><span>The booking is <b>confirmed right away</b>. No payment or screenshot needed.</span></li>
       </ol>`
     : html`<ol class="steps-list">
         <li><span class="n amber">1</span><span>We hold ${res.name} for you for <b>${holdMin} minutes</b>${credit() ? ` and set aside ${peso(credit())} of your credit` : ''}.</span></li>
-        <li><span class="n blue">2</span><span>Pay <b>${peso(due())}</b> by GCash and upload your screenshot.</span></li>
+        <li><span class="n blue">2</span><span>Pay <b>${peso(due())}</b> using an enabled payment method and upload your screenshot.</span></li>
         <li><span class="n violet">3</span><span>Staff verify your payment. Then your booking is <b>confirmed</b>.</span></li>
       </ol>`;
   const ctaLabel = () => (coveredByCredit() ? html`${icon('gift', 20)}Book with credit` : html`Reserve &amp; pay ${peso(due())}`);

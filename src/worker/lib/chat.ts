@@ -4,6 +4,7 @@ import { newId } from './crypto';
 import { resolveStaffStmt } from './notify';
 import { proofLink } from './payments';
 import { afterPage, pageResult, type PageRequest } from './pagination';
+import { authorizedBatch } from './authorized-mutations';
 
 /**
  * Booking chat: one private thread per booking between its player and staff.
@@ -79,7 +80,7 @@ export async function listMessages(env: Bindings, bookingId: string, viewer: { s
 }
 
 /** Moves the reader's marker up to the newest message from the other side. */
-export async function markRead(env: Bindings, bookingId: string, side: ChatSide, userId: string, now = Date.now()) {
+export async function markRead(env: Bindings, bookingId: string, side: ChatSide, userId: string, now = Date.now(), actor?: SessionUser) {
   const db = env.DB;
   const other: ChatSide = side === 'player' ? 'staff' : 'player';
   const row = await db
@@ -90,7 +91,7 @@ export async function markRead(env: Bindings, bookingId: string, side: ChatSide,
     .bind(bookingId, other, side)
     .first<{ latest: number | null; read_at: number | null }>();
   if (!row?.latest || (row.read_at ?? 0) >= row.latest) return;
-  await db.batch([
+  const statements = [
     db
       .prepare(
         `INSERT INTO message_reads (booking_id, reader, last_read_at) VALUES (?1, ?2, ?3)
@@ -102,7 +103,11 @@ export async function markRead(env: Bindings, bookingId: string, side: ChatSide,
           .prepare(`UPDATE notifications SET read_at = ? WHERE audience = 'user' AND user_id = ? AND booking_id = ? AND type = 'new_message' AND read_at IS NULL`)
           .bind(now, userId, bookingId)
       : resolveStaffStmt(db, bookingId, ['new_message'], now),
-  ]);
+  ];
+  if (side === 'staff') {
+    if (!actor) throw new Error('Staff read markers require the authenticated actor.');
+    await authorizedBatch(db, actor, statements);
+  } else await db.batch(statements);
 }
 
 /**
@@ -163,7 +168,8 @@ export async function postMessage(env: Bindings, author: SessionUser, side: Chat
       resolveStaffStmt(db, booking.id, ['new_message'], now),
     );
   }
-  await db.batch(stmts);
+  if (side === 'staff') await authorizedBatch(db, author, stmts);
+  else await db.batch(stmts);
   return id;
 }
 

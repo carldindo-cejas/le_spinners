@@ -59,6 +59,8 @@ export async function newBookingView({ query }) {
   };
   const picked = new Set();
   let day = null;
+  let requestGeneration = 0;
+  let submitting = false;
 
   const root = frame({
     key: 'bookings',
@@ -134,8 +136,8 @@ export async function newBookingView({ query }) {
       <div><dt>Total</dt><dd class="mono big-amt">${f.payment === 'none' ? 'No charge' : n && total != null ? peso(total) : '—'}</dd></div>
       ${f.payment === 'on_site' && price != null && n > 1 ? html`<div><dt></dt><dd class="small">${n} × ${peso(price)} ${f.rate === 'member' ? 'member' : 'non-member'} rate</dd></div>` : ''}`);
     const named = f.bookerName.trim().length >= 2;
-    bookBtn.disabled = !res || !n || !named;
-    bookBtn.textContent = !res ? 'Pick a court or table' : !n ? 'Pick a time' : !named ? "Enter the booker's name" : `Book & confirm${f.payment === 'on_site' && total != null ? ` · ${peso(total)}` : ''}`;
+    bookBtn.disabled = submitting || !res || !n || !named;
+    if (!submitting) bookBtn.textContent = !res ? 'Pick a court or table' : !n ? 'Pick a time' : !named ? "Enter the booker's name" : `Book & confirm${f.payment === 'on_site' && total != null ? ` · ${peso(total)}` : ''}`;
   }
 
   function paintDay() {
@@ -168,8 +170,12 @@ export async function newBookingView({ query }) {
   }
 
   async function load(quiet = false) {
+    const generation = ++requestGeneration;
+    const { date, activity } = f;
     try {
-      day = await api.get(`${API}/schedule?date=${f.date}&activity=${f.activity}`);
+      const response = await api.get(`${API}/schedule?date=${date}&activity=${activity}`);
+      if (generation !== requestGeneration || date !== f.date || activity !== f.activity) return;
+      day = response;
       // Drop picked times that were taken meanwhile.
       const res = resource();
       const lost = res ? sorted().filter((s) => res.slots.find((x) => x.start === s)?.state !== 'available') : [];
@@ -177,6 +183,7 @@ export async function newBookingView({ query }) {
       if (lost.length && quiet) toast(lost.length === 1 ? `${minutesLabel(lost[0])} was just taken` : `${lost.length} of your times were just taken`, { type: 'warn', sub: 'They were removed from your selection.' });
       paintDay();
     } catch (err) {
+      if (generation !== requestGeneration || date !== f.date || activity !== f.activity) return;
       if (quiet) return;
       render(slotsEl, errorState(err));
       listen($('[data-act="retry"]', slotsEl), 'click', () => load());
@@ -186,7 +193,10 @@ export async function newBookingView({ query }) {
   function reset(what) {
     Object.assign(f, what);
     picked.clear();
+    day = null;
     syncUrl();
+    render($('[data-resources]', root), '');
+    paintSummary();
     render(slotsEl, skeletonRows(4));
     load();
   }
@@ -234,9 +244,10 @@ export async function newBookingView({ query }) {
     paintSummary();
   });
   listen(bookBtn, 'click', async () => {
-    if (bookBtn.disabled) return;
+    if (submitting || bookBtn.disabled) return;
     const bookerName = f.bookerName.trim();
     if (!picked.size || !f.resourceId || bookerName.length < 2) return;
+    submitting = true;
     setBusy(bookBtn, true, 'Booking…');
     try {
       const res = await postBooking(`${API}/bookings`, {
@@ -245,6 +256,7 @@ export async function newBookingView({ query }) {
       toast('Booking confirmed', { sub: `${res.booking.bookerName || res.booking.user.name} · ${res.booking.resource.name} · ${res.booking.timeLabel} · ${res.booking.ref}` });
       navigate(`${BASE}/bookings/${res.booking.id}`, { replace: true });
     } catch (err) {
+      submitting = false;
       setBusy(bookBtn, false);
       toast(err.message, { type: 'error' });
       if (err.code === 'SLOT_TAKEN' || err.code === 'TIME_STARTED' || err.code === 'CLOSED') load();

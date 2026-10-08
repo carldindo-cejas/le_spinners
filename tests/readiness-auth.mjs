@@ -9,7 +9,7 @@ import { adminAccountSql } from '../scripts/lib/admin-account.mjs';
 const oldHash='A'.repeat(43),newHash='B'.repeat(43),salt='S'.repeat(22);
 const freshPassword=(hash=newHash,s='T'.repeat(22))=>({clientHash:hash,salt:s,scheme:app.PASSWORD_SCHEME,iterations:app.PASSWORD_ITERATIONS});
 async function setup(t,role='player') {
-  const f=fixture(t);f.env.PASSWORD_PEPPER='synthetic-auth-pepper-for-deterministic-tests-only';
+  const f=fixture(t);f.DB.sqlite.exec('DELETE FROM sessions');f.env.PASSWORD_PEPPER='synthetic-auth-pepper-for-deterministic-tests-only';
   const hash=await app.pepperHash(f.env.PASSWORD_PEPPER,oldHash);
   f.DB.sqlite.prepare('UPDATE users SET password_hash=?,password_salt=?,password_iterations=?,password_scheme=?,role=? WHERE id=?')
     .run(hash,salt,app.PASSWORD_ITERATIONS,app.PASSWORD_SCHEME,role,'test_player');

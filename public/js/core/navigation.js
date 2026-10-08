@@ -32,7 +32,7 @@ export function loginReturnTarget(target, { portal = 'player', origin = location
     if (path === base || path === base + '/') return true;
     if (!path.startsWith(base + '/')) return false;
     const rest = path.slice(base.length);
-    return consolePaths.test(rest) || (portal === 'admin' && /^\/settings\/?$/.test(rest));
+    return consolePaths.test(rest) || (portal === 'admin' && /^\/(?:settings|staff)\/?$/.test(rest));
   };
   return localTarget(target, { origin, allowPath }) || fallback;
 }

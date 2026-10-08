@@ -4,11 +4,11 @@ import { api } from '../../core/api.js';
 import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, bookingTime, clock, dateLabel, dayClock, isoDate, longDate, peso, shortDate } from '../../core/format.js';
-import { errorState, poll, skeletonRows, toast } from '../../core/ui.js';
+import { errorState, openModal, poll, skeletonRows, toast } from '../../core/ui.js';
 import { bell, frame, showSessionExpired } from '../shell.js';
 import { API, BASE, REVENUE } from '../console.js';
 
-const viewTools = createViewTools({ listen, api, on, render, setBusy, poll, toast, frame });
+const viewTools = createViewTools({ listen, api, on, render, setBusy, openModal, poll, toast, frame });
 
 /**
  * Revenue (admin only, /revenue/). Read-only reporting over verified payments.
@@ -24,6 +24,10 @@ const QUICK = [
   { key: '1y', label: '1Y', title: 'Last 12 months' },
 ];
 const RANGES = [...QUICK.map((r) => r.key), 'custom'];
+const EXPORT_QUICK = [
+  { key: '1d', label: '1D', title: 'Today' },
+  ...QUICK.filter((r) => r.key !== '3m'),
+];
 const PAY_STATUS = [
   { key: 'paid', label: 'Paid · verified' },
   { key: 'pending', label: 'Pending verification' },
@@ -94,6 +98,7 @@ function addMonths(date, months) {
 /** [from, to] (inclusive facility dates) for a preset, relative to the facility's today. */
 function presetRange(key, today) {
   switch (key) {
+    case '1d': return [today, today];
     case '30d': return [addDays(today, -29), today];
     case '3m': return [addDays(addMonths(today, -3), 1), today];
     case '1y': return [addDays(addMonths(today, -12), 1), today];
@@ -133,7 +138,7 @@ function readState(query, today) {
     q: (query.get('q') || '').slice(0, 80),
     resource: /^[A-Za-z0-9_-]{1,64}$/.test(query.get('resource') || '') ? query.get('resource') : '',
     type: pick(query.get('type'), ['pickleball', 'table_tennis'], ''),
-    method: pick(query.get('method'), ['gcash', 'on_site'], ''),
+    method: /^[A-Za-z0-9_-]{1,64}$/.test(query.get('method') || '') ? query.get('method') : '',
     status: pick(query.get('status'), PAY_STATUS.map((s) => s.key), ''),
     sort: pick(query.get('sort'), COLUMNS.map((c) => c.key), 'date'),
     dir: pick(query.get('dir'), ['asc', 'desc'], 'desc'),
@@ -185,13 +190,12 @@ function changeChip(p) {
 
 function summaryCard(p) {
   const a = CARD[p.key];
-  const cxl = p.cancelledAfterPayment;
+  const amount = money(p.collected);
   return html`<article class="rev-card ${a.tone}" aria-labelledby="rev-${p.key}">
     <div class="rev-card-head"><span class="tile sm ${a.tone}">${icon(a.icon, 20)}</span><h3 class="eyebrow" id="rev-${p.key}">${p.label}</h3></div>
-    <p class="rev-amt">${money(p.collected)}</p>
+    <p class="rev-amt${amount.length > 10 ? ' long' : ''}">${amount}</p>
     <p class="rev-cmp">${changeChip(p)}<span class="meta">vs ${money(p.previous.toDate)} ${a.cmp}</span></p>
     <p class="meta">${plural(p.payments, 'payment')} · ${p.rangeLabel}</p>
-    ${cxl.count ? html`<p class="meta amber-text rev-foot">${icon('alert', 14, 2.2)}<span>${money(cxl.amount)} cancelled after payment · not included</span></p>` : ''}
   </article>`;
 }
 
@@ -271,21 +275,15 @@ function pager(d) {
     </div>`;
 }
 
-function totalsStrip(d) {
-  const t = d.totals;
-  return html`<div class="ledger-total"><span class="eyebrow">Collected</span><span class="strong mono">${money(t.collected)}</span><span class="meta">${plural(t.collectedCount, 'verified payment')}</span></div>
-    <div class="ledger-total"><span class="eyebrow">Pending verification</span><span class="strong mono">${money(t.pending)}</span><span class="meta">${plural(t.pendingCount, 'proof')} · not revenue yet</span></div>
-    ${t.cancelledAfterPaymentCount ? html`<div class="ledger-total amber"><span class="eyebrow">Cancelled after payment</span><span class="strong mono">${money(t.cancelledAfterPayment)}</span><span class="meta">${plural(t.cancelledAfterPaymentCount, 'booking')} · reconcile credit ledger and external refunds</span></div>` : ''}`;
-}
-
 // ── Screen ────────────────────────────────────────────────────────────────
 
 export function revenueView({ query }) {
-  const { listen, scope, frame, render, api, setBusy, setTimeout, toast, on, poll, setInterval } = viewTools();
+  const { listen, scope, frame, render, api, setBusy, openModal, setTimeout, toast, on, poll, setInterval } = viewTools();
   const nowLine = () => `${longDate(isoDate(Date.now()))} · ${clock(Date.now())}`;
   let today = isoDate(Date.now());
   const f = readState(query, today);
   let resources = [];
+  let methods = [];
 
   const root = frame({
     key: 'revenue',
@@ -294,18 +292,15 @@ export function revenueView({ query }) {
     mobileHeader: html`<div class="tb-mobile"><div class="row row-between"><h1 class="m-title">Revenue</h1>${bell({ dark: true })}</div><p class="small light-text" data-clock>${dateLabel(today)} · ${clock(Date.now())}</p></div>`,
     template: html`<div class="page revenue">
       <section class="rev-grid" aria-label="Revenue summary" data-cards>${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}</section>
-      <p class="small rev-note" data-note>Collected revenue counts payments staff have verified, on the day they were verified. Proofs still waiting, rejected proofs and unpaid holds are never counted.</p>
-      <p class="small rev-note" data-accounting></p>
 
       <section class="panel ledger" aria-labelledby="ledger-title">
         <div class="ledger-head">
-          <div class="stack stack-4">
-            <h2 class="panel-title" id="ledger-title">Booking Ledger</h2>
-            <p class="small">A record of bookings and their associated payments, including payment dates, facilities, amounts, and payment status.</p>
-          </div>
+          <h2 class="panel-title" id="ledger-title">Booking Ledger</h2>
           <button type="button" class="btn btn-secondary btn-sm" data-act="export">${icon('download', 18)}Export CSV</button>
         </div>
-        <div class="ledger-tools">
+        <details class="ledger-filters" data-filter-panel>
+          <summary><span data-filter-label>Show Filters</span>${icon('chevron-down', 16)}</summary>
+          <div class="ledger-tools">
           <div class="ledger-search">
             <label class="search-pill">${icon('search', 18)}<input type="search" placeholder="Reference, customer, email or court" aria-label="Search the ledger" data-q value="${f.q}" maxlength="80"></label>
             <button type="button" class="btn btn-text btn-sm" data-act="clear">Clear filters</button>
@@ -313,7 +308,7 @@ export function revenueView({ query }) {
           <div class="filters">
             <select class="select" data-f="resource" aria-label="Facility"></select>
             <select class="select" data-f="type" aria-label="Booking type"><option value="">All types</option><option value="pickleball">Pickleball</option><option value="table_tennis">Table Tennis</option></select>
-            <select class="select" data-f="method" aria-label="Payment method"><option value="">All methods</option><option value="gcash">GCash</option><option value="on_site">Paid on site</option></select>
+            <select class="select" data-f="method" aria-label="Payment method"><option value="">All methods</option></select>
             <select class="select" data-f="status" aria-label="Payment status"><option value="">All statuses</option>${PAY_STATUS.map((s) => html`<option value="${s.key}">${s.label}</option>`)}</select>
             <select class="select only-mobile" data-f="msort" aria-label="Sort">${MOBILE_SORTS.map((s) => html`<option value="${s.key}">${s.label}</option>`)}</select>
           </div>
@@ -328,7 +323,7 @@ export function revenueView({ query }) {
           <p class="field-error rev-date-error" role="alert" data-date-error hidden></p>
           <p class="small rev-period"><span class="strong" data-range-label>${rangeText(f.from, f.to)}</span> · facility time (Asia/Manila)</p>
         </div>
-        <div class="ledger-totals" data-totals></div>
+        </details>
         <div data-ledger>${skeletonRows(5)}</div>
         <div class="pager" data-pager></div>
       </section>
@@ -338,8 +333,12 @@ export function revenueView({ query }) {
   const $cards = $('[data-cards]', root);
   const $ledger = $('[data-ledger]', root);
   const $pager = $('[data-pager]', root);
-  const $totals = $('[data-totals]', root);
   const $dateError = $('[data-date-error]', root);
+  const filterPanel = $('[data-filter-panel]', root);
+  filterPanel.open = matchMedia('(min-width: 768px)').matches;
+  const filterLabel = () => { $('[data-filter-label]', root).textContent = filterPanel.open ? 'Hide Filters' : 'Show Filters'; };
+  listen(filterPanel, 'toggle', filterLabel);
+  filterLabel();
   let ledgerSeq = 0;
   let inflight = null;
   let searchTimer = null;
@@ -357,6 +356,7 @@ export function revenueView({ query }) {
       { activity: 'table_tennis', label: 'Table tennis tables' },
     ].filter((g) => !f.type || g.activity === f.type);
     render(res, html`<option value="">All facilities</option>${groups.map((g) => html`<optgroup label="${g.label}">${resources.filter((r) => r.activity === g.activity).map((r) => html`<option value="${r.id}">${r.name}</option>`)}</optgroup>`)}`);
+    render($('select[data-f="method"]', root), html`<option value="">All methods</option>${methods.map(m => html`<option value="${m.value}">${m.label}</option>`)}`);
     for (const sel of $$('select[data-f]', root)) {
       sel.value = sel.dataset.f === 'msort' ? `${f.sort}:${f.dir}` : f[sel.dataset.f] || '';
       if (sel.dataset.f === 'msort' && sel.selectedIndex < 0) sel.selectedIndex = 0;
@@ -386,17 +386,12 @@ export function revenueView({ query }) {
   async function loadSummary() {
     try {
       const s = await api.get(`${API}/revenue/summary`);
-      const accounting = await api.get(`${API}/revenue/accounting`).catch(() => null);
-      if (accounting) render($('[data-accounting]',root),html`Verified cash recorded (including later cancellations): ${money(accounting.verifiedCash)}. Recorded credit refunds: ${money(accounting.recordedRefunds)}. Active credit balances: ${money(accounting.activeCreditBalances)}. Reconcile cash and refunds against external payment records; active credits are separate from collected revenue.`);
       if (s.today !== today) today = s.today;
       const first = !resources.length;
       resources = s.resources;
+      methods = s.methods || [];
       if (first) syncControls();
       render($cards, s.periods.map(summaryCard));
-      const pend = s.pendingVerification;
-      render($('[data-note]', root), html`Collected revenue counts payments staff have verified, on the day they were verified.
-        ${pend.count ? html`<a href="${BASE}/verify">${plural(pend.count, 'proof')} (${money(pend.amount)})</a> still ${pend.count === 1 ? 'waits' : 'wait'} for verification and ${pend.count === 1 ? "isn't" : "aren't"} counted yet.` : 'Nothing is waiting for verification.'}
-        Rejected proofs and unpaid holds are never counted.`);
     } catch (err) {
       render($cards, errorState(err, { title: "Revenue totals didn't load" }));
       listen($('[data-act="retry"]', $cards), 'click', loadSummary);
@@ -425,7 +420,6 @@ export function revenueView({ query }) {
       if (err && err.name === 'AbortError') return;
       if (seq !== ledgerSeq) return;
       data = null;
-      render($totals, '');
       render($pager, '');
       render($ledger, errorState(err, { title: "The ledger didn't load" }));
       listen($('[data-act="retry"]', $ledger), 'click', loadLedger);
@@ -439,7 +433,6 @@ export function revenueView({ query }) {
 
   function paintLedger(d) {
     const thisYear = today.slice(0, 4);
-    render($totals, totalsStrip(d));
     if (!d.rows.length) {
       render($pager, '');
       const filtered = f.q || f.resource || f.type || f.method || f.status;
@@ -505,11 +498,11 @@ export function revenueView({ query }) {
     throw new Error('Payments changed while the file was being built. Export again in a moment.');
   }
 
-  async function exportCsv(btn) {
+  async function exportCsv(btn, filters) {
     if (btn.disabled) return;
     setBusy(btn, true, 'Exporting…');
     try {
-      const { name, chunks, rows } = await exportText(toQuery(f, { paged: false }), btn);
+      const { name, chunks, rows } = await exportText(toQuery(filters, { paged: false }), btn);
       scope.assertCurrent();
       // A byte-order mark so spreadsheet apps read the file as UTF-8 (₱, ñ).
       const blob = new Blob([String.fromCharCode(0xfeff), ...chunks], { type: 'text/csv;charset=utf-8' });
@@ -523,12 +516,87 @@ export function revenueView({ query }) {
       a.click();
       a.remove();
       setTimeout(release, 10_000);
-      toast('Ledger exported', { sub: `${plural(rows, 'record')} · same filters and order as the table` });
+      toast('Ledger exported', { sub: `${plural(rows, 'record')} · ${rangeText(filters.from, filters.to)}` });
+      return true;
     } catch (err) {
       toast(err.message || "The export didn't work.", { type: 'error' });
+      return false;
     } finally {
       setBusy(btn, false);
     }
+  }
+
+  function chooseExportDates() {
+    const filters = { ...f, range: EXPORT_QUICK.some((r) => r.key === f.range) ? f.range : 'custom' };
+    let busy = false;
+    openModal({
+      label: 'Export booking ledger', className: 'rev-export', locked: () => busy,
+      content: () => html`<form class="stack stack-16" data-export-form novalidate>
+        <h2 class="h3">Export booking ledger</h2>
+        <p class="small">Choose the dates to export. Current search, payment filters and sort order apply.</p>
+        <div class="chip-row" role="group" aria-label="Export date range">
+          ${EXPORT_QUICK.map((r) => html`<button type="button" class="chip" data-export-range="${r.key}" aria-pressed="${filters.range === r.key ? 'true' : 'false'}" title="${r.title}">${r.label}</button>`)}
+          <button type="button" class="chip" data-export-range="custom" aria-pressed="${filters.range === 'custom' ? 'true' : 'false'}">${icon('calendar', 16)}Custom</button>
+        </div>
+        <div class="rev-dates">
+          <label class="rev-date"><span class="label">From</span><input class="input" type="date" name="from" value="${filters.from}" required aria-label="Export start date"></label>
+          <label class="rev-date"><span class="label">To</span><input class="input" type="date" name="to" value="${filters.to}" required aria-label="Export end date"></label>
+        </div>
+        <p class="small"><span class="strong" data-export-period>${rangeText(filters.from, filters.to)}</span> · Asia/Manila</p>
+        <p class="field-error" role="alert" data-export-error hidden></p>
+        <div class="row row-wrap" data-gap="8"><button type="submit" class="btn btn-primary btn-sm" data-confirm-export>${icon('download', 16)}Export CSV</button><button type="button" class="btn btn-secondary btn-sm" data-close>Cancel</button></div>
+      </form>`,
+      onOpen(panel, modal) {
+        const local = viewTools(modal.scope);
+        const form = $('[data-export-form]', panel);
+        const from = form.elements.namedItem('from');
+        const to = form.elements.namedItem('to');
+        const error = $('[data-export-error]', panel);
+        function syncDates() {
+          for (const button of $$('[data-export-range]', panel)) button.setAttribute('aria-pressed', String(button.dataset.exportRange === filters.range));
+          const valid = DATE_RE.test(from.value) && DATE_RE.test(to.value) && from.value <= to.value;
+          $('[data-export-period]', panel).textContent = valid ? rangeText(from.value, to.value) : 'Choose a start and end date';
+          error.hidden = true;
+        }
+        local.on(panel, 'click', '[data-export-range]', (_event, button) => {
+          if (busy) return;
+          filters.range = button.dataset.exportRange;
+          if (filters.range === 'custom') from.focus();
+          else [from.value, to.value] = presetRange(filters.range, today);
+          syncDates();
+        });
+        local.listen(form, 'input', (event) => {
+          if (busy || !event.target.matches('input[type="date"]')) return;
+          filters.range = 'custom';
+          syncDates();
+        });
+        local.listen(form, 'submit', async (event) => {
+          event.preventDefault();
+          if (busy) return;
+          if (!DATE_RE.test(from.value) || !DATE_RE.test(to.value) || !from.validity.valid || !to.validity.valid) {
+            error.textContent = 'Choose a valid start and end date.';
+            error.hidden = false;
+            return;
+          }
+          if (from.value > to.value) {
+            error.textContent = 'The start date must be on or before the end date.';
+            error.hidden = false;
+            return;
+          }
+          Object.assign(filters, { from: from.value, to: to.value });
+          error.hidden = true;
+          busy = true;
+          const button = $('[data-confirm-export]', panel);
+          for (const field of form.elements) if (field !== button) field.disabled = true;
+          try {
+            if (await exportCsv(button, filters)) modal.close();
+          } finally {
+            busy = false;
+            for (const field of form.elements) field.disabled = false;
+          }
+        });
+      },
+    });
   }
 
   // ── Events ──
@@ -602,7 +670,7 @@ export function revenueView({ query }) {
     $('[data-q]', root).value = '';
     changed();
   });
-  on(root, 'click', '[data-act="export"]', (_e, btn) => exportCsv(btn));
+  on(root, 'click', '[data-act="export"]', chooseExportDates);
 
   syncControls();
   syncUrl();

@@ -16,11 +16,11 @@ if(mode==='static'){
   for(const file of files)run(['--check',file]);console.log(files.length+' syntax checks passed');
   run([cli,'types','--check']);run([path.join(root,'node_modules/typescript/bin/tsc'),'--noEmit']);
   const tests=fs.readdirSync(path.join(root,'tests')).filter(f=>/^readiness-.*\.mjs$/.test(f)).map(f=>'tests/'+f);
-  run(['--test',...tests,'tests/polling.mjs','tests/booking-request.mjs']);
+  run(['--test',...tests,'tests/payment-methods.mjs','tests/calendar-maps.mjs','tests/polling.mjs','tests/booking-request.mjs','tests/concurrency-booking-regression.mjs','tests/concurrency-payments-regression.mjs','tests/concurrency-export-regression.mjs','tests/concurrency-resource-regression.mjs']);
   run([cli,'deploy','--dry-run','--outdir','.wrangler/verify-build']);
 } else if(mode==='browser'){
   const server=await serve(['tests/helpers/browser-server.mjs'],root,8805,{PORT:'8805'});
-  try{for(const test of ['public-pages','refund-retry','outbox-ui','images-browser','lifecycle-browser','logout-browser','redirect-browser','remaining-browser','facility-browser','pwa-browser','accessibility-browser'])run(['tests/'+test+'.mjs'],root,{BASE_URL:'http://127.0.0.1:8805'});}finally{stop(server);}
+  try{for(const test of ['public-pages','refund-retry','outbox-ui','images-browser','lifecycle-browser','logout-browser','redirect-browser','remaining-browser','facility-browser','pwa-browser','accessibility-browser','mobile-payments-browser','calendar-maps-browser','player-availability-browser','staff-management-browser'])run(['tests/'+test+'.mjs'],root,{BASE_URL:'http://127.0.0.1:8805'});run(['--test','tests/concurrency-frontend-regression.mjs']);}finally{stop(server);}
 } else if(mode==='runtime'){
   // Only the disposable copy is ever seeded/reset; no remote binding flags are used.
   const scratch=fs.mkdtempSync(path.join(root,'.wrangler','verify-runtime-'));
@@ -37,6 +37,7 @@ if(mode==='static'){
   let probe,calendar;
   try{
     run(['tests/smoke.mjs'],scratch,{BASE_URL:'http://127.0.0.1:8810'});
+    run(['tests/staff-runtime.mjs'],scratch,{BASE_URL:'http://127.0.0.1:8810'});
     run([path.join(root,'tests/storage-runtime.mjs')],root,{BASE_URL:'http://127.0.0.1:8810',STORAGE_RUNTIME_ROOT:scratch});
     probe=await serve([cli,'dev','--local','--config','wrangler-probe.jsonc','--port','8811','--inspector-port','0'],scratch,8811);
     run([path.join(root,'tests/auth-runtime.mjs')],root,{AUTH_RUNTIME_ROOT:scratch+path.sep,AUTH_BASE_URL:'http://127.0.0.1:8810',AUTH_PROBE_URL:'http://127.0.0.1:8811'});

@@ -1,25 +1,27 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppContext, AppEnv, BookingStatus, ResourceRow } from '../types';
-import { dayAvailability } from '../lib/availability';
+import { dayAvailability, scheduleDaysSummary } from '../lib/availability';
 import { audit, clientIp, requireStaff } from '../lib/auth';
 import { ADMIN_RETRO_DAYS, bookingCreditInfo, openDisruptionItems, resolveDeferredForBooking } from '../lib/disruptions';
 import {
   BOOKING_SELECT, bookingDTO, createConsoleBooking, effectiveStatus, getBooking, PICK_A_TIME, hasSlotPick, listEvents, requestedStarts, slotLabel, sweepExpired,
-  isOpenPlay, underMaintenance, zSlotPick, type BookingJoin,
+  closureCovers, OCCUPYING, isOpenPlay, underMaintenance, zSlotPick, type BookingJoin, type ClosureRow, type HoursRow,
 } from '../lib/bookings';
 import { MESSAGE_MAX_CHARS, listMessages, markRead, postMessage, staffConversations, staffUnreadChats } from '../lib/chat';
 import { notFound, unprocessable } from '../lib/errors';
 import { lazyMaintenance } from '../lib/maintenance';
 import { approvePayment, listProofs, proofLink, rejectPayment, staffCancel } from '../lib/payments';
 import { loadSettings } from '../lib/settings';
-import { addDays, dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso } from '../lib/time';
+import { collectedPaymentSql } from '../lib/revenue';
+import { addDays, dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso, weekdayOf } from '../lib/time';
 import { jsonBody, parse, query, zActivity, zDate, zId, zIdempotencyKey } from '../lib/validate';
 import { staffCreditRoutes } from './credits';
 import { disruptionRoutes } from './disruptions';
 import { facilityAdminRoutes } from './facilities';
 import { notificationDTO, readSchema } from './notifications';
 import { afterPage, pageRequest, pageResult } from '../lib/pagination';
+import { authorizedBatch } from '../lib/authorized-mutations';
 
 /**
  * Day-to-day operations: dashboard, payment verification, bookings, chat, staff
@@ -45,17 +47,19 @@ async function staffContext(c: AppContext) {
   return { settings, offset };
 }
 
-type ProofSummaryRow = { id: string; booking_id: string; amount_claimed: number | null; gcash_ref: string | null; status: string; created_at: number };
+type ProofSummaryRow = { id: string; booking_id: string; amount_claimed: number | null; gcash_ref: string | null; status: string; created_at: number;
+  payment_method_id: string | null; payment_method_name: string | null; account_name: string | null; account_number: string | null };
 
 /** Latest proof per booking, for queue rows. */
 async function latestProofs(db: D1Database, bookingIds: string[]): Promise<Map<string, ProofSummaryRow>> {
   if (!bookingIds.length) return new Map();
   const { results } = await db
     .prepare(
-      `SELECT p.id, p.booking_id, p.amount_claimed, p.gcash_ref, p.status, p.created_at
+      `SELECT p.id, p.booking_id, p.amount_claimed, p.gcash_ref, p.status, p.created_at,
+              p.payment_method_id, p.payment_method_name, p.account_name, p.account_number
          FROM payment_proofs p
         WHERE p.booking_id IN (SELECT value FROM json_each(?1))
-          AND p.id = (SELECT q.id FROM payment_proofs q WHERE q.booking_id = p.booking_id ORDER BY q.created_at DESC LIMIT 1)`,
+          AND p.id = (SELECT q.id FROM payment_proofs q WHERE q.booking_id = p.booking_id ORDER BY q.created_at DESC, q.rowid DESC LIMIT 1)`,
     )
     .bind(JSON.stringify(bookingIds))
     .all<ProofSummaryRow>();
@@ -82,6 +86,10 @@ function proofSummary(b: BookingJoin, p: ProofSummaryRow | undefined, link?: { u
     amountClaimedLabel: p.amount_claimed != null ? peso(p.amount_claimed) : null,
     amountCheck: amountCheck(b, p.amount_claimed),
     gcashRef: p.gcash_ref,
+    paymentMethodId: p.payment_method_id ?? 'gcash',
+    paymentMethodName: p.payment_method_name ?? 'GCash',
+    accountName: p.account_name,
+    accountNumber: p.account_number,
     status: p.status,
     submittedAt: p.created_at,
   };
@@ -90,12 +98,13 @@ function proofSummary(b: BookingJoin, p: ProofSummaryRow | undefined, link?: { u
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
 async function summary(c: AppContext) {
+  const admin = requireStaff(c).role === 'admin';
   const db = c.env.DB;
   const now = Date.now();
   await sweepExpired(c.env, now);
   const { settings, offset } = await staffContext(c);
   const local = localNow(offset, now);
-  const [pending, holds, today, notif, upcoming, facility] = await db.batch([
+  const [pending, holds, today, notif, upcoming, facility, queueCounts, revenue, hours, closures, occupied] = await db.batch([
     db.prepare(`${BOOKING_SELECT} WHERE b.status = 'PAYMENT_SUBMITTED' ORDER BY b.submitted_at ASC LIMIT 50`),
     db.prepare(`${BOOKING_SELECT} WHERE b.status IN ('TEMPORARY', 'REJECTED') AND b.hold_expires_at > ? ORDER BY b.hold_expires_at ASC LIMIT 50`).bind(now),
     db
@@ -104,22 +113,39 @@ async function summary(c: AppContext) {
     db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE audience = 'staff' AND resolved_at IS NULL`),
     db.prepare(`SELECT COUNT(*) AS n FROM bookings WHERE status = 'CONFIRMED' AND (date > ?1 OR (date = ?1 AND end_min > ?2))`).bind(local.date, local.minutes),
     db.prepare(`SELECT id, name, activity, status, open_play, maintenance_note, maintenance_until FROM resources ORDER BY activity, sort_order, name`),
+    db.prepare(`SELECT
+      (SELECT COUNT(*) FROM bookings WHERE status = 'PAYMENT_SUBMITTED') AS pending,
+      (SELECT COUNT(*) FROM bookings WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1) AS holds`).bind(now),
+    admin ? db.prepare(`SELECT COALESCE(SUM(amount_due),0) AS amount FROM bookings WHERE ${collectedPaymentSql()}
+      AND confirmed_at >= ? AND confirmed_at < ?`)
+      .bind(localToMs(local.date, 0, offset), localToMs(addDays(local.date, 1), 0, offset)) : db.prepare('SELECT NULL AS amount'),
+    db.prepare('SELECT * FROM opening_hours WHERE weekday=?').bind(weekdayOf(local.date)),
+    db.prepare('SELECT * FROM closures WHERE date=?').bind(local.date),
+    db.prepare(`SELECT DISTINCT t.resource_id FROM booking_times t JOIN bookings b ON b.id=t.booking_id
+      WHERE t.date=?1 AND t.start_min <= ?2 AND t.end_min > ?2 AND ${OCCUPYING('b', '?3')}`).bind(local.date, local.minutes, now),
   ]);
   const resources = (facility?.results ?? []) as Pick<ResourceRow, 'id' | 'name' | 'activity' | 'status' | 'open_play' | 'maintenance_note' | 'maintenance_until'>[];
   const pendingRows = (pending?.results ?? []) as BookingJoin[];
   const holdRows = (holds?.results ?? []) as BookingJoin[];
   const todayRows = (today?.results ?? []) as BookingJoin[];
+  const queueTotals = ((queueCounts?.results ?? [])[0] as { pending: number; holds: number } | undefined) ?? { pending: 0, holds: 0 };
   const proofs = await latestProofs(db, pendingRows.map((b) => b.id));
   const links = await proofLinks(c, proofs, now);
   const dto = (b: BookingJoin) => bookingDTO(b, now, settings, offset, true);
   const confirmedToday = todayRows.filter((b) => b.status === 'CONFIRMED' || b.status === 'COMPLETED');
+  const dayHours = hours?.results[0] as HoursRow | undefined;
+  const dayClosures = (closures?.results ?? []) as ClosureRow[];
+  const busy = new Set(((occupied?.results ?? []) as { resource_id: string }[]).map(r => r.resource_id));
+  const isAvailable = (r: typeof resources[number]) => r.status !== 'disabled' && !underMaintenance(r, local.date)
+    && Boolean(dayHours?.is_open && local.minutes >= dayHours.open_min && local.minutes < dayHours.close_min)
+    && !dayClosures.some(closure => closureCovers(closure, r.id, local.minutes, local.minutes + 1)) && !busy.has(r.id);
   return c.json({
     now,
     today: local.date,
     todayLabel: dateLabel(local.date),
     counts: {
-      pendingVerification: pendingRows.length,
-      activeHolds: holdRows.length,
+      pendingVerification: queueTotals.pending,
+      activeHolds: queueTotals.holds,
       confirmedToday: confirmedToday.length,
       unresolved: ((notif?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0,
       unreadChats: await staffUnreadChats(db),
@@ -127,8 +153,12 @@ async function summary(c: AppContext) {
       /** Bookings a disruption still needs staff for (payment waiting, or changed while applying). */
       disruptionsOpen: await openDisruptionItems(db),
     },
-    // Disabled courts are retired, not out of service: they count in neither number.
+    // Preserve the legacy inService/total counts; availability includes disabled resources.
     facility: {
+      availability: (['pickleball', 'table_tennis'] as const).map(activity => {
+        const rows = resources.filter(r => r.activity === activity);
+        return { activity, available: rows.filter(isAvailable).length, total: rows.length };
+      }),
       inService: resources.filter((r) => r.status !== 'disabled' && !underMaintenance(r, local.date)).length,
       total: resources.filter((r) => r.status !== 'disabled').length,
       maintenance: resources
@@ -137,7 +167,7 @@ async function summary(c: AppContext) {
       // In service, but free for all: not bookable.
       openPlay: resources.filter((r) => isOpenPlay(r)).map((r) => ({ id: r.id, name: r.name, activity: r.activity })),
     },
-    verifiedRevenueToday: confirmedToday.reduce((sum, b) => sum + b.amount_due, 0),
+    ...(admin ? { verifiedRevenueToday: Number((revenue?.results[0] as { amount: number } | undefined)?.amount ?? 0) } : {}),
     verification: pendingRows.map((b) => ({ ...dto(b), proof: proofSummary(b, proofs.get(b.id), links.get(b.id)) })),
     holds: holdRows.map(dto),
     todaySchedule: todayRows.map(dto),
@@ -418,10 +448,11 @@ operationsRoutes.post('/bookings/:id/approve', async (c) => {
       message: z.string().trim().max(1000).optional(),
       // The "Before you approve" checklist: every item has to be ticked.
       checklist: z.literal(true, { error: 'Tick every item on the "Before you approve" checklist first.' }),
+      proofId: zId,
     }),
   );
   const now = Date.now();
-  await approvePayment(c.env, staff, id, now, body.message || null);
+  await approvePayment(c.env, staff, id, now, body.message || null, body.proofId);
   c.executionCtx.waitUntil(audit(c, staff.id, 'payment_approved', 'booking', id));
   // A disruption that was waiting on this payment now cancels the booking and issues its credit.
   const disruptions = await resolveDeferredForBooking(c, staff, id, clientIp(c));
@@ -429,6 +460,7 @@ operationsRoutes.post('/bookings/:id/approve', async (c) => {
 });
 
 const rejectSchema = z.object({
+  proofId: zId,
   reason: z.string().trim().min(3, 'Tell the player why the proof was rejected.').max(300, 'Keep the reason under 300 characters.'),
   // The prefilled rejection note runs past the typed-chat limit, so it keeps its own cap.
   message: z.string().trim().max(1000).optional(),
@@ -441,7 +473,7 @@ operationsRoutes.post('/bookings/:id/reject', async (c) => {
   const body = await jsonBody(c, rejectSchema);
   const { settings } = await staffContext(c);
   const now = Date.now();
-  await rejectPayment(c.env, settings, staff, id, { reason: body.reason, message: body.message || null, keepHold: body.keepHold }, now);
+  await rejectPayment(c.env, settings, staff, id, { proofId: body.proofId, reason: body.reason, message: body.message || null, keepHold: body.keepHold }, now);
   c.executionCtx.waitUntil(audit(c, staff.id, 'payment_rejected', 'booking', id, body.reason));
   // Rejected for good: a disruption that was waiting on this payment has nothing to credit.
   const disruptions = body.keepHold ? [] : await resolveDeferredForBooking(c, staff, id, clientIp(c));
@@ -459,6 +491,15 @@ operationsRoutes.post('/bookings/:id/cancel', async (c) => {
 });
 
 // ── Schedule grid (with names — staff only) ────────────────────────────────
+
+operationsRoutes.get('/schedule/days', async (c) => {
+  const q = query(c, z.object({ from: zDate.optional(), activity: zActivity.optional() }));
+  const { settings, offset } = await staffContext(c);
+  const now = Date.now();
+  const from = q.from ?? localNow(offset, now).date;
+  if (!isValidDate(from) || !isValidDate(addDays(from, 13))) throw unprocessable('VALIDATION_ERROR', 'Use a real date (YYYY-MM-DD).');
+  return c.json(await scheduleDaysSummary(c.env, settings, { activity: q.activity ?? null, from }, now));
+});
 
 operationsRoutes.get('/schedule', async (c) => {
   const q = query(c, z.object({ date: zDate.optional(), activity: zActivity.optional() }));
@@ -508,7 +549,7 @@ operationsRoutes.get('/bookings/:id/messages', async (c) => {
   const { settings, offset } = await staffContext(c);
   const page = pageRequest(c.req.query(),`console-chat:${staff.id}:${id}`,['number','string']);
   const messages = await listMessages(c.env, id, { side: 'staff', userId: staff.id }, now,page);
-  c.executionCtx.waitUntil(markRead(c.env, id, 'staff', staff.id, now).catch((err) => console.error('markRead failed', err)));
+  c.executionCtx.waitUntil(markRead(c.env, id, 'staff', staff.id, now, staff).catch((err) => console.error('markRead failed', err)));
   return c.json({ now, booking: bookingDTO(b, now, settings, offset, true), page:messages.page, messages });
 });
 
@@ -556,27 +597,27 @@ operationsRoutes.get('/notifications', async (c) => {
 });
 
 operationsRoutes.post('/notifications/read', async (c) => {
+  const actor = requireStaff(c);
   const body = await jsonBody(c, readSchema);
   const now = Date.now();
   if (body.all) {
-    await c.env.DB.prepare(`UPDATE notifications SET read_at = ? WHERE audience = 'staff' AND read_at IS NULL`).bind(now).run();
+    await authorizedBatch(c.env.DB, actor, [c.env.DB.prepare(`UPDATE notifications SET read_at = ? WHERE audience = 'staff' AND read_at IS NULL`).bind(now)]);
   } else {
-    await c.env.DB.prepare(`UPDATE notifications SET read_at = ? WHERE audience = 'staff' AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))`)
-      .bind(now, JSON.stringify(body.ids))
-      .run();
+    await authorizedBatch(c.env.DB, actor, [c.env.DB.prepare(`UPDATE notifications SET read_at = ? WHERE audience = 'staff' AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))`)
+      .bind(now, JSON.stringify(body.ids))]);
   }
   return c.json({ ok: true });
 });
 
 operationsRoutes.post('/notifications/:id/resolve', async (c) => {
+  const actor = requireStaff(c);
   const id = parse(zId, c.req.param('id'));
   const now = Date.now();
-  const res = await c.env.DB.prepare(
+  const [res] = await authorizedBatch(c.env.DB, actor, [c.env.DB.prepare(
     `UPDATE notifications SET resolved_at = COALESCE(resolved_at, ?1), read_at = COALESCE(read_at, ?1) WHERE id = ?2 AND audience = 'staff'`,
   )
-    .bind(now, id)
-    .run();
-  if (!res.meta.changes) throw notFound('Notification not found.');
+    .bind(now, id)]);
+  if (!res?.meta.changes) throw notFound('Notification not found.');
   return c.json({ ok: true });
 });
 

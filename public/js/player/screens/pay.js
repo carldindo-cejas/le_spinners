@@ -54,7 +54,7 @@ export async function heldView({ params }) {
     <div class="stack stack-8 center">
       <p class="overline amber">Booking created</p>
       <h1 class="h1">${b.resource.name} is held for you</h1>
-      <p class="body">Pay ${b.amountLabel} by GCash${b.creditApplied ? ` (your ${b.creditAppliedLabel} booking credit covers the rest)` : ''} and upload your screenshot before the timer runs out. Until then, other players see this slot as "On hold".</p>
+      <p class="body">Pay ${b.amountLabel} using a configured payment method${b.creditApplied ? ` (your ${b.creditAppliedLabel} booking credit covers the rest)` : ''} and upload your screenshot before the timer runs out. Until then, other players see this slot as "On hold".</p>
     </div>
     <p class="banner warn" role="alert" data-warn-line hidden>${icon('hourglass', 20, 2.2)}<span><b>Your temporary reservation will expire soon.</b> Upload your proof now to keep ${b.resource.name}.</span></p>
     <a class="banner neutral" href="/bookings/${b.id}" data-ended-line hidden>${icon('clock-x', 20, 2.2)}<span>The hold ended and ${b.resource.name} was released. See what you can do next.</span></a>
@@ -134,12 +134,12 @@ function confirmRelease(b, trigger) {
 
 function fileProblem(file) {
   if (!OK_TYPES[file.type] && !/\.(jpe?g|png|webp)$/i.test(file.name)) {
-    return { title: "That file type isn't supported", body: 'Upload a JPG, PNG or WEBP. Tip: take a screenshot of the GCash receipt instead of sharing the photo.' };
+    return { title: "That file type isn't supported", body: 'Upload a JPG, PNG or WEBP. Tip: take a screenshot of the payment receipt instead of sharing the photo.' };
   }
   if (file.size > MAX_MB * 1024 * 1024) {
     return { title: 'This image is too large', body: `The limit is ${MAX_MB} MB. A screenshot of the receipt is usually well under that.` };
   }
-  if (file.size === 0) return { title: 'That file is empty', body: 'Choose your GCash screenshot again.' };
+  if (file.size === 0) return { title: 'That file is empty', body: 'Choose your payment screenshot again.' };
   return null;
 }
 
@@ -155,25 +155,14 @@ function parsePesos(v) {
   return Number(w) * 100 + Number(f.padEnd(2, '0'));
 }
 
-function gcashCard(d, b) {
-  const g = d.payment;
-  const digits = g.gcashNumber.replace(/\s+/g, '');
+function paymentCard(method, b) {
+  if (!method || (!method.accountName && !method.accountNumber && !method.qrUrl)) return '';
   return html`<section class="card gcash-card">
-    <div class="gc-head"><span class="overline">GCash payment information</span><span class="pill volt sm">GCash</span></div>
+    <div class="gc-head"><span class="overline">Payment information</span><span class="pill volt sm">${method.name}</span></div>
     <div class="gc-body">
-      <div class="kv-stack"><span class="small">Account name</span><span class="strong">${g.gcashName}</span></div>
-      <div class="row row-between">
-        <div class="kv-stack"><span class="small">GCash number</span><span class="mono gc-number">${g.gcashNumber}</span></div>
-        <button type="button" class="btn btn-tonal btn-sm" data-copy="${digits}" data-copy-label="GCash number copied">${icon('copy', 18)}<span>Copy number</span></button>
-      </div>
-      <div class="qr-panel">
-        ${g.hasQr
-          ? html`<img class="qr-img" src="${g.qrUrl}" alt="Le Spinners GCash QR code" width="216" height="216">
-            <p class="small strong ink">Scan this QR code using GCash</p>
-            <div class="row" data-gap="8"><a class="btn btn-secondary btn-sm" href="${g.qrUrl}" download="le-spinners-gcash-qr.png" data-native>${icon('download', 18)}Save QR</a><a class="btn btn-secondary btn-sm" href="/bookings/${b.id}/gcash">${icon('fullscreen', 18)}Full screen</a></div>`
-          : html`<span class="tile blue lg">${icon('qr', 26)}</span><p class="small">No QR code yet — send to the GCash number above.</p>`}
-      </div>
-      <p class="banner warn compact">${icon('alert', 18, 2.2)}<span>Make sure the payment amount matches the booking amount: <b>${b.amountLabel}</b>.</span></p>
+      ${method.accountName ? html`<div class="kv-stack"><span class="small">Account name</span><span class="strong">${method.accountName}</span></div>` : ''}
+      ${method.accountNumber ? html`<div class="row row-between payment-account"><div class="kv-stack"><span class="small">Account number</span><span class="mono gc-number">${method.accountNumber}</span></div><button type="button" class="btn btn-tonal btn-sm" data-copy="${method.accountNumber}" data-copy-label="Account number copied">${icon('copy', 18)}<span>Copy number</span></button></div>` : ''}
+      ${method.qrUrl ? html`<div class="qr-panel"><img class="qr-img" src="${method.qrUrl}" alt="${method.name} QR code" width="216" height="216"><p class="small strong ink">Scan with ${method.name}</p><div class="row row-wrap" data-gap="8"><a class="btn btn-secondary btn-sm" href="${method.qrUrl}" download="le-spinners-qr" data-native>${icon('download', 18)}Save QR</a><a class="btn btn-secondary btn-sm" href="/bookings/${b.id}/gcash?method=${encodeURIComponent(method.id)}">${icon('fullscreen', 18)}Full screen</a></div></div>` : ''}
     </div>
   </section>`;
 }
@@ -190,6 +179,9 @@ export async function payView({ params, query }) {
   const b = d.booking;
   if (!holding(b)) return navigate(`/bookings/${b.id}`, { replace: true });
   const rejected = b.status === 'REJECTED';
+  let methods = (d.payment?.methods || []).filter(method => method.enabled);
+  let selectedId = methods.find(method => method.id === query.get('method'))?.id
+    || methods.find(method => method.id === b.paymentMethodId)?.id || methods[0]?.id || '';
   const totalMs = (rejected ? state.facility.rules.resubmitMinutes : state.facility.rules.holdMinutes) * 60_000;
 
   const root = show(html`${subHeader({
@@ -220,12 +212,19 @@ export async function payView({ params, query }) {
     <section class="section">
       <h2 class="h3">How to pay</h2>
       <ol class="howto">
-        <li><span class="n">1</span>Send ${b.amountLabel} by GCash</li>
+        <li><span class="n">1</span>Send ${b.amountLabel} using your selected method</li>
         <li><span class="n">2</span>Screenshot the receipt</li>
         <li><span class="n">3</span>Upload it below</li>
       </ol>
     </section>
-    ${gcashCard(d, b)}
+    <section class="card card-pad stack stack-12">
+      <label class="label" for="payment-method">Payment Method</label>
+      <select class="input" id="payment-method" data-payment-method aria-describedby="payment-method-state"></select>
+      <p class="small" id="payment-method-state" role="status" data-method-state hidden></p>
+      <button type="button" class="btn btn-secondary btn-sm" data-refresh-methods hidden>Refresh payment methods</button>
+    </section>
+    <div data-payment-info aria-live="polite"></div>
+    <p class="banner warn compact">${icon('alert', 18, 2.2)}<span>Pay exactly <b>${b.amountLabel}</b> before uploading proof.</span></p>
     <section class="card card-pad-lg stack stack-16 upload-card" id="upload">
       <div class="stack stack-4"><h2 class="h3">Already paid?</h2><p class="small">Send us proof so staff can verify it.</p></div>
       <form class="stack stack-16" novalidate data-form="proof">
@@ -233,8 +232,8 @@ export async function payView({ params, query }) {
         <input class="sr-only" type="file" id="proof-file" name="file" accept="image/jpeg,image/png,image/webp" data-file-input>
         <div class="grid-2 grid-2-stack">
           <div class="field">
-            <label class="label" for="f-ref">GCash reference number <span class="opt">(optional)</span></label>
-            <input class="input mono" id="f-ref" name="gcashRef" inputmode="numeric" autocomplete="off" maxlength="40" placeholder="e.g. 123456789">
+            <label class="label" for="f-ref">Payment reference number <span class="opt">(optional)</span></label>
+            <input class="input mono" id="f-ref" name="gcashRef" autocomplete="off" maxlength="40" placeholder="e.g. 123456789">
           </div>
           <div class="field">
             <label class="label" for="f-amount">Amount paid <span class="opt">(optional)</span></label>
@@ -266,6 +265,42 @@ export async function payView({ params, query }) {
   let uploading = false;
   let ended = false;
   let lastError = null;
+  const methodSelect = $('[data-payment-method]', root);
+  function paintMethod() {
+    render(methodSelect, methods.length ? html`${!selectedId ? html`<option value="" disabled>Choose payment method</option>` : ''}${methods.map(method => html`<option value="${method.id}">${method.name}</option>`)}` : html`<option value="">Unavailable</option>`);
+    methodSelect.value = selectedId;
+    methodSelect.disabled = !methods.length || uploading;
+    const selected = methods.find(method => method.id === selectedId);
+    render($('[data-payment-info]', root), paymentCard(selected, b));
+    const qr = $('[data-payment-info] .qr-img', root);
+    if (qr) listen(qr, 'error', () => {
+      const card = qr.closest('.gcash-card');
+      qr.closest('.qr-panel')?.remove();
+      if (!selected.accountName && !selected.accountNumber) card?.remove();
+    }, { once: true });
+    $('[data-method-state]', root).hidden = Boolean(methods.length && selectedId);
+    $('[data-method-state]', root).textContent = methods.length ? (selectedId ? '' : 'Choose the payment method used for this proof before resubmitting.') : 'Payment methods are currently unavailable. Contact Le Spinners through Help or try refreshing.';
+    $('[data-refresh-methods]', root).hidden = Boolean(methods.length);
+    paintSubmit();
+  }
+  async function refreshMethods() {
+    const button = $('[data-refresh-methods]', root);
+    setBusy(button, true, 'Refreshing…');
+    try {
+      const detail = await api.get(`/api/bookings/${b.id}`);
+      methods = (detail.payment?.methods || []).filter(method => method.enabled);
+      selectedId = methods.find(method => method.id === selectedId)?.id || '';
+      paintMethod();
+    } catch (err) { toast(err.message, { type: 'error' }); }
+    finally { setBusy(button, false); }
+  }
+  listen(methodSelect, 'change', () => {
+    selectedId = methodSelect.value;
+    const url = new URL(location.href); url.searchParams.set('method', selectedId);
+    history.replaceState(history.state, '', url.pathname + url.search);
+    paintMethod();
+  });
+  listen($('[data-refresh-methods]', root), 'click', refreshMethods);
 
   function paintFile() {
     if (preview) {
@@ -308,9 +343,9 @@ export async function payView({ params, query }) {
 
   function paintSubmit() {
     if (uploading) return;
-    const ready = file && !problem && !ended;
+    const ready = file && !problem && !ended && selectedId && methods.some(method => method.id === selectedId);
     submit.disabled = !ready;
-    submit.textContent = ended ? 'Payment window closed' : ready ? 'Submit payment proof' : 'Add a screenshot to submit';
+    submit.textContent = ended ? 'Payment window closed' : !methods.length ? 'Payment method unavailable' : !selectedId ? 'Choose a payment method' : ready ? 'Submit payment proof' : 'Add a screenshot to submit';
   }
 
   function paintMatch() {
@@ -356,7 +391,7 @@ export async function payView({ params, query }) {
   });
 
   async function doUpload() {
-    if (!file || problem || uploading) return;
+    if (!file || problem || uploading || ended || !methods.some(method => method.id === selectedId)) return;
     const amount = parsePesos(form.elements.namedItem('amountPesos').value);
     if (Number.isNaN(amount)) {
       form.elements.namedItem('amountPesos').focus();
@@ -366,6 +401,8 @@ export async function payView({ params, query }) {
     lastError = null;
     const fd = new FormData();
     fd.append('file', file, file.name);
+    fd.append('paymentMethodId', selectedId);
+    methodSelect.disabled = true;
     const ref = form.elements.namedItem('gcashRef').value.trim();
     if (ref) fd.append('gcashRef', ref);
     if (amount != null) fd.append('amountPesos', (amount / 100).toFixed(2));
@@ -392,12 +429,16 @@ export async function payView({ params, query }) {
     } catch (err) {
       uploading = false;
       setBusy(submit, false);
-      if (err.code === 'HOLD_EXPIRED' || err.code === 'ALREADY_SUBMITTED' || err.code === 'INVALID_STATUS') {
+      methodSelect.disabled = !methods.length;
+      if (err.code === 'HOLD_EXPIRED' || err.code === 'ALREADY_SUBMITTED' || err.code === 'INVALID_STATUS' || err.code === 'BOOKING_CHANGED') {
         toast(err.message, { type: err.code === 'ALREADY_SUBMITTED' ? 'info' : 'error' });
         navigate(`/bookings/${b.id}`, { replace: true });
         return;
       }
-      if (err.code === 'NETWORK') lastError = { title: "Upload didn't finish", body: 'Your connection dropped. Your hold timer keeps running, so try again now.', retry: true };
+      if (err.code === 'PAYMENT_METHOD_UNAVAILABLE') {
+        lastError = { title: 'Payment method changed', body: err.message, retry: true };
+        await refreshMethods();
+      } else if (err.code === 'NETWORK') lastError = { title: "Upload didn't finish", body: 'Your connection dropped. Your hold timer keeps running, so try again now.', retry: true };
       else if (err.code === 'FILE_TOO_LARGE') lastError = { title: 'This image is too large', body: err.message };
       else if (err.code === 'UNSUPPORTED_FILE_TYPE' || err.code === 'EMPTY_FILE') lastError = { title: "That file type isn't supported", body: err.message };
       else if (err.details && err.details.amountPesos) {
@@ -409,6 +450,7 @@ export async function payView({ params, query }) {
     }
   }
 
+  paintMethod();
   paintFile();
   if (query.get('upload') === '1') setTimeout(() => $('#upload', root)?.scrollIntoView({ block: 'start' }), 50);
 
@@ -428,57 +470,30 @@ export async function payView({ params, query }) {
   });
 }
 
-// ── U26: GCash full screen ─────────────────────────────────────────────────
+// ── U26: payment QR full screen ────────────────────────────────────────────
 
-export async function gcashView({ params }) {
-  const { navigate, show, on, copyText, toast, render, startCountdown } = viewTools();
+export async function gcashView({ params, query }) {
+  const { navigate, show, listen, startCountdown } = viewTools();
   loadingScreen();
   let d;
-  try {
-    d = await loadDetail(params.id);
-  } catch (err) {
-    return failScreen(err, () => gcashView({ params }));
-  }
+  try { d = await loadDetail(params.id); } catch (err) { return failScreen(err, () => gcashView({ params, query })); }
   const b = d.booking;
-  if (!holding(b) || !d.payment) return navigate(`/bookings/${b.id}`, { replace: true });
-  const g = d.payment;
-  const digits = g.gcashNumber.replace(/\s+/g, '');
+  const methods = (d.payment?.methods || []).filter(method => method.enabled);
+  const method = methods.find(row => row.id === query.get('method')) || methods.find(row => row.id === b.paymentMethodId) || methods[0];
+  const payUrl = '/bookings/' + b.id + '/pay' + (method ? '?method=' + encodeURIComponent(method.id) : '');
+  if (!holding(b) || !method?.qrUrl) return navigate(payUrl, { replace: true });
   const root = show(html`<div class="screen gcash-full screen-enter">
-    <div class="row row-between">
-      <a class="icon-btn" href="/bookings/${b.id}/pay" data-back aria-label="Close">${icon('x', 20, 2.2)}</a>
-      <h1 class="h3">Pay with GCash</h1>
-      <span class="timer-pill" data-countdown role="timer" aria-label="Time left">${icon('clock', 16, 2.2)}<span data-cd-time>--:--</span></span>
-    </div>
-    <div class="qr-panel big">
-      ${g.hasQr ? html`<img class="qr-img" src="${g.qrUrl}" alt="Le Spinners GCash QR code" width="240" height="240">` : html`<span class="tile blue lg">${icon('qr', 26)}</span><p class="small">No QR code yet — use the number below.</p>`}
-      <p class="small">Scan with GCash · pay <span class="mono ink">${peso(b.amountDue, { decimals: true })}</span></p>
-    </div>
-    <div class="card card-pad row row-between">
-      <div class="kv-stack"><span class="strong">${g.gcashName}</span><span class="mono">${g.gcashNumber}</span></div>
-      <button type="button" class="btn btn-tonal btn-sm" data-copy="${digits}">${icon('copy', 18)}<span>Copy</span></button>
-    </div>
-    <section class="section">
-      <h2 class="h3">Paying on this phone?</h2>
-      <ol class="steps-list">
-        <li><span class="n blue">1</span><span>Tap <b>Save QR image</b> below.</span></li>
-        <li><span class="n blue">2</span><span>In GCash, scan a QR and choose the saved image from your gallery.</span></li>
-        <li><span class="n blue">3</span><span>Pay exactly <b>${b.amountLabel}</b>, screenshot the receipt, then come back here.</span></li>
-      </ol>
-    </section>
-    ${g.hasQr ? html`<a class="btn btn-secondary btn-block" href="${g.qrUrl}" download="le-spinners-gcash-qr.png" data-native>${icon('download', 20)}Save QR image</a>` : ''}
-    <a class="btn btn-primary btn-lg btn-block" href="/bookings/${b.id}/pay?upload=1" data-replace>I've paid — upload proof</a>
+    <div class="row row-between"><a class="icon-btn" href="${payUrl}" aria-label="Close">${icon('x', 20, 2.2)}</a><h1 class="h3">Pay with ${method.name}</h1><span class="timer-pill" data-countdown role="timer" aria-label="Time left">${icon('clock', 16, 2.2)}<span data-cd-time>--:--</span></span></div>
+    <div class="qr-panel big"><img class="qr-img" src="${method.qrUrl}" alt="${method.name} QR code" width="240" height="240"><p class="small">Scan with ${method.name} - pay <span class="mono ink">${peso(b.amountDue, { decimals: true })}</span></p></div>
+    ${method.accountName ? html`<p class="strong">${method.accountName}</p>` : ''}
+    ${method.accountNumber ? html`<p class="mono">${method.accountNumber}</p>` : ''}
+    <section class="section"><h2 class="h3">Paying on this phone?</h2><ol class="steps-list"><li><span class="n blue">1</span><span>Save the QR image below.</span></li><li><span class="n blue">2</span><span>Open ${method.name} and scan the saved image from your gallery.</span></li><li><span class="n blue">3</span><span>Pay exactly <b>${b.amountLabel}</b>, screenshot the receipt, then upload proof.</span></li></ol></section>
+    <a class="btn btn-secondary btn-block" href="${method.qrUrl}" download="le-spinners-qr" data-native>${icon('download', 20)}Save QR image</a>
+    <a class="btn btn-primary btn-lg btn-block" href="${payUrl}&upload=1" data-replace>I've paid - upload proof</a>
   </div>`);
-  on(root, 'click', '[data-copy]', async (_e, btn) => {
-    if (await copyText(btn.dataset.copy)) {
-      toast('GCash number copied');
-      btn.classList.add('copied');
-      render(btn, html`${icon('check', 18, 2.6)}<span>Copied</span>`);
-    }
-  });
+  listen($('.qr-img', root), 'error', () => navigate(payUrl, { replace: true }), { once: true });
   return startCountdown(root, { expiresAt: b.holdExpiresAt, serverNow: d.now, totalMs: state.facility.rules.holdMinutes * 60_000 });
 }
-
-// ── U29: proof submitted ───────────────────────────────────────────────────
 
 export async function submittedView({ params }) {
   const { navigate, show } = viewTools();

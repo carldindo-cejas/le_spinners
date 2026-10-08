@@ -1,14 +1,16 @@
 import { createViewTools } from '../../core/view.js';
 import { splitBookings } from '../../core/booking-time.js';
 import { api } from '../../core/api.js';
+import { facilityDirections } from '../../core/facility.js';
 import { listen, html, render } from '../../core/dom.js';
 import { icon, logo, courtArt } from '../../core/icons.js';
 import { bookingTime, dateLabel, dayMonth, firstName, greeting, initials } from './util.js';
-import { errorState, memberTag, poll, skeletonRows, statusPill } from '../../core/ui.js';
+import { errorState, memberTag, skeletonRows, statusPill } from '../../core/ui.js';
 import { bellButton, show, state } from '../shell.js';
 import { bookingCard, bookingHref, resourceTile, startCardCountdowns } from '../components.js';
+import { availabilityCalendar, startAvailabilityCalendar } from '../availability-calendar.js';
 
-const viewTools = createViewTools({ listen, api, render, poll, show, startCardCountdowns });
+const viewTools = createViewTools({ listen, api, render, show, startCardCountdowns });
 
 function rateLine(user) {
   if (user.membership === 'member') return html`${memberTag('member')}<span>Member rates apply</span>`;
@@ -19,44 +21,6 @@ function rateLine(user) {
 function todayHours(facility) {
   const wd = new Date(`${facility.today}T00:00:00Z`).getUTCDay();
   return facility.hours.find((h) => h.weekday === wd);
-}
-
-function availableToday(days, now) {
-  const rows = [];
-  for (const day of days) {
-    if (!day) continue;
-    for (const r of day.resources) {
-      const open = r.slots.filter((s) => s.state === 'available');
-      const held = r.slots.filter((s) => s.state === 'held');
-      rows.push({ r, day, open, held });
-    }
-  }
-  if (!rows.length) return html`<p class="t-row t-none">No courts or tables are set up yet.</p>`;
-  return rows.map(({ r, day, open, held }) => {
-    const type = r.activity === 'table_tennis' ? 'Table tennis' : 'Pickleball';
-    if (r.status === 'maintenance') {
-      return html`<div class="t-row"><div class="row row-between"><span class="t-name">${r.name}<small>${type}</small></span><span class="pill hatch sm">${icon('wrench', 12, 2.4)}Maintenance</span></div>
-        <p class="t-none">${r.maintenance?.note || 'Maintenance'}${r.maintenance?.untilLabel ? ` · back ${r.maintenance.untilLabel}` : ''}</p></div>`;
-    }
-    if (r.status === 'open_play') {
-      return html`<div class="t-row"><div class="row row-between"><span class="t-name">${r.name}<small>${type}</small></span><span class="pill blue sm">${icon('users', 12, 2.4)}Open play</span></div>
-        <p class="t-none">Free for all · no booking needed</p></div>`;
-    }
-    const chips = [
-      ...open.map((s) => ({ s, kind: 'open' })),
-      ...held.map((s) => ({ s, kind: 'held' })),
-    ].sort((a, b) => a.s.start - b.s.start);
-    return html`<div class="t-row">
-      <span class="t-name">${r.name}<small>${type}</small></span>
-      ${chips.length
-        ? html`<div class="slot-chips">${chips.map(({ s, kind }) =>
-            kind === 'open'
-              ? html`<a class="slot-chip" href="/book/${r.activity}/${day.date}/${r.id}/${s.start}" aria-label="Book ${r.name} at ${s.label}"><span class="s-dot"></span>${s.label}</a>`
-              : html`<span class="slot-chip held" aria-label="${s.label} on hold">${icon('hourglass', 14, 2.4)}${s.label} on hold</span>`,
-          )}</div>`
-        : html`<p class="t-none">No open times left today.</p>`}
-    </div>`;
-  });
 }
 
 function upcomingBlock(bookings, now) {
@@ -95,7 +59,7 @@ function facilityCard(f) {
   const h = todayHours(f);
   const pickleball = f.activities.find((a) => a.id === 'pickleball');
   const tt = f.activities.find((a) => a.id === 'table_tennis');
-  const hasAddress = f.facility.address && !f.facility.address.startsWith('[');
+  const directions = facilityDirections(f.facility);
   const nowMin = (() => {
     const d = new Date(Date.now() + 8 * 3_600_000);
     return d.getUTCHours() * 60 + d.getUTCMinutes();
@@ -106,12 +70,12 @@ function facilityCard(f) {
     <p class="f-row">${icon('clock', 18)}Today ${h && h.isOpen ? h.label : 'closed'}</p>
     <p class="f-row">${icon('map-pin', 18)}${f.facility.address || 'Address coming soon'}</p>
     <p class="f-row">${icon('court', 18)}${pickleball?.count ?? 0} pickleball courts · ${tt?.count ?? 0} table tennis tables</p>
-    ${hasAddress ? html`<a class="btn btn-sm" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(f.facility.address)}" target="_blank" rel="noopener noreferrer">${icon('map-pin', 18)}Directions</a>` : ''}
+    ${directions ? html`<a class="btn btn-sm" href="${directions}" target="_blank" rel="noopener noreferrer">${icon('map-pin', 18)}Directions</a>` : ''}
   </section>`;
 }
 
 export function homeView(ctx) {
-  const { listen, show, api, render, startCardCountdowns, setTimeout, poll } = viewTools(ctx);
+  const { listen, show, api, render, startCardCountdowns, setTimeout } = viewTools(ctx);
   const u = state.user;
   const f = state.facility;
   const root = show(html`<div class="screen wide has-tabbar screen-enter">
@@ -135,11 +99,7 @@ export function homeView(ctx) {
             <span class="q-meta" data-open-count="${a.id}">Checking…</span>
           </a>`)}
         </section>
-        <section class="section o-4">
-          <div class="section-head"><h2 class="h2">Available today</h2><span class="row small" data-gap="6"><span class="live-dot"></span><span data-live>Live</span></span></div>
-          <div class="card today-card" data-today>${skeletonRows(3)}</div>
-          <a class="btn btn-text btn-block" href="/book">See all courts &amp; tables</a>
-        </section>
+        ${availabilityCalendar(f)}
       </div>
       <div class="col">
         <div data-credit></div>
@@ -153,25 +113,9 @@ export function homeView(ctx) {
     </div>
   </div>`, { tab: 'home', nav: true });
 
-  const todayEl = root.querySelector('[data-today]');
   const upcomingEl = root.querySelector('[data-upcoming]');
   const recentEl = root.querySelector('[data-recent]');
   let stopCountdowns = () => {};
-
-  async function loadAvailability() {
-    const acts = f.activities.map((a) => a.id);
-    const days = await Promise.all(acts.map((a) => api.get(`/api/availability?activity=${a}&date=${f.today}`).catch(() => null)));
-    render(todayEl, availableToday(days));
-    days.forEach((day, i) => {
-      const el = root.querySelector(`[data-open-count="${acts[i]}"]`);
-      if (!el) return;
-      const n = day ? day.resources.reduce((sum, r) => sum + r.slots.filter((s) => s.state === 'available').length, 0) : 0;
-      el.textContent = day ? (n ? `${n} open today` : 'Full today · book ahead') : 'Tap to see times';
-      el.classList.toggle('none', !n);
-    });
-    const live = root.querySelector('[data-live]');
-    if (live) live.textContent = 'Live · just now';
-  }
 
   async function loadBookings() {
     try {
@@ -191,14 +135,10 @@ export function homeView(ctx) {
     }
   }
 
-  loadAvailability().catch((err) => {
-    render(todayEl, errorState(err, { title: "Couldn't load live availability" }));
-    listen(todayEl.querySelector('[data-act="retry"]'), 'click', () => loadAvailability());
-  });
+  const stopAvailability = startAvailabilityCalendar(root, f, ctx);
   loadBookings();
-  const stopPoll = poll(() => loadAvailability(), 30_000);
   return () => {
-    stopPoll();
+    stopAvailability();
     stopCountdowns();
   };
 }

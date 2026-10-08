@@ -33,6 +33,7 @@ export function moreView() {
       <p class="eyebrow">${isAdminConsole ? 'People & alerts' : 'Alerts & account'}</p>
       <nav class="panel menu" aria-label="${isAdminConsole ? 'People and alerts' : 'Alerts and account'}">
         ${row(`${BASE}/notifications`, 'bell', 'Notifications', 'In-app, email and SMS alerts', n ? html`<span class="badge inline">${n}</span>` : '')}
+        ${isAdminConsole ? row('/admin/staff', 'users', 'Staff Management', 'Staff accounts and access') : ''}
         ${isAdminConsole ? row('/admin/settings', 'settings', 'Settings', 'Booking rules, GCash, prices') : ''}
         ${row(`${BASE}/profile`, 'user', 'My profile', 'Name, phone and password')}
       </nav>

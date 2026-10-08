@@ -76,6 +76,9 @@ test('console returns require the correct portal and enforce admin-only paths', 
   assert.equal(loginReturnTarget('/revenue/../staff/', { origin, portal:'admin' }), '/admin/');
   assert.equal(loginReturnTarget('/revenue/extra', { origin, portal:'admin' }), '/admin/');
   assert.equal(loginReturnTarget('/admin/settings', { origin, portal:'admin' }), '/admin/settings');
+  assert.equal(loginReturnTarget('/admin/staff?q=staff#accounts', { origin, portal:'admin' }), '/admin/staff?q=staff#accounts');
+  assert.equal(loginReturnTarget('/admin/staff', { origin, portal:'staff' }), '/staff/');
+  assert.equal(loginReturnTarget('/staff/staff', { origin, portal:'staff' }), '/staff/');
   assert.equal(loginReturnTarget('/staff/settings', { origin, portal:'staff' }), '/staff/');
   assert.equal(loginReturnTarget('/revenue/', { origin, portal:'staff' }), '/staff/');
 });

@@ -10,7 +10,8 @@ const DELETE_LEASE_MS = 60_000;
 const QR_RETIRE_DELAY_MS = 60_000; // Longer than the per-isolate settings cache.
 const KEY_SCOPE = `(kind='proof' AND substr(r2_key,1,7)='proofs/') OR (kind='qr' AND substr(r2_key,1,18)='settings/gcash-qr/')`;
 const REFERENCES = `EXISTS (SELECT 1 FROM payment_proofs p WHERE p.r2_key = storage_uploads.r2_key)
-  OR EXISTS (SELECT 1 FROM settings s WHERE s.key = 'gcash_qr_key' AND s.value = storage_uploads.r2_key)`;
+  OR EXISTS (SELECT 1 FROM settings s WHERE s.key = 'gcash_qr_key' AND s.value = storage_uploads.r2_key)
+  OR EXISTS (SELECT 1 FROM payment_methods m WHERE m.qr_key = storage_uploads.r2_key)`;
 export type UploadIntent = { id: string; key: string; token: string };
 type CleanupClaim = { id: string; r2_key: string; claim_id: string; put_id: string | null; delete_attempts: number };
 
@@ -98,8 +99,9 @@ async function discoverOrphans(env: Bindings, now: number) {
       SELECT ?,?,?,'delete_pending',?,?,?,'LEGACY_UNREFERENCED'
       WHERE EXISTS (SELECT 1 FROM storage_scan_state WHERE prefix=? AND claim_id=? AND lease_until > ?)
         AND NOT EXISTS (SELECT 1 FROM payment_proofs WHERE r2_key=?)
-        AND NOT EXISTS (SELECT 1 FROM settings WHERE key='gcash_qr_key' AND value=?)`)
-      .bind(newId('orphan_'),object.key,row.prefix === 'proofs/' ? 'proof' : 'qr',object.uploaded.getTime(),now,now,row.prefix,token,Date.now(),object.key,object.key));
+        AND NOT EXISTS (SELECT 1 FROM settings WHERE key='gcash_qr_key' AND value=?)
+        AND NOT EXISTS (SELECT 1 FROM payment_methods WHERE qr_key=?)`)
+      .bind(newId('orphan_'),object.key,row.prefix === 'proofs/' ? 'proof' : 'qr',object.uploaded.getTime(),now,now,row.prefix,token,Date.now(),object.key,object.key,object.key));
   }
   statements.push(env.DB.prepare(`UPDATE storage_scan_state SET cursor=?,claim_id=NULL,lease_until=0,next_scan_at=?
     WHERE prefix=? AND claim_id=? AND lease_until > ?`).bind(page.truncated ? page.cursor : null,now + 60_000,row.prefix,token,Date.now()));
@@ -142,6 +144,7 @@ function retirePreviousQrStmt(env: Bindings, intent: UploadIntent, now: number) 
       WHERE id=? AND state='attached' AND previous_key IS NOT NULL AND previous_key != '' AND previous_key != r2_key
         AND NOT EXISTS (SELECT 1 FROM payment_proofs WHERE r2_key=previous_key)
         AND NOT EXISTS (SELECT 1 FROM settings WHERE key='gcash_qr_key' AND value=previous_key)
+        AND NOT EXISTS (SELECT 1 FROM payment_methods WHERE qr_key=previous_key)
     ON CONFLICT(r2_key) DO UPDATE SET state='delete_pending',claim_id=NULL,lease_until=0,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at
       WHERE storage_uploads.state='attached'`).bind(newId('retired_'),now,now,now + QR_RETIRE_DELAY_MS,intent.id);
 }
@@ -179,12 +182,70 @@ export async function removeQr(env: Bindings, actor: SessionUser, ip: string, no
       WHERE id=? AND previous_key IS NOT NULL AND previous_key != ''
         AND NOT EXISTS (SELECT 1 FROM payment_proofs WHERE r2_key=previous_key)
         AND NOT EXISTS (SELECT 1 FROM settings WHERE key='gcash_qr_key' AND value=previous_key)
+        AND NOT EXISTS (SELECT 1 FROM payment_methods WHERE qr_key=previous_key)
       ON CONFLICT(r2_key) DO UPDATE SET state='delete_pending',claim_id=NULL,lease_until=0,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at
         WHERE storage_uploads.state='attached'`).bind(newId('retired_'),now,now,now + QR_RETIRE_DELAY_MS,id),
   ]); } catch (error) {
     let saved = false;
     try { saved = Boolean(await env.DB.prepare('SELECT id FROM storage_qr_operations WHERE id=?').bind(id).first()); }
     catch { /* Its committed transaction, if any, retains the cleanup checkpoint. */ }
+    if (!saved) throw error;
+  }
+  invalidateSettings();
+}
+
+/** Reuse staged uploads and retirement checkpoints for configurable method QRs. */
+export async function commitMethodQrUpload(env: Bindings, actor: SessionUser, intent: UploadIntent, methodId: string, ip: string, now = Date.now()) {
+  const g = uploadGuard(intent, now);
+  const guard = `${g.sql} AND EXISTS (SELECT 1 FROM payment_methods WHERE id=? AND deleted_at IS NULL)`;
+  const params = [...g.params, methodId];
+  const statements = [
+    env.DB.prepare(`UPDATE storage_uploads SET previous_key=(SELECT qr_key FROM payment_methods WHERE id=?)
+      WHERE id=? AND ${guard}`).bind(methodId, intent.id, ...params),
+    env.DB.prepare(`UPDATE payment_methods SET qr_key=?,updated_at=?,updated_by=? WHERE id=? AND ${guard}`)
+      .bind(intent.key, now, actor.id, methodId, ...params),
+    env.DB.prepare(`INSERT INTO audit_log(actor_id,action,entity,entity_id,detail,ip,created_at)
+      SELECT ?,'payment_method_qr_updated','payment_method',?,?,?,? WHERE ${guard}`)
+      .bind(actor.id, methodId, intent.id, ip, now, ...params),
+  ];
+  if (methodId === 'gcash') statements.push(env.DB.prepare(`INSERT INTO settings(key,value,updated_at,updated_by)
+    SELECT 'gcash_qr_key',?,?,? WHERE ${guard}
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+    .bind(intent.key, now, actor.id, ...params));
+  statements.push(attachUploadStmt(env, intent, now), retirePreviousQrStmt(env, intent, now));
+  const results = await env.DB.batch(statements);
+  if (!results[1]?.meta.changes) throw conflict('UPLOAD_EXPIRED', 'The method changed or the upload expired. Refresh and try again.');
+  invalidateSettings();
+}
+
+/** Soft removal retains historical IDs and stages old files atomically, including under racing uploads. */
+export async function removeMethodQr(env: Bindings, actor: SessionUser, methodId: string, ip: string, removeMethod = false, now = Date.now()) {
+  const id = newId('qr_remove_');
+  const statements = [
+    env.DB.prepare(`INSERT INTO storage_qr_operations(id,previous_key,owner_id,created_at)
+      VALUES(?,(SELECT qr_key FROM payment_methods WHERE id=?),?,?)`).bind(id, methodId, actor.id, now),
+    env.DB.prepare(`UPDATE payment_methods SET qr_key=NULL,updated_at=?,updated_by=?
+      ${removeMethod ? ',enabled=0,deleted_at=?' : ''} WHERE id=? AND deleted_at IS NULL`)
+      .bind(now, actor.id, ...(removeMethod ? [now] : []), methodId),
+    env.DB.prepare(`INSERT INTO audit_log(actor_id,action,entity,entity_id,detail,ip,created_at)
+      VALUES(?,?,'payment_method',?,?,?,?)`)
+      .bind(actor.id, removeMethod ? 'payment_method_removed' : 'payment_method_qr_removed', methodId, id, ip, now),
+  ];
+  if (methodId === 'gcash') statements.push(env.DB.prepare(`INSERT INTO settings(key,value,updated_at,updated_by) VALUES('gcash_qr_key','',?,?)
+    ON CONFLICT(key) DO UPDATE SET value='',updated_at=excluded.updated_at,updated_by=excluded.updated_by`).bind(now, actor.id));
+  statements.push(env.DB.prepare(`INSERT INTO storage_uploads(id,r2_key,kind,state,created_at,updated_at,next_attempt_at)
+    SELECT ?,previous_key,'qr','delete_pending',?,?,? FROM storage_qr_operations
+    WHERE id=? AND previous_key IS NOT NULL AND previous_key != ''
+      AND NOT EXISTS (SELECT 1 FROM payment_proofs WHERE r2_key=previous_key)
+      AND NOT EXISTS (SELECT 1 FROM settings WHERE key='gcash_qr_key' AND value=previous_key)
+      AND NOT EXISTS (SELECT 1 FROM payment_methods WHERE qr_key=previous_key)
+    ON CONFLICT(r2_key) DO UPDATE SET state='delete_pending',claim_id=NULL,lease_until=0,next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at
+      WHERE storage_uploads.state='attached'`).bind(newId('retired_'), now, now, now + QR_RETIRE_DELAY_MS, id));
+  try { await env.DB.batch(statements); }
+  catch (error) {
+    let saved = false;
+    try { saved = Boolean(await env.DB.prepare('SELECT id FROM storage_qr_operations WHERE id=?').bind(id).first()); }
+    catch { /* An ambiguous commit retains its durable checkpoint. */ }
     if (!saved) throw error;
   }
   invalidateSettings();

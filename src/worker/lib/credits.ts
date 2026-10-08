@@ -387,13 +387,18 @@ export async function issueManualCredit(
   now = Date.now(),
 ) {
   const db = env.DB;
-  const existing = await db.prepare('SELECT id, user_id, amount FROM booking_credits WHERE idempotency_key = ?').bind(input.idempotencyKey).first<{ id: string; user_id: string; amount: number }>();
-  if (existing) {
-    if (existing.user_id !== input.userId || existing.amount !== input.amount) {
+  const replay = async (): Promise<string | null> => {
+    const existing = await db.prepare('SELECT id, user_id, amount, reason, source_booking_id, created_by FROM booking_credits WHERE idempotency_key = ?')
+      .bind(input.idempotencyKey).first<{ id: string; user_id: string; amount: number; reason: string; source_booking_id: string | null; created_by: string | null }>();
+    if (!existing) return null;
+    if (existing.user_id !== input.userId || existing.amount !== input.amount || existing.reason !== input.reason
+      || existing.source_booking_id !== input.sourceBookingId || existing.created_by !== admin.id) {
       throw conflict('IDEMPOTENCY_KEY_REUSED', 'This request key was already used for a different credit. Reload and try again.');
     }
     return existing.id;
-  }
+  };
+  const existing = await replay();
+  if (existing) return existing;
   const player = await db.prepare(`SELECT id, name, email, role FROM users WHERE id = ?`).bind(input.userId).first<{ id: string; name: string; email: string; role: string }>();
   if (!player || player.role !== 'player') throw notFound('Player not found.');
   if (input.sourceBookingId) {
@@ -402,27 +407,35 @@ export async function issueManualCredit(
   }
   const id = newId('cr_');
   const guard = { sql: 'EXISTS (SELECT 1 FROM booking_credits WHERE id = ?)', params: [id] };
-  await db.batch([
-    db
-      .prepare(
-        `INSERT INTO booking_credits (id, user_id, origin, source_booking_id, disruption_id, amount, remaining, state, expires_at, reason, created_by, idempotency_key, created_at, updated_at)
-         VALUES (?1, ?2, 'manual', ?3, NULL, ?4, ?4, 'active', NULL, ?5, ?6, ?7, ?8, ?8)`,
-      )
-      .bind(id, input.userId, input.sourceBookingId, input.amount, input.reason, admin.id, input.idempotencyKey, now),
-    db
-      .prepare(
-        `INSERT INTO credit_transactions (id, credit_id, user_id, kind, amount, booking_id, actor_id, actor_role, note, created_at)
-         VALUES (?, ?, ?, 'issue', ?, ?, ?, 'staff', ?, ?)`,
-      )
-      .bind(newId('ct_'), id, input.userId, input.amount, input.sourceBookingId, admin.id, input.reason, now),
-    creditNotice(db, input.userId, 'Booking credit added', `${peso(input.amount)} from Le Spinners · ${input.reason}`, now, guard),
-    outboxStmt(db, 'email', player.email, `Le Spinners — ${peso(input.amount)} booking credit`,
-      `Hi ${player.name},\n\nLe Spinners added a ${peso(input.amount)} booking credit to your account.\nReason: ${input.reason}\n\nIt isn't a cash refund. It's applied automatically the next time you book: ${env.APP_ORIGIN}/credits\n\nLe Spinners Recreational Hub`,
-      input.sourceBookingId, now, guard),
-    db
-      .prepare(`INSERT INTO audit_log (actor_id, action, entity, entity_id, detail, ip, created_at) VALUES (?, 'credit_issued_manual', 'credit', ?, ?, NULL, ?)`)
-      .bind(admin.id, id, JSON.stringify({ userId: input.userId, amount: input.amount, sourceBookingId: input.sourceBookingId }), now),
-  ]);
+  try {
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO booking_credits (id, user_id, origin, source_booking_id, disruption_id, amount, remaining, state, expires_at, reason, created_by, idempotency_key, created_at, updated_at)
+           VALUES (?1, ?2, 'manual', ?3, NULL, ?4, ?4, 'active', NULL, ?5, ?6, ?7, ?8, ?8)`,
+        )
+        .bind(id, input.userId, input.sourceBookingId, input.amount, input.reason, admin.id, input.idempotencyKey, now),
+      db
+        .prepare(
+          `INSERT INTO credit_transactions (id, credit_id, user_id, kind, amount, booking_id, actor_id, actor_role, note, created_at)
+           VALUES (?, ?, ?, 'issue', ?, ?, ?, 'staff', ?, ?)`,
+        )
+        .bind(newId('ct_'), id, input.userId, input.amount, input.sourceBookingId, admin.id, input.reason, now),
+      creditNotice(db, input.userId, 'Booking credit added', `${peso(input.amount)} from Le Spinners · ${input.reason}`, now, guard),
+      outboxStmt(db, 'email', player.email, `Le Spinners — ${peso(input.amount)} booking credit`,
+        `Hi ${player.name},\n\nLe Spinners added a ${peso(input.amount)} booking credit to your account.\nReason: ${input.reason}\n\nIt isn't a cash refund. It's applied automatically the next time you book: ${env.APP_ORIGIN}/credits\n\nLe Spinners Recreational Hub`,
+        input.sourceBookingId, now, guard),
+      db
+        .prepare(`INSERT INTO audit_log (actor_id, action, entity, entity_id, detail, ip, created_at) VALUES (?, 'credit_issued_manual', 'credit', ?, ?, NULL, ?)`)
+        .bind(admin.id, id, JSON.stringify({ userId: input.userId, amount: input.amount, sourceBookingId: input.sourceBookingId }), now),
+    ]);
+  } catch (error) {
+    // A concurrent same-key request may have won, or the response may have been
+    // lost after commit. Its credit and all effects were committed atomically.
+    const saved = await replay();
+    if (saved) return saved;
+    throw error;
+  }
   return id;
 }
 

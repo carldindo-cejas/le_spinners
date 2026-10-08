@@ -52,7 +52,10 @@ const NAV = [
       { key: 'calendar', label: 'Calendar', href: `${BASE}/calendar`, icon: 'calendar-grid' },
     ],
   },
-  ...(isAdminConsole ? [{ group: 'Admin', items: [{ key: 'settings', label: 'Settings', href: '/admin/settings', icon: 'settings' }] }] : []),
+  ...(isAdminConsole ? [{ group: 'Admin', items: [
+    { key: 'staff', label: 'Staff Management', href: '/admin/staff', icon: 'users' },
+    { key: 'settings', label: 'Settings', href: '/admin/settings', icon: 'settings' },
+  ] }] : []),
 ];
 
 const TABS = [
@@ -208,7 +211,7 @@ export function showSessionExpired() {
     onClose: () => (sessionOpen = false),
     content: () => html`<span class="tile blue">${icon('lock', 24)}</span>
       <h2 class="dialog-title">Please sign in again</h2>
-      <p class="body">Staff sessions end after 12 hours or when you sign out. Nothing you approved or sent was lost.</p>
+      <p class="body">${isAdminConsole ? 'Admin' : 'Staff'} sessions end after 12 hours, sign-out, or an account access change. Nothing you approved or sent was lost.</p>
       <div class="dialog-actions"><a class="btn btn-primary btn-block" href="${BASE}/login?next=${encodeURIComponent(next)}" data-signin>Sign in</a></div>`,
     onOpen: (panel, m) => panel.querySelector('[data-signin]').addEventListener('click', () => {
       sessionOpen = false;

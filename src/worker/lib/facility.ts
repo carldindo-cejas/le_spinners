@@ -7,6 +7,7 @@ import { conflict, forbidden, notFound, unprocessable } from './errors';
 import { addDays, dateLabel, localNow, offsetMinutes, peso } from './time';
 import { zActivity, zDate, zId } from './validate';
 import { scheduleBatch, scheduleVersion } from './schedule';
+import { authorizedBatch } from './authorized-mutations';
 
 /**
  * Facility changes (maintenance, open play, disabling a court, closures, weekly hours) never
@@ -158,6 +159,13 @@ async function checkNameFree(db: D1Database, activity: string, name: string, exc
   if (taken) throw conflict('NAME_TAKEN', 'Another court or table already has that name.', { name: ['Already used.'] });
 }
 
+function rethrowResourceWrite(error: unknown): never {
+  if (String(error).includes('UNIQUE constraint failed: resources.activity, resources.name')) {
+    throw conflict('NAME_TAKEN', 'Another court or table already has that name.', { name: ['Already used.'] });
+  }
+  throw error;
+}
+
 export async function getResource(db: D1Database, id: string): Promise<ResourceRow> {
   const row = await db.prepare('SELECT * FROM resources WHERE id = ?').bind(id).first<ResourceRow>();
   if (!row) throw notFound('Court or table not found.');
@@ -219,7 +227,9 @@ export async function updateResource(c: AppContext, actor: SessionUser, id: stri
   if (body.maintenanceNote !== undefined || body.status !== undefined) set('maintenance_note', next.maintenance_note);
   if (body.maintenanceUntil !== undefined || body.status !== undefined) set('maintenance_until', next.maintenance_until);
   set('updated_at', now);
-  await scheduleBatch(db, version, [db.prepare(`UPDATE resources SET ${fields.join(', ')} WHERE id = ?`).bind(...values, id)]);
+  try {
+    await scheduleBatch(db, version, [db.prepare(`UPDATE resources SET ${fields.join(', ')} WHERE id = ?`).bind(...values, id)], actor);
+  } catch (error) { rethrowResourceWrite(error); }
   const changed = Object.keys(body).filter((k) => k !== 'confirmAffected').join(',');
   const detail = affected.length ? `${changed}; affected ${affected.map((a) => a.ref).join(' ')}` : changed;
   c.executionCtx.waitUntil(audit(c, actor.id, 'resource_updated', 'resource', id, detail));
@@ -247,13 +257,14 @@ export async function createResource(c: AppContext, actor: SessionUser, body: z.
   }
   const id = newId('r_');
   const now = Date.now();
-  await db
-    .prepare(
-      `INSERT INTO resources (id, activity, name, sort_order, status, open_play, price_member, price_non_member, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(id, body.activity, body.name, (template?.max_sort ?? 0) + 1, ...storedStatus(body.status), priceMember, priceNonMember, now, now)
-    .run();
+  try {
+    await authorizedBatch(db, actor, [db
+      .prepare(
+        `INSERT INTO resources (id, activity, name, sort_order, status, open_play, price_member, price_non_member, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(id, body.activity, body.name, (template?.max_sort ?? 0) + 1, ...storedStatus(body.status), priceMember, priceNonMember, now, now)]);
+  } catch (error) { rethrowResourceWrite(error); }
   c.executionCtx.waitUntil(audit(c, actor.id, 'resource_created', 'resource', id, `${body.activity} ${body.name}`));
   return resourceDTO(await getResource(db, id));
 }
@@ -285,7 +296,7 @@ export async function createClosure(c: AppContext, actor: SessionUser, body: z.i
   const id = newId('cl_');
   await scheduleBatch(db, version, [db
     .prepare('INSERT INTO closures (id, date, resource_id, start_min, end_min, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, body.date, body.resourceId, body.start, body.end, body.reason, actor.id, now)]);
+    .bind(id, body.date, body.resourceId, body.start, body.end, body.reason, actor.id, now)], actor);
   const detail = `${body.date} ${resource?.name ?? 'facility'} ${body.start ?? 'all'}-${body.end ?? 'day'}${affected.length ? `; affected ${affected.map((a) => a.ref).join(' ')}` : ''}`;
   c.executionCtx.waitUntil(audit(c, actor.id, 'closure_created', 'closure', id, detail));
   return { id, affected };
@@ -298,7 +309,8 @@ export async function deleteClosure(c: AppContext, actor: SessionUser, id: strin
   const row = await db.prepare('SELECT id, date FROM closures WHERE id = ?').bind(id).first<{ id: string; date: string }>();
   if (!row) throw notFound('Closure not found.');
   if (row.date < today) throw conflict('CLOSURE_PAST', 'This date has passed. Past closures are kept for the record.');
-  await db.prepare('DELETE FROM closures WHERE id = ?').bind(id).run();
+  const [removed] = await authorizedBatch(db, actor, [db.prepare('DELETE FROM closures WHERE id = ?').bind(id)]);
+  if (!removed?.meta.changes) throw notFound('Closure not found.');
   c.executionCtx.waitUntil(audit(c, actor.id, 'closure_removed', 'closure', id, row.date));
 }
 
@@ -329,7 +341,7 @@ export async function setWeeklyHours(c: AppContext, actor: SessionUser, weekday:
       `INSERT INTO opening_hours (weekday, is_open, open_min, close_min) VALUES (?, ?, ?, ?)
        ON CONFLICT (weekday) DO UPDATE SET is_open = excluded.is_open, open_min = excluded.open_min, close_min = excluded.close_min`,
     )
-    .bind(weekday, body.isOpen ? 1 : 0, body.open, body.close)]);
+    .bind(weekday, body.isOpen ? 1 : 0, body.open, body.close)], actor);
   const before = current ? `${current.is_open ? `${current.open_min}-${current.close_min}` : 'closed'}` : 'unset';
   const after = body.isOpen ? `${body.open}-${body.close}` : 'closed';
   const detail = `${WEEKDAYS[weekday]} ${before} -> ${after}${affected.length ? `; affected ${affected.map((a) => a.ref).join(' ')}` : ''}`;

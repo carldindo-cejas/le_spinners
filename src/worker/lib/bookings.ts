@@ -7,7 +7,7 @@ import { MAINTENANCE_BATCH_SIZE } from './limits';
 import { isOverspend, planCreditUse, redeemStmts, releaseStmts, spendableCredits, usesNote, type CreditUse } from './credits';
 import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt, type Guard } from './notify';
 import type { Settings } from './settings';
-import { scheduleBatch, scheduleVersion } from './schedule';
+import { bookingConfigurationBatch, bookingConfigurationVersion } from './schedule';
 import {
   addDays,
   dateLabel,
@@ -155,9 +155,10 @@ const METHOD_LABEL: Record<PaymentMethod, string> = { gcash: 'GCash', on_site: '
  * How a booking was paid. `payment_method` is how the cash part was paid; credit is separate:
  * 'none' + credit = "Paid with credit", 'gcash' + credit = "GCash + credit".
  */
-export function paymentMethodLabel(m: PaymentMethod, creditApplied = 0): string {
-  if (creditApplied > 0) return m === 'none' ? 'Paid with credit' : `${METHOD_LABEL[m]} + credit`;
-  return METHOD_LABEL[m];
+export function paymentMethodLabel(m: PaymentMethod, creditApplied = 0, name?: string | null): string {
+  const label = name || METHOD_LABEL[m];
+  if (creditApplied > 0) return m === 'none' ? 'Paid with credit' : `${label} + credit`;
+  return label;
 }
 
 export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offsetMin: number, forStaff = false) {
@@ -207,7 +208,9 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     disrupted: Boolean(b.disruption_id),
     source: b.source,
     paymentMethod: b.payment_method,
-    paymentMethodLabel: paymentMethodLabel(b.payment_method, b.credit_applied ?? 0),
+    paymentMethodId: b.payment_method_id ?? null,
+    paymentMethodName: b.payment_method_name ?? METHOD_LABEL[b.payment_method],
+    paymentMethodLabel: paymentMethodLabel(b.payment_method, b.credit_applied ?? 0, b.payment_method_name),
     /** Credit used to pay; amountDue above is the cash part. */
     creditApplied: b.credit_applied ?? 0,
     creditAppliedLabel: peso(b.credit_applied ?? 0),
@@ -289,14 +292,14 @@ function passGuard(id: string, token: string): Guard {
 }
 
 /** Expires at most eight unpaid holds, including their credit and complete effects. */
-export async function sweepExpired(env: Bindings, now = Date.now(), scope?: { resourceId: string; date: string }): Promise<number> {
+export async function sweepExpired(env: Bindings, now = Date.now(), scope?: { resourceId: string; date: string; startMin?: number }): Promise<number> {
   const db = env.DB;
   const { results } = await db.prepare(`SELECT b.id, b.user_id, b.rejected_at, r.name AS resource_name, b.date, b.start_min
     FROM bookings b JOIN resources r ON r.id = b.resource_id
     WHERE b.status IN ('TEMPORARY', 'REJECTED') AND b.hold_expires_at <= ?
       ${scope ? 'AND b.resource_id = ? AND b.date = ?' : ''}
-    ORDER BY b.hold_expires_at, b.id LIMIT ?`)
-    .bind(now, ...(scope ? [scope.resourceId, scope.date] : []), MAINTENANCE_BATCH_SIZE).all<MaintenanceRow>();
+    ORDER BY ${scope?.startMin != null ? 'CASE WHEN b.start_min = ? THEN 0 ELSE 1 END, ' : ''}b.hold_expires_at, b.id LIMIT ?`)
+    .bind(now, ...(scope ? [scope.resourceId, scope.date] : []), ...(scope?.startMin != null ? [scope.startMin] : []), MAINTENANCE_BATCH_SIZE).all<MaintenanceRow>();
   if (!results.length) return 0;
   const token = newId('tr_');
   const statements = [db.prepare(`UPDATE bookings SET status = 'EXPIRED', updated_at = ?1, transition_id = ?2
@@ -407,13 +410,15 @@ async function checkSlots(env: Bindings, settings: Settings, input: SlotInput, n
   const local = localNow(offsetMinutes(env.TZ_OFFSET_MINUTES), now);
   const { resourceId, date } = input;
   if (!isValidDate(date)) throw unprocessable('VALIDATION_ERROR', 'Use a real date (YYYY-MM-DD).', { date: ['Invalid date.'] });
-  // Expiry itself changes the schedule. Capture the plan's version afterward.
-  await sweepExpired(env, now, { resourceId, date });
-  const version = await scheduleVersion(db);
   const starts = [...new Set(input.starts)].sort((a, b) => a - b);
   if (!starts.length || starts.length > MAX_SLOTS || starts.some((s) => !Number.isInteger(s))) {
     throw unprocessable('INVALID_SLOT', 'Pick one or more of the listed times.');
   }
+  // Release expired inventory first. Occupancy is rechecked by the atomic INSERT;
+  // only resource/hour/closure changes invalidate the configuration read below.
+  // Prioritize the exact-start backstop's expired row even behind a large backlog.
+  await sweepExpired(env, now, { resourceId, date, startMin: starts[0]! });
+  const version = await bookingConfigurationVersion(db);
 
   const resource = await db.prepare('SELECT * FROM resources WHERE id = ?').bind(resourceId).first<ResourceRow>();
   if (!resource || resource.status === 'disabled') throw unprocessable('RESOURCE_UNAVAILABLE', 'That court or table is not available.');
@@ -496,6 +501,7 @@ async function insertBooking(
   now: number,
   maxOpenHolds: number | null,
   extra: D1PreparedStatement[] = [],
+  actor?: SessionUser,
 ): Promise<number> {
   const segs = JSON.stringify(row.segments.map((s) => [s.start, s.end]));
   const start = row.segments[0]!.start;
@@ -508,7 +514,7 @@ async function insertBooking(
       `INSERT INTO bookings (id, ref, user_id, resource_id, date, start_min, end_min, status, amount_due, rate, hold_expires_at, created_at, updated_at,
                              source, created_by, payment_method, submitted_at, confirmed_at, confirmed_by, credit_applied, booker_name)
        SELECT ?1,
-              'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, -3) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
+              'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, 13) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
               ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?19, ?20
         WHERE NOT ${clashSql('t.resource_id = ?3', '?4', '?18', '?10')}
           AND NOT ${clashSql('b.user_id = ?2', '?4', '?18', '?10')}
@@ -537,7 +543,7 @@ async function insertBooking(
     )
     .bind(row.id, row.resourceId, row.date, segs);
   try {
-    const [res] = await scheduleBatch(db, row.scheduleVersion, [insert, times, ...extra]);
+    const [res] = await bookingConfigurationBatch(db, row.scheduleVersion, [insert, times, ...extra], actor);
     return res?.meta.changes ?? 0;
   } catch (err) {
     if (!/UNIQUE constraint failed: bookings\.resource_id, bookings\.date, bookings\.start_min/.test(String(err))) throw err;
@@ -621,6 +627,7 @@ export async function createHold(
   user: SessionUser,
   input: SlotInput & { useCredit?: boolean; expectedCredit?: number | null; idempotencyKey?: string },
   now = Date.now(),
+  beforeCreate?: () => Promise<void>,
 ) {
   const db = env.DB;
   const { resourceId, date } = input;
@@ -631,6 +638,9 @@ export async function createHold(
   const replay = await op.replay();
   if (replay) return getBooking(db, replay);
   try {
+    // HTTP callers charge only new attempts. Durable successful retries must
+    // remain recoverable even when the player's new-hold budget is exhausted.
+    await beforeCreate?.();
     const { resource, segments, slots, version } = await checkSlots(env, settings, input, now);
 
     const rate = user.membership === 'member' ? 'member' : 'non_member';
@@ -769,7 +779,7 @@ export async function createConsoleBooking(
       submittedAt: payment === 'on_site' ? now : null,
       confirmedAt: now,
       confirmedBy: staff.id,
-    }, now, null, effects);
+    }, now, null, effects, staff);
     if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false, self: false });
 
     return getBooking(db, id);

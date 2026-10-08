@@ -99,9 +99,9 @@ export const loadSession: MiddlewareHandler<AppEnv> = async (c, next) => {
         // Player sessions slide; staff sessions keep their 12-hour limit.
         const expires = isStaff(user.role) ? expires_at : now + PLAYER_TTL_MS;
         c.executionCtx.waitUntil(
-          c.env.DB.prepare(`UPDATE sessions SET last_seen_at=?,expires_at=? WHERE id=? AND auth_version=?
+          c.env.DB.prepare(`UPDATE sessions SET last_seen_at=?,expires_at=? WHERE id=? AND auth_version=? AND last_seen_at=? AND expires_at>?
             AND EXISTS (SELECT 1 FROM users WHERE id=sessions.user_id AND status='active' AND auth_version=?)`)
-            .bind(now,expires,id,user.auth_version,user.auth_version).run(),
+            .bind(now,expires,id,user.auth_version,last_seen_at,now,user.auth_version).run(),
         );
       }
     } else if (row) {

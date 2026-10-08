@@ -8,30 +8,17 @@ import {
 import { fakePasswordSalt, newId, PASSWORD_ITERATIONS, PASSWORD_SCHEME, pepperHash, verifyClientHash } from '../lib/crypto';
 import { ApiError, conflict, forbidden, tooMany } from '../lib/errors';
 import { jsonBody } from '../lib/validate';
+import { zClientHash, zEmail, zName, zNewPassword } from '../lib/auth-validation';
+export { zEmail } from '../lib/auth-validation';
 
 const MINUTE = 60_000;
 const RELOAD = 'Please reload the page and try again.';
 
 // Passwords never reach the Worker: the browser sends PBKDF2 output (see public/js/core/password.js).
-const zSalt = z.string().regex(/^[A-Za-z0-9_-]{22}$/, RELOAD); // 16 bytes, base64url
-const zClientHash = z.string().regex(/^[A-Za-z0-9_-]{43}$/, RELOAD); // 32 bytes, base64url
-const zNewPassword = z.object({
-  scheme: z.literal(PASSWORD_SCHEME, { error: RELOAD }),
-  iterations: z.literal(PASSWORD_ITERATIONS, { error: RELOAD }),
-  salt: zSalt,
-  clientHash: zClientHash,
-});
 
 type PasswordRow = Pick<UserRow, 'password_hash' | 'password_salt' | 'password_iterations' | 'password_scheme' | 'auth_version'>;
 const usable = (row: PasswordRow | null | undefined) => !!row && row.password_scheme === PASSWORD_SCHEME && !!row.password_hash;
 
-export const zEmail = z
-  .string()
-  .trim()
-  .toLowerCase()
-  .max(254, 'That email is too long.')
-  .pipe(z.email('Enter a valid email address.'));
-const zName = z.string().trim().min(2, 'Enter your full name.').max(80, 'Use at most 80 characters.');
 const zPhone = z
   .string()
   .trim()
@@ -205,10 +192,14 @@ meRoutes.get('/', (c) => c.json({ user: userDTO(requireUser(c)) }));
 meRoutes.patch('/', async (c) => {
   const user = requireUser(c);
   const body = await jsonBody(c, z.object({ name: zName.optional(), phone: zPhone.optional() }));
-  const name = body.name ?? user.name;
-  const phone = body.phone === undefined ? user.phone : body.phone;
-  await c.env.DB.prepare('UPDATE users SET name = ?, phone = ?, updated_at = ? WHERE id = ?').bind(name, phone, Date.now(), user.id).run();
-  return c.json({ user: userDTO({ ...user, name, phone }) });
+  // Write only supplied fields: simultaneous name/phone edits must not copy
+  // stale session fields over each other. Account changes also fence this write.
+  const saved = await c.env.DB.prepare(`UPDATE users SET name=COALESCE(?1,name),
+    phone=CASE WHEN ?2 THEN ?3 ELSE phone END,updated_at=MAX(?4,updated_at+1)
+    WHERE id=?5 AND status='active' AND auth_version=?6 RETURNING *`)
+    .bind(body.name ?? null,body.phone !== undefined ? 1 : 0,body.phone ?? null,Date.now(),user.id,user.auth_version).first<UserRow>();
+  if (!saved) throw conflict('CREDENTIALS_CHANGED','Your account or session changed. Sign in again and retry.');
+  return c.json({ user: userDTO(saved) });
 });
 
 meRoutes.post('/password', async (c) => {

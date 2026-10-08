@@ -76,8 +76,8 @@ async function writeCycle(i,cookies,admin){
   const resourceId='court-'+(1+i%3),start=(i%12)*60;
   const hold=(await post('create hold','/api/bookings',{resourceId,date,starts:[start]},cookie,{'Idempotency-Key':key()},[201])).data.booking;
   const form=new FormData();form.set('file',new File([fs.readFileSync(path.join(root,'db/seed-proofs/juan.png'))],'synthetic.png',{type:'image/png'}));form.set('amountPesos',(hold.amountDue/100).toFixed(2));
-  await post('proof upload',`/api/bookings/${hold.id}/proof`,form,cookie,{},[201]);
-  await post('approve',`/api/admin/bookings/${hold.id}/approve`,{checklist:true},admin);
+  const uploaded = await post('proof upload',`/api/bookings/${hold.id}/proof`,form,cookie,{},[201]);
+  await post('approve',`/api/admin/bookings/${hold.id}/approve`,{checklist:true,proofId:uploaded.data.proofs[0].id},admin);
   const preview=(await post('disruption preview','/api/admin/disruptions/preview',{scope:{kind:'bookings',bookingIds:[hold.id]},category:'equipment_failure',reason:'Synthetic capacity exercise'},admin)).data.preview;
   const disruptionBody={...preview.input,previewToken:preview.previewToken},disruptionKey=key();
   const disruption=(await post('disruption apply','/api/admin/disruptions',disruptionBody,admin,{'Idempotency-Key':disruptionKey},[201])).data;

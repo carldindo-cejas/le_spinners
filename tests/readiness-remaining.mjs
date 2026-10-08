@@ -113,7 +113,7 @@ if(process.env.BASELINE_ONLY!=='1') {
     const f=await apiFixture(t);for(let n=0;n<61;n++)assert.equal((await f.login(n%60,false)).status,n<60?401:429);
     assert.equal((await f.login(59)).status,200);
     for(let n=62;n<120;n++)await f.login(n%60,false);
-    assert.equal((await f.login(58)).status,429);assert.ok(f.DB.count('sessions')<=1);
+    assert.equal((await f.login(58)).status,429);assert.ok(f.DB.count('sessions', "user_id LIKE 'nat-%'")<=1);
   });
   test('M13 limiter recovers at exact windows, canonicalizes IPv6 and ignores untrusted proxies',async t=>{
     const f=await apiFixture(t);for(let n=0;n<9;n++)await f.login(0,false,'2001:db8::1');

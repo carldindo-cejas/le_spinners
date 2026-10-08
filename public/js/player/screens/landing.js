@@ -1,5 +1,6 @@
 import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
+import { facilityDirections } from '../../core/facility.js';
 import { listen, html, raw, render } from '../../core/dom.js';
 import { icon, logo, courtArt, tableArt } from '../../core/icons.js';
 import { poll } from '../../core/ui.js';
@@ -64,8 +65,9 @@ function sportCards(facility) {
 function visitInfo(f) {
   const address = f?.facility.address;
   const hasAddress = address && !address.startsWith('[');
+  const directions = facilityDirections(f?.facility);
   return html`<div class="lp-visit-address"><span class="lp-location-icon">${icon('map-pin', 30)}</span><h3>${f?.facility.name || 'Le Spinners Recreational Hub'}</h3><p>${hasAddress ? address : 'Our address will appear here once the facility details are ready.'}</p>
-    ${hasAddress ? html`<a class="btn btn-volt btn-md" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}" target="_blank" rel="noopener noreferrer">Get directions${icon('arrow-right', 18)}</a>` : ''}</div>
+    ${directions ? html`<a class="btn btn-volt btn-md" href="${directions}" target="_blank" rel="noopener noreferrer">Get directions${icon('arrow-right', 18)}</a>` : ''}</div>
     <div class="lp-hours"><h3>${icon('clock', 20)}Regular opening hours</h3>${f?.hours?.length ? html`<dl>${[...f.hours].sort((a, b) => ((a.weekday + 6) % 7) - ((b.weekday + 6) % 7)).map((h) => html`<div><dt>${h.name}</dt><dd>${h.isOpen ? h.label : 'Closed'}</dd></div>`)}</dl>` : html`<p>Opening hours are temporarily unavailable.</p>`}<p class="lp-small">Schedules can change. Check the Court Calendar for your date.</p></div>`;
 }
 

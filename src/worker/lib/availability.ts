@@ -175,6 +175,34 @@ export async function dayAvailability(
 
 export type DayLoad = 'open' | 'few' | 'full' | 'closed';
 
+/** Compact console date strip, using the same hours, closures and slots as its grid. */
+export async function scheduleDaysSummary(
+  env: Bindings,
+  settings: Settings,
+  input: { activity: Activity | null; from: string },
+  now = Date.now(),
+) {
+  const local = localNow(offsetMinutes(env.TZ_OFFSET_MINUTES), now);
+  const ctx = await loadCtx(env.DB, input.activity, input.from, addDays(input.from, 13), now);
+  const days = Array.from({ length: 14 }, (_, index) => {
+    const date = addDays(input.from, index);
+    const day = buildDay(ctx, date, local, settings, { staff: true });
+    const slots = day.resources.flatMap(resource => resource.slots);
+    const available = slots.filter(slot => slot.state === 'available').length;
+    const openPlay = slots.some(slot => slot.state === 'open_play');
+    const occupied = slots.some(slot => ['held', 'unavailable', 'booked'].includes(slot.state));
+    const state = date < local.date ? 'past'
+      : !day.resources.length ? 'empty'
+      : !day.open ? 'closed'
+      : available ? 'open'
+      : openPlay ? 'open_play'
+      : occupied ? 'full'
+      : slots.length && slots.every(slot => slot.state === 'past') ? 'past' : 'closed';
+    return { date, weekday: day.weekday, day: day.day, isToday: day.isToday, state, available };
+  });
+  return { now, today: local.date, days };
+}
+
 /** The date strip: how busy each bookable day is for one activity. */
 export async function daysSummary(
   env: Bindings,

@@ -1,6 +1,7 @@
 export type Settings = {
   facilityName: string;
   facilityAddress: string;
+  facilityMapsUrl: string;
   gcashName: string;
   gcashNumber: string;
   gcashQrKey: string | null;
@@ -17,6 +18,7 @@ export type Settings = {
 const DEFAULTS: Record<string, string> = {
   facility_name: 'Le Spinners Recreational Hub',
   facility_address: '',
+  facility_maps_url: '',
   gcash_name: 'Le Spinners Recreational Hub',
   gcash_number: '',
   gcash_qr_key: '',
@@ -65,6 +67,7 @@ async function readSettings(db: D1Database): Promise<Settings> {
   return {
     facilityName: map.facility_name ?? DEFAULTS.facility_name!,
     facilityAddress: map.facility_address ?? '',
+    facilityMapsUrl: map.facility_maps_url ?? '',
     gcashName: map.gcash_name ?? '',
     gcashNumber: map.gcash_number ?? '',
     gcashQrKey: map.gcash_qr_key ? map.gcash_qr_key : null,
@@ -84,6 +87,7 @@ export function publicSettings(s: Settings) {
   return {
     facilityName: s.facilityName,
     facilityAddress: s.facilityAddress,
+    facilityMapsUrl: s.facilityMapsUrl,
     gcash: { name: s.gcashName, number: s.gcashNumber, hasQr: Boolean(s.gcashQrKey) },
     rules: {
       bookingWindowDays: s.bookingWindowDays,

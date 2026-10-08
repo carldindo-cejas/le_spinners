@@ -15,7 +15,7 @@ await build({
       'lib/facility', 'lib/validate', 'lib/time', 'lib/maintenance', 'lib/notify', 'lib/outbox', 'lib/storage', 'lib/auth', 'lib/crypto', 'lib/chat', 'lib/pagination', 'routes/notifications', 'routes/auth', 'routes/credits', 'routes/bookings', 'routes/admin', 'routes/admin-settings']
       // The preserved pre-M06 tree exports flushOutbox from notify, before outbox existed.
       .filter(name => !['lib/outbox','lib/storage','lib/pagination'].includes(name) || existsSync(path.join(root,`src/worker/${name}.ts`)))
-      .concat('routes/revenue').map(name => `export * from './src/worker/${name}.ts';`).join('\n'),
+      .concat('routes/revenue', 'routes/facility', 'routes/admin-staff', 'lib/staff-accounts', 'lib/authorized-mutations').map(name => `export * from './src/worker/${name}.ts';`).join('\n'),
     resolveDir: root, loader: 'ts',
   },
   bundle: true, platform: 'node', format: 'esm', outfile: output,
@@ -91,7 +91,11 @@ export function fixture(t) {
     TZ_OFFSET_MINUTES: '480', APP_ORIGIN: 'http://127.0.0.1:8787',
     FILE_SIGNING_SECRET: 'synthetic-signing-secret-for-isolated-tests-only',
   };
-  const user = id => ({ ...DB.one('SELECT * FROM users WHERE id=?', id), session_id: 'synthetic-session' });
+  for (const id of ['test_admin', 'test_staff']) {
+    DB.sqlite.prepare('INSERT INTO sessions(id,user_id,created_at,expires_at,last_seen_at,auth_version) VALUES(?,?,?,?,?,1)')
+      .run('synthetic-session-' + id, id, NOW, NOW + 12 * 60 * 60_000, NOW);
+  }
+  const user = id => ({ ...DB.one('SELECT * FROM users WHERE id=?', id), session_id: 'synthetic-session-' + id });
   const background = [];
   const c = { env, req: { header() { return null; } }, executionCtx: { waitUntil(promise) { background.push(promise); } } };
   t.after(async () => { await Promise.all(background); DB.sqlite.close(); });

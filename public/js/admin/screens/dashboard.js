@@ -7,7 +7,7 @@ import {
 } from '../../core/format.js';
 import { errorState, memberTag, poll, skeletonRows, statusPill } from '../../core/ui.js';
 import { frame, state } from '../shell.js';
-import { API, BASE } from '../console.js';
+import { API, BASE, isAdminConsole, REVENUE } from '../console.js';
 
 const viewTools = createViewTools({ listen, api, render, poll, frame });
 
@@ -66,6 +66,22 @@ function todayList(d) {
 }
 
 /** Courts and tables in maintenance or open play right now, and confirmed bookings still ahead. */
+function facilityStat(d) {
+  const rows = d.facility?.availability;
+  if (!rows) return html`<a class="panel stat" href="${BASE}/facilities"><span class="eyebrow">Facilities</span><span class="small">Status unavailable</span></a>`;
+  const total = rows.reduce((sum, row) => sum + row.total, 0);
+  const available = rows.reduce((sum, row) => sum + row.available, 0);
+  return html`<a class="panel stat facility-stat" href="${BASE}/facilities">
+    <span class="eyebrow">Facilities</span><span class="num">${available}/${total}</span>
+    <span class="facility-bar" aria-hidden="true">${rows.flatMap(row => [
+      ...Array.from({ length: row.available }, () => html`<i class="${row.activity === 'pickleball' ? 'blue' : 'green'}"></i>`),
+      ...Array.from({ length: row.total - row.available }, () => html`<i class="red"></i>`),
+    ])}</span>
+    ${rows.map(row => html`<span class="small">${row.activity === 'pickleball' ? 'Pickleball' : 'Table Tennis'} ${row.available}/${row.total}</span>`)}
+    ${!total ? html`<span class="small">No facilities configured</span>` : ''}
+  </a>`;
+}
+
 function facilityPanel(d) {
   const f = d.facility;
   if (!f) return '';
@@ -88,7 +104,7 @@ export async function dashboardView() {
     eyebrow: nowStr,
     title: 'Dashboard',
     actions: html`<span class="live only-desktop"><span class="live-dot"></span>Live</span>`,
-    mobileHeader: html`<div class="tb-mobile"><div class="row row-between"><a class="sb-brand" href="${BASE}/">${logo(34)}<span><span class="n1">Le Spinners</span><br><span class="n2">STAFF</span></span></a><div class="row" data-gap="8"><a class="icon-btn" href="${BASE}/notifications" aria-label="Notifications">${icon('bell', 21)}${state.badges.unresolved ? html`<span class="badge" aria-hidden="true">${state.badges.unresolved}</span>` : ''}</a><a class="avatar volt" href="${BASE}/more" aria-label="More">${initials(u.name)}</a></div></div>
+    mobileHeader: html`<div class="tb-mobile"><div class="row row-between"><a class="sb-brand" href="${BASE}/">${logo(34)}<span><span class="n1">Le Spinners</span><br><span class="n2">${isAdminConsole ? 'ADMIN' : 'STAFF'}</span></span></a><div class="row" data-gap="8"><a class="icon-btn" href="${BASE}/notifications" aria-label="Notifications">${icon('bell', 21)}${state.badges.unresolved ? html`<span class="badge" aria-hidden="true">${state.badges.unresolved}</span>` : ''}</a><a class="avatar volt" href="${BASE}/more" aria-label="More">${initials(u.name)}</a></div></div>
       <div><p class="m-title">${greeting()}, ${firstName(u.name)}</p><p class="small light-text">${dateLabel(isoDate(Date.now()))} · ${clock(Date.now())}</p></div></div>`,
     template: html`<div class="page" data-page>
       <div class="row row-between only-desktop"><h2 class="h1">${greeting()}, ${firstName(u.name)}</h2><a class="btn btn-secondary btn-md" href="${BASE}/calendar">${icon('calendar-grid', 18)}Open calendar</a></div>
@@ -122,9 +138,9 @@ export async function dashboardView() {
           <p class="eyebrow">Today at a glance</p>
           <div class="stat-grid">
             <div class="panel stat"><span class="eyebrow">Today's bookings</span><span class="num">${total}</span><span class="split-bar" aria-hidden="true"><i data-css="--w:${total ? Math.round((pickleball / total) * 100) : 50}%"></i><i></i></span><span class="small">${pickleball} Pickleball · ${total - pickleball} Table Tennis</span></div>
-            <div class="panel stat"><span class="eyebrow">Confirmed today</span><span class="num">${d.counts.confirmedToday}</span><span class="small">verified ${peso(d.verifiedRevenueToday)}</span></div>
-            <div class="panel stat"><span class="eyebrow">Active holds</span><span class="num">${d.counts.activeHolds}</span><span class="small">release on their own if unpaid</span></div>
-            <div class="panel stat"><span class="eyebrow">Unresolved alerts</span><span class="num">${d.counts.unresolved}</span><span class="small"><a href="${BASE}/notifications">Open notifications</a></span></div>
+            <div class="panel stat"><span class="eyebrow">Confirmed today</span><span class="num">${d.counts.confirmedToday}</span><span class="small">${isAdminConsole ? `verified ${peso(d.verifiedRevenueToday)}` : 'confirmed bookings'}</span></div>
+            ${isAdminConsole ? html`<a class="panel stat revenue-stat${peso(d.verifiedRevenueToday, { decimals: true }).length > 10 ? ' large-amount' : ''}" href="${REVENUE}"><span class="eyebrow">Today's Revenue</span><span class="num">${peso(d.verifiedRevenueToday, { decimals: true })}</span><span class="small">collected today</span></a>` : html`<div class="panel stat"><span class="eyebrow">Active holds</span><span class="num">${d.counts.activeHolds}</span><span class="small">players paying now</span></div>`}
+            ${facilityStat(d)}
           </div>
         </section>
         ${facilityPanel(d)}

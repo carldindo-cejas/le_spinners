@@ -23,9 +23,9 @@ page for its role:
 
 | Role | Sign in | Dashboard | What it's for |
 |---|---|---|---|
-| User (player) | `/login` | `/` | Live availability, booking any open times on a court or table (back to back or with gaps, price × slots), a 10-minute temporary hold, GCash payment instructions, payment-screenshot upload, booking chat, notifications, profile, **booking credits** (what Le Spinners owes after cancelling a paid booking) and **Rebook** |
+| User (player) | `/login` | `/` | Live availability, booking any open times on a court or table (back to back or with gaps, price × slots), a 10-minute temporary hold, configured payment instructions, payment-screenshot upload, booking chat, notifications, profile, **booking credits** (what Le Spinners owes after cancelling a paid booking) and **Rebook** |
 | Staff | `/staff/login` | `/staff/` | Dashboard, payment verification (approve after ticking the required "Before you approve" checklist, or reject with a reason), bookings with their author ("Online" or "Staff · name" / "Admin · name"), bookings on site (**New booking**: the booker's name is required for reference, confirmed at once, paid at the desk or free), per-booking chat that opens in place on the booking and review pages, notification center, calendar, courts and tables, weekly hours and closed dates, **Cancel & credit** and **Disruptions** (cancel or cut short paid bookings with a booking credit), booking credits, own profile |
-| Admin | `/admin/login` | `/admin/` | Everything staff can do, plus Settings (GCash details and QR, prices, alert recipients, booking rules, the email/SMS outbox), **Revenue** at `/revenue/` (collected revenue and the booking ledger), credits issued by hand, voids and cash-refund records, and disruptions up to 7 days back |
+| Admin | `/admin/login` | `/admin/` | Everything staff can do, plus **Staff Management** at `/admin/staff`, Settings (payment methods and QR codes, prices, alert recipients, booking rules, the email/SMS outbox), **Revenue** at `/revenue/` (collected revenue and the booking ledger), credits issued by hand, voids and cash-refund records, and disruptions up to 7 days back |
 
 Member and non-member are a player's *membership* (it sets the price), not a role, and it
 never grants console access.
@@ -37,7 +37,7 @@ One Cloudflare Worker serves all three apps and the API:
 | Hosting | Cloudflare Workers + static assets (`public/`) |
 | API | [Hono](https://hono.dev) in TypeScript (`src/worker/`) |
 | Database | Cloudflare D1 (SQLite), migrations in `migrations/` |
-| Files | Private R2 bucket for payment screenshots and the GCash QR |
+| Files | Private R2 bucket for payment screenshots and payment-method QRs |
 | Jobs | Cron trigger every minute (expire holds, warnings, completions, email) |
 | Frontend | Plain HTML, CSS and vanilla JavaScript modules — no build step |
 
@@ -45,7 +45,7 @@ One Cloudflare Worker serves all three apps and the API:
 
 ```
 Select time ─▶ TEMPORARY (slot held 10 min, countdown)
-                 │ upload GCash screenshot
+                 │ upload payment screenshot
                  ▼
            PAYMENT_SUBMITTED  ("Payment proof submitted" · "Waiting for admin verification")
              │ staff approve                     │ staff reject (reason required)
@@ -84,7 +84,7 @@ questions are in [REBOOKING.md](REBOOKING.md).
   A booking whose payment proof is waiting is finished once staff verify or reject it.
 - Booking credit is money, never a cash refund. It is spent automatically on the player's next
   booking (any court or table): if it covers the price the booking is confirmed at once; if
-  not, the rest is paid by GCash and the credit comes back if that hold ends unpaid.
+  not, the rest is paid using an enabled method and the credit comes back if that hold ends unpaid.
 - The closure, the cancellations, the credits, the ledger, the notices and the audit row are one
   database transaction. Every credit change is a row in `credit_transactions`, and a credit's
   `remaining` always equals the sum of its ledger.
@@ -110,15 +110,68 @@ verified, counted on the day they verified it:
 Each booking is one ledger row, so resubmitted proofs never double count. `amount_due` is the
 cash part: booking credit used to pay (`credit_applied`) is never counted as collected cash. Days, weeks
 (Monday–Sunday), months and years use facility time (`TZ_OFFSET_MINUTES`, Asia/Manila).
-GCash is the only payment method the app records. The API is
+Configured payment methods (including disabled/removed methods with historical payments)
+are available in ledger filters and exports. The API is
 `GET /api/admin/revenue/summary`, `/ledger` and `/export`. The CSV is built in parts of
-1,000 rows (`?part=N`, about 4 ms of Worker CPU each, so it fits the Free plan); the page
+1,000 rows (`?part=N`); deployed CPU and database usage must be measured on the intended plan. The page
 fetches every part and saves one file of up to 50,000 rows. If payments change between
 parts, the page starts the file over. Each export is logged in `audit_log`.
 
+## Payment methods and mobile admin UI
+
+Admin Settings supports adding, editing, disabling and removing payment methods.
+Only the method name is required; account name, account number and a QR image are
+optional. Each method saves independently of the other settings. QR images use
+the existing private R2 bucket, image validation and durable upload/cleanup tracking.
+The booker selects an enabled method and sees only its configured instructions.
+Submitted proofs retain the method name and recipient details, so later admin
+edits/removal do not alter payment history or staff verification.
+
+Apply **migration 0020** after the existing migrations before deploying this API
+and frontend together. It migrates the current GCash settings and labels existing
+online payments as GCash. Legacy GCash settings, QR endpoints and proof clients
+remain supported; omitted proof selections use GCash only when it is still enabled.
+The existing `payment_method` column retains its cash-channel enum; new
+`payment_method_id` and snapshot columns identify configurable online methods.
+No new Cloudflare binding or storage bucket is required.
+
+Revenue cards form a 2×2 mobile grid. Ledger filters start collapsed on phones,
+and CSV export stays at the header's right edge. Dashboard collected revenue
+uses verification date, matching the revenue report. Facility segments represent
+availability **right now**, including opening hours, closures, maintenance,
+disabled resources and occupying bookings; open play remains open/in service.
+Counts include disabled facilities so they appear as unavailable segments.
+
+`npm run test:payment-methods` runs isolated migration/API/storage/accounting tests.
+`npm run test:mobile-payments` uses the read-only browser fixture server at
+localhost:8805 (or `BASE_URL`) for 320, 375, 390, 430 and 1440px UI checks.
+Both suites are included in `npm run verify`.
+
+## Facility location and console calendar
+
+Admin Settings → Facility info includes an optional **Maps location link**.
+Paste an HTTPS map share URL to set the precise location used by Directions on
+the public site and player home screen. Clearing it restores directions based
+on the address. This uses the existing settings table; no additional migration
+or Cloudflare binding is required.
+
+The admin/staff calendar combines the date picker and day navigation with a
+14-day strip of live availability. It retains the resource/time grid and booking
+review links. Resource labels and time headings stay visible while scrolling;
+phones have swipe support and explicit earlier/later time controls. Date,
+activity and Today controls remain available at phone, tablet and desktop sizes.
+Changes cancel older requests so delayed responses cannot replace the current
+date/filter. The grid refreshes using the existing visibility-aware polling.
+
+`npm run test:calendar-maps` checks settings persistence, authorization, URL
+validation, Directions fallback and the real console availability API using
+isolated SQLite fixtures. `npm run test:calendar-maps-ui` uses the read-only
+browser fixture at localhost:8805 (or `BASE_URL`) for responsive calendar,
+settings and Directions checks. Both are included in `npm run verify`.
+
 ## Run it locally
 
-Requires Node.js 20 or newer.
+Requires Node.js 24 or newer.
 
 ```bash
 npm install
@@ -177,7 +230,7 @@ for isolated date, payment-transition, schedule-race, refund/booking replay, mai
 Booking creation now requires an `Idempotency-Key` header; see [specs/readiness-recovery.md](specs/readiness-recovery.md) for client compatibility, bounded catch-up, current quota projections and remaining staging checks.
 Outbox claims, replay bounds and safe rollback are described in [specs/readiness-outbox.md](specs/readiness-outbox.md).
 Image acceptance and upload recovery are described in [specs/readiness-storage.md](specs/readiness-storage.md).
-The new Worker requires migrations **0009–0015**. Follow the readiness migration/recovery
+The new Worker requires migrations **0009–0021**. Follow the readiness migration/recovery
 procedure before any live rollout; current local test results do not establish production readiness.
 
 Credential/session versioning and administrative reset requirements are described in
@@ -186,6 +239,28 @@ initiating live session. Resetting credentials, changing roles or disabling an a
 invalidates earlier versions; re-enabling an account does not revive old sessions.
 Provisioning with `npm run create-admin` requires migration 0015 and rejects a concurrent
 account change instead of silently replacing its credentials.
+
+Administrators can manage staff at `/admin/staff` (sidebar or mobile **More**, above
+Settings): search/filter the paginated list, add an account, edit its name/email,
+activate/deactivate it, or reset its password after confirming their own administrator
+password. Accounts use email sign-in and always receive the Staff role. New accounts
+do not replace the administrator's session. Password resets and email/status changes
+revoke every staff session; activation requires a fresh sign-in at `/staff/login`.
+The API uses `/api/admin/staff` for listing/creation, `PATCH /api/admin/staff/:id`
+for edits/status, and `POST /api/admin/staff/:id/reset-password` for resets.
+Edits/resets require the returned `authVersion` and `updatedAt` as
+`expectedAuthVersion` and `expectedUpdatedAt`, so a stale form cannot overwrite a
+later change. Account responses omit credential and session data.
+
+Apply **migration 0021** before deploying these Worker changes. It adds the staff
+list index, includes email changes in session versioning, and creates a constant
+authorization assertion table. Staff operations recheck the acting account and live
+session within the transaction that performs the write, so a request paused before
+deactivation cannot commit afterward. Existing accounts and valid sessions are
+preserved by the migration. Run `npm run test:staff` for isolated account/security
+regressions and `npm run test:staff-ui` with the local fixture server running for
+responsive forms and navigation. `npm run verify` includes both suites and staff
+login/revocation tests against disposable local D1.
 
 Route cancellation, authentication generations and dialog/listener cleanup are described in
 [specs/readiness-lifecycle.md](specs/readiness-lifecycle.md). `npm run test:readiness`
@@ -235,6 +310,14 @@ Linux CI uses `npx playwright install --with-deps chromium`. Verification checks
 See [history/time/auth contracts](specs/readiness-remaining.md), [toolchain and CI evidence](specs/readiness-tooling.md), and [migration, retention, recovery and incident procedures](specs/readiness-operations.md). Existing-account operator recovery is `npm run recover-account` (local by default); remote recovery needs an explicitly mapped named environment and the reviewed identity/recovery procedure. Production readiness remains tracked in [SYSTEM_REPORT_IMPLEMENTATION.md](SYSTEM_REPORT_IMPLEMENTATION.md).
 
 ## Deploy to Cloudflare
+
+The [8 October concurrency audit](specs/concurrency-audit-2026-10-08.md) records simultaneous
+booking tests through 50 players, the implemented race fixes, and remaining production gates.
+`npm run test:concurrency` creates disposable local D1/R2 state and runs actual HTTP workloads;
+`npm run test:concurrency:regressions` exercises forced interleavings and browser behavior.
+Before rollout, run [the resource-name preflight](scripts/audit-resource-names.sql), reconcile
+duplicate physical mappings, and apply migrations 0017–0019 in order. Updated staff decisions
+require `proofId`, so deploy the API and frontend together and refresh cached clients.
 
 Password derivation (PBKDF2) runs in the browser; the Worker verifies an HMAC and
 performs authentication database work. Image uploads validate container bytes and
@@ -287,11 +370,12 @@ See [the workload budget](specs/readiness-recovery.md) and
    ```bash
    npm run create-admin -- --remote
    ```
-   Use `--role staff` for front-desk accounts. Staff sign in at `/staff/login` and can verify
+   After signing in, use **Staff Management → Add Staff** for front-desk accounts;
+   `--role staff` remains available for command-line provisioning. Staff sign in at `/staff/login` and can verify
    payments and manage courts, hours and closed dates, but can't open Settings or change prices.
    Running the script again for the same email resets that account's password and role.
-9. Sign in at `/admin/login` → **Settings**. Set the GCash account name and number, upload the
-   GCash QR, add alert email addresses and the facility address, and check the prices.
+9. Sign in at `/admin/login` → **Settings**. Configure the payment methods and their optional
+   account details/QR images, add alert email addresses and the facility address, and check the prices.
 
 Existing deployments need no database migration for roles: `users.role` already holds
 `player`, `staff` or `admin`. After deploying, staff accounts that used `/admin/` are sent to
@@ -345,14 +429,14 @@ contract; historical queued texts must be reviewed before sending.
     |---|---|
     | `/api/bookings/*`, `/api/credits/*`, `/api/notifications/*`, `/api/availability*` | players (their own bookings and credits only) |
     | `/api/staff/*` | staff and admins: dashboard, verification, bookings, chat, staff notifications, schedule, courts, hours, closures, disruptions (cancel & credit), credit lookups |
-    | `/api/admin/*` | admins: the same operations, plus settings, GCash QR, prices, the outbox, revenue (`/api/admin/revenue/*`) and credit changes (`/api/admin/credits/*`) |
+    | `/api/admin/*` | admins: the same operations, plus staff account management (`/api/admin/staff/*`), settings, payment methods and QR images, prices, the outbox, revenue (`/api/admin/revenue/*`) and credit changes (`/api/admin/credits/*`) |
     | `/api/me`, `/api/auth/*`, `/api/files/proofs/:id`, `/api/facility*` | shared, checked per route |
 
     Missing or expired sessions get `401`; signed-in accounts without the role get `403`, and
     the attempt goes to `audit_log` (`forbidden_access`). The consoles and their navigation only
     reflect this; they are not the security boundary.
-  - Nobody can change a role through the app. Staff and admin accounts are created with
-    `npm run create-admin`.
+  - Nobody can change a role through the app. Administrators create Staff accounts in
+    **Staff Management**; `npm run create-admin` also provisions staff/admin accounts.
 - **Facility changes never cancel bookings on their own.** Putting a court into maintenance or
   open play (free for all: players see it marked OPEN PLAY and can't book it), disabling it,
   closing a date or time, or changing weekly hours first lists the active bookings it would
@@ -376,7 +460,9 @@ contract; historical queued texts must be reviewed before sending.
   (`Secure` over HTTPS). Only its SHA-256 is stored.
   - Player sessions last 30 days and extend with use. Unticking "Keep me logged in"
     ends the session when the browser closes.
-  - Staff sessions end 12 hours after sign-in.
+  - Staff and administrator sessions end 12 hours after sign-in. Every request checks
+    the current account status and credential version; staff writes also check the
+    acting session within their database transaction.
 - **Rate limits** apply to salt lookups and sign-in (per IP and per email; temporary 15-minute
   windows, never a permanent lockout), registration, password changes, holds, uploads and chat messages.
 - **Cross-site requests.** Every state-changing request must come from the app's own
@@ -401,7 +487,7 @@ contract; historical queued texts must be reviewed before sending.
     its own; ICC profiles and supported rendering/color information are retained.
     This validates containers without decoding compressed pixels or sanitizing ICC
     profile internals. It cannot prove every accepted bitstream is decodable or erase
-    information visible in pixels. The same contract applies to GCash QR uploads.
+    information visible in pixels. The same contract applies to payment-method QR uploads.
   - Upload ownership is stored before R2 writes; attachment commits with the proof
     or QR setting. Failed/abandoned uploads receive fenced cleanup and retry records.
     Settings → Upload recovery shows pending work and manual review counts. Historical
@@ -435,7 +521,7 @@ public/                 static PWA (player app at /, staff console at /staff/, a
 src/worker/             Hono API (TypeScript)
   routes/               auth, facility/availability, bookings, notifications/files,
                         admin.ts (operations, served at /api/staff and /api/admin),
-                        admin-settings.ts (admin only), facilities.ts (courts, hours, closures),
+                        admin-settings.ts and admin-staff.ts (admin only), facilities.ts (courts, hours, closures),
                         disruptions.ts (cancel & credit), credits.ts (players, staff, admin),
                         revenue.ts (admin only: revenue summary, ledger, CSV)
   lib/                  bookings, payments, availability, facility, disruptions, credits, chat, notify, images, auth, …
@@ -448,8 +534,7 @@ specs/                  technical design
 
 ## Not in this version
 
-Tournaments, user and staff account management screens (accounts are created with
-`npm run create-admin`, and membership is still confirmed in the database), moving a booking
+Tournaments, player account management screens (membership is still confirmed in the database), moving a booking
 to another court or time, staff booking for a walk-in player with their credit, credit expiry
 (no policy decided), a real SMS provider, push notifications, and live WebSocket chat (the app
 refreshes active screens every 10–60 seconds, with hidden/offline/idle pauses).

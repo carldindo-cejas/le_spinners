@@ -14,6 +14,7 @@ import { bookingCreditInfo } from '../lib/disruptions';
 import { ApiError, badRequest, conflict, notFound, unprocessable } from '../lib/errors';
 import { listProofs, proofLink, submitProof } from '../lib/payments';
 import { loadSettings, publicSettings } from '../lib/settings';
+import { listPaymentMethods } from '../lib/payment-methods';
 import { localNow, offsetMinutes, peso } from '../lib/time';
 import { jsonBody, parse, query, zDate, zId, zIdempotencyKey } from '../lib/validate';
 
@@ -67,7 +68,7 @@ async function playerDetail(c: AppContext, b: BookingJoin, now: number) {
         }
       : null,
     payment: booking.canSubmitProof
-      ? { gcashName: pub.gcash.name, gcashNumber: pub.gcash.number, hasQr: pub.gcash.hasQr, qrUrl: pub.gcash.hasQr ? '/api/facility/gcash-qr' : null, maxUploadMb: pub.rules.maxUploadMb }
+      ? { methods: await listPaymentMethods(c.env.DB, true), gcashName: pub.gcash.name, gcashNumber: pub.gcash.number, hasQr: pub.gcash.hasQr, qrUrl: pub.gcash.hasQr ? '/api/facility/gcash-qr' : null, maxUploadMb: pub.rules.maxUploadMb }
       : null,
   };
 }
@@ -146,12 +147,12 @@ bookingRoutes.post('/', async (c) => {
   const user = requirePlayer(c);
   const idempotencyKey = parse(zIdempotencyKey, c.req.header('Idempotency-Key') ?? '');
   const body = await jsonBody(c, holdSchema);
-  await enforceRateLimit(c.env.DB, `hold:user:${user.id}`, 20, 60 * MINUTE);
   const settings = await loadSettings(c.env.DB);
   const input = { resourceId: body.resourceId, date: body.date, starts: requestedStarts(body, settings.slotMinutes) };
   const now = Date.now();
   try {
-    const b = await createHold(c.env, settings, user, { ...input, idempotencyKey, useCredit: body.useCredit ?? false, expectedCredit: body.expectedCredit ?? null }, now);
+    const b = await createHold(c.env, settings, user, { ...input, idempotencyKey, useCredit: body.useCredit ?? false, expectedCredit: body.expectedCredit ?? null }, now,
+      () => enforceRateLimit(c.env.DB, `hold:user:${user.id}`, 20, 60 * MINUTE));
     return c.json(await playerDetail(c, b, now), 201);
   } catch (err) {
     if (err instanceof ApiError && err.code === 'SLOT_TAKEN') {
@@ -185,7 +186,7 @@ const zGcashRef = z
   .regex(/^[A-Za-z0-9 -]*$/, 'Use letters and numbers only.')
   .transform((v) => v.replace(/\s+/g, ' ') || null);
 
-/** Upload a GCash screenshot (multipart: file, gcashRef?, amountPesos?). */
+/** Upload payment proof (multipart: file, paymentMethodId?, gcashRef?, amountPesos?). */
 bookingRoutes.post('/:id/proof', async (c) => {
   const user = requirePlayer(c);
   const b = await ownBooking(c, user);
@@ -197,13 +198,15 @@ bookingRoutes.post('/:id/proof', async (c) => {
     throw badRequest('Send the screenshot as a file upload.');
   }
   const file = form.get('file');
-  if (!(file instanceof File)) throw unprocessable('FILE_REQUIRED', 'Choose your GCash screenshot to upload.', { file: ['Choose a screenshot.'] });
+  if (!(file instanceof File)) throw unprocessable('FILE_REQUIRED', 'Choose your payment screenshot to upload.', { file: ['Choose a screenshot.'] });
   const refRaw = form.get('gcashRef');
   const gcashRef = parse(zGcashRef, typeof refRaw === 'string' ? refRaw : '');
   const amount = parseAmountPesos(form.get('amountPesos'));
+  const methodRaw = form.get('paymentMethodId');
+  const paymentMethodId = methodRaw === null ? undefined : parse(zId, methodRaw);
   const settings = await loadSettings(c.env.DB);
   const now = Date.now();
-  const updated = await submitProof(c.env, settings, user, b.id, file, { gcashRef, amount }, now);
+  const updated = await submitProof(c.env, settings, user, b.id, file, { gcashRef, amount, paymentMethodId }, now);
   return c.json(await playerDetail(c, updated, now), 201);
 });
 

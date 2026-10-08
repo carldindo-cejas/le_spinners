@@ -33,10 +33,19 @@ function toError(status, data) {
   return new ApiError(status, e.code || `HTTP_${status}`, e.message || 'Something went wrong. Please try again.', e.details, e.requestId);
 }
 
-async function request(method, path, { body, signal, scope, quiet401 = false, headers: extra = {} } = {}) {
+async function request(method, path, { body, signal, scope, quiet401 = false, headers: extra = {}, timeoutMs = 30_000 } = {}) {
   const guard = requestGuard({ signal, scope });
-  try {
+  const controller = new AbortController();
+  let timedOut = false;
+  const cancel = () => controller.abort();
+  guard.signal.addEventListener('abort', cancel, { once: true });
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  const check = () => {
     guard.check();
+    if (timedOut) throw new ApiError(0, 'NETWORK', 'The request took too long. Try again to check whether it completed.');
+  };
+  try {
+    check();
     const headers = { ...extra, Accept: 'application/json' };
     let payload;
     if (body !== undefined && method !== 'GET') {
@@ -45,23 +54,27 @@ async function request(method, path, { body, signal, scope, quiet401 = false, he
     }
     let res;
     try {
-      res = await fetch(path, { method, headers, body: payload, credentials: 'same-origin', signal: guard.signal, cache: 'no-store' });
+      res = await fetch(path, { method, headers, body: payload, credentials: 'same-origin', signal: controller.signal, cache: 'no-store' });
     } catch (err) {
-      guard.check();
+      check();
       if (err && err.name === 'AbortError') throw err;
       throw networkError();
     }
     let data = null;
-    guard.check();
+    check();
     if ((res.headers.get('content-type') || '').includes('application/json')) data = await res.json().catch(() => null);
-    guard.check();
+    check();
     if (!res.ok) {
       const err = toError(res.status, data);
       if (res.status === 401 && !quiet401) for (const fn of unauthorizedListeners) fn(err);
       throw err;
     }
     return data;
-  } finally { guard.release(); }
+  } finally {
+    clearTimeout(timer);
+    guard.signal.removeEventListener('abort', cancel);
+    guard.release();
+  }
 }
 
 /** Multipart upload with progress (fetch can't report upload progress). */

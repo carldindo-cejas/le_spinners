@@ -865,7 +865,7 @@ export async function applyDisruption(
   );
 
   try {
-    await scheduleBatch(db, plan.scheduleVersion, stmts);
+    await scheduleBatch(db, plan.scheduleVersion, stmts, actor);
   } catch (err) {
     // A same-key winner may have changed the revision before this batch started.
     const won = await db.prepare('SELECT id, request_hash FROM disruptions WHERE idempotency_key = ?').bind(idempotencyKey).first<{ id: string; request_hash: string }>();
@@ -947,7 +947,7 @@ export async function resolveItem(c: AppContext, actor: SessionUser, disruptionI
         .prepare(`UPDATE disruption_items SET outcome = 'skipped', skip_reason = ?3, resolved_at = ?4 WHERE disruption_id = ?1 AND booking_id = ?2 AND ${OPEN_ITEM('disruption_items')}`)
         .bind(disruptionId, bookingId, reason, now),
       resolveNoticeStmt(db, disruptionId, now),
-    ]);
+    ], actor);
     return { outcome: 'skipped' as const, reason };
   }
   if (p.action === 'defer') {
@@ -971,7 +971,7 @@ export async function resolveItem(c: AppContext, actor: SessionUser, disruptionI
     ...effectStatements(ctx),
     resolveNoticeStmt(db, disruptionId, now),
     auditStmt(db, actor.id, 'disruption_item_applied', disruptionId, { bookingId, action: p.action, credit: p.credit }, ip, now),
-  ]);
+  ], actor);
   if (!row?.meta.changes) throw conflict('ITEM_RESOLVED', 'This booking was already handled.');
   const after = await db
     .prepare('SELECT outcome, credit_amount FROM disruption_items WHERE disruption_id = ? AND booking_id = ?')

@@ -1,18 +1,19 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
-import type { AppEnv, ResourceRow } from '../types';
+import type { AppContext, AppEnv, ResourceRow } from '../types';
 import { audit, clientIp, requireAdmin } from '../lib/auth';
 import { resourceStatus, type HoursRow } from '../lib/bookings';
 import { newId } from '../lib/crypto';
-import { ApiError, badRequest, unprocessable } from '../lib/errors';
+import { ApiError, badRequest, notFound, unprocessable } from '../lib/errors';
+import { listPaymentMethods, paymentMethodSchema, type PaymentMethodRow } from '../lib/payment-methods';
 import { sniffImage, stripMetadata } from '../lib/images';
 import { invalidateSettings, loadSettings } from '../lib/settings';
 import { dateLabel, hoursLabel, peso } from '../lib/time';
 import { resourceUpdateSchema, updateResource } from '../lib/facility';
 import { listOutbox } from '../lib/outbox';
-import { beginUpload, commitQrUpload, markUploadStored, recoverUploadFailure, removeQr, storageHealth } from '../lib/storage';
+import { beginUpload, commitQrUpload, commitMethodQrUpload, markUploadStored, recoverUploadFailure, removeQr, removeMethodQr, storageHealth } from '../lib/storage';
 import { jsonBody, parse, query, zId } from '../lib/validate';
-import { zEmail } from './auth';
+import { zEmail } from '../lib/auth-validation';
 
 export const adminSettingsRoutes = new Hono<AppEnv>();
 
@@ -34,9 +35,11 @@ adminSettingsRoutes.get('/settings', async (c) => {
   ]);
   return c.json({
     canEdit: user.role === 'admin',
+    paymentMethods: await listPaymentMethods(db),
     settings: {
       facilityName: s.facilityName,
       facilityAddress: s.facilityAddress,
+      facilityMapsUrl: s.facilityMapsUrl,
       gcashName: s.gcashName,
       gcashNumber: s.gcashNumber,
       hasQr: Boolean(s.gcashQrKey),
@@ -85,6 +88,13 @@ const zPhone = z
 const settingsSchema = z.object({
   facilityName: z.string().trim().min(2, 'Enter the facility name.').max(80).optional(),
   facilityAddress: z.string().trim().max(200).optional(),
+  facilityMapsUrl: z.string().trim().max(2048).refine(value => {
+    if (!value) return true;
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' && Boolean(url.hostname) && !url.username && !url.password && !/[\u0000-\u001f\u007f]/.test(value);
+    } catch { return false; }
+  }, 'Enter a full HTTPS Maps link, or leave this blank to use the address.').optional(),
   gcashName: z.string().trim().min(2, 'Enter the GCash account name.').max(80).optional(),
   gcashNumber: z
     .string()
@@ -102,6 +112,7 @@ const settingsSchema = z.object({
 const SETTING_KEYS: Record<keyof z.infer<typeof settingsSchema>, string> = {
   facilityName: 'facility_name',
   facilityAddress: 'facility_address',
+  facilityMapsUrl: 'facility_maps_url',
   gcashName: 'gcash_name',
   gcashNumber: 'gcash_number',
   holdMinutes: 'hold_minutes',
@@ -140,38 +151,100 @@ adminSettingsRoutes.put('/settings', async (c) => {
   return c.json({ ok: true, changed });
 });
 
-/** Upload the GCash QR image players scan on the payment screen. */
-adminSettingsRoutes.put('/settings/gcash-qr', async (c) => {
+async function configuredMethod(db: D1Database, id: string) {
+  const method = await db.prepare('SELECT * FROM payment_methods WHERE id=? AND deleted_at IS NULL').bind(id).first<PaymentMethodRow>();
+  if (!method) throw notFound('Payment method not found.');
+  return method;
+}
+
+adminSettingsRoutes.post('/payment-methods', async (c) => {
+  const admin = requireAdmin(c);
+  const body = await jsonBody(c, paymentMethodSchema);
+  const id = newId('pm_');
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO payment_methods(id,name,account_name,account_number,enabled,created_at,updated_at,updated_by)
+      VALUES(?,?,?,?,?,?,?,?)`).bind(id, body.name, body.accountName || null, body.accountNumber || null, Number(body.enabled), now, now, admin.id),
+    c.env.DB.prepare(`INSERT INTO audit_log(actor_id,action,entity,entity_id,ip,created_at)
+      VALUES(?,'payment_method_added','payment_method',?,?,?)`).bind(admin.id, id, clientIp(c), now),
+  ]);
+  return c.json({ ok: true, id }, 201);
+});
+
+adminSettingsRoutes.put('/payment-methods/:id', async (c) => {
+  const admin = requireAdmin(c);
+  const id = parse(zId, c.req.param('id'));
+  await configuredMethod(c.env.DB, id);
+  const body = await jsonBody(c, paymentMethodSchema);
+  const now = Date.now();
+  const statements = [c.env.DB.prepare(`UPDATE payment_methods SET name=?,account_name=?,account_number=?,enabled=?,updated_at=?,updated_by=?
+    WHERE id=? AND deleted_at IS NULL`).bind(body.name, body.accountName || null, body.accountNumber || null, Number(body.enabled), now, admin.id, id)];
+  if (id === 'gcash') for (const [key, value] of [['gcash_name', body.accountName || ''], ['gcash_number', body.accountNumber || '']]) {
+    statements.push(upsertSetting(c.env.DB, key!, value!, now, admin.id));
+  }
+  statements.push(c.env.DB.prepare(`INSERT INTO audit_log(actor_id,action,entity,entity_id,ip,created_at)
+    SELECT ?,'payment_method_updated','payment_method',?,?,? WHERE EXISTS (SELECT 1 FROM payment_methods WHERE id=? AND deleted_at IS NULL)`)
+    .bind(admin.id, id, clientIp(c), now, id));
+  const results = await c.env.DB.batch(statements);
+  if (!results[0]?.meta.changes) throw notFound('Payment method no longer exists.');
+  invalidateSettings();
+  return c.json({ ok: true });
+});
+
+adminSettingsRoutes.delete('/payment-methods/:id', async (c) => {
+  const admin = requireAdmin(c);
+  const id = parse(zId, c.req.param('id'));
+  await configuredMethod(c.env.DB, id);
+  await removeMethodQr(c.env, admin, id, clientIp(c), true);
+  return c.json({ ok: true });
+});
+
+/** Both QR interfaces use the same validation, staging and uncertain-commit recovery. */
+async function storeQrImage(c: AppContext, methodId?: string) {
   const admin = requireAdmin(c);
   let form: FormData;
-  try {
-    form = await c.req.formData();
-  } catch {
-    throw badRequest('Send the QR image as a file upload.');
-  }
+  try { form = await c.req.formData(); } catch { throw badRequest('Send the QR image as a file upload.'); }
   const file = form.get('file');
   if (!(file instanceof File)) throw unprocessable('FILE_REQUIRED', 'Choose the QR image to upload.');
   if (file.size > QR_MAX_BYTES) throw new ApiError(413, 'FILE_TOO_LARGE', 'The QR image is too large. The limit is 5 MB.');
   const bytes = new Uint8Array(await file.arrayBuffer());
   const kind = sniffImage(bytes);
   if (!kind) throw unprocessable('UNSUPPORTED_FILE_TYPE', 'Upload the QR code as a JPG, PNG or WEBP image.');
-  const clean = stripMetadata(bytes,kind);
-  const key = `settings/gcash-qr/${newId()}.${kind.ext}`;
-  const upload = await beginUpload(c.env,key,'qr',admin.id,null);
+  const clean = stripMetadata(bytes, kind);
+  const upload = await beginUpload(c.env, `settings/gcash-qr/${newId()}.${kind.ext}`, 'qr', admin.id, null);
   try {
-    const object = await c.env.PROOFS.put(key,clean,{httpMetadata:{contentType:kind.type},customMetadata:{uploadId:upload.id}});
+    const object = await c.env.PROOFS.put(upload.key, clean, { httpMetadata: { contentType: kind.type }, customMetadata: { uploadId: upload.id } });
     if (!object) throw new Error('R2 upload was not stored');
-    await markUploadStored(c.env,upload);
-    await commitQrUpload(c.env,admin,upload,clientIp(c));
+    await markUploadStored(c.env, upload);
+    if (methodId) await commitMethodQrUpload(c.env, admin, upload, methodId, clientIp(c));
+    else await commitQrUpload(c.env, admin, upload, clientIp(c));
   } catch (error) {
-    await recoverUploadFailure(c.env,upload);
-    // The audit carries the intent identity, even if another administrator has since replaced it.
-    let saved = false;
-    try { saved = Boolean(await c.env.DB.prepare("SELECT id FROM audit_log WHERE action='gcash_qr_updated' AND detail=? LIMIT 1").bind(upload.id).first()); }
-    catch { /* A durable staged/attached checkpoint survives unknown database state. */ }
+    await recoverUploadFailure(c.env, upload);
+    const saved = await c.env.DB.prepare('SELECT id FROM audit_log WHERE action=? AND detail=? LIMIT 1')
+      .bind(methodId ? 'payment_method_qr_updated' : 'gcash_qr_updated', upload.id).first().catch(() => null);
     if (!saved) throw error;
     invalidateSettings();
   }
+}
+
+adminSettingsRoutes.put('/payment-methods/:id/qr', async (c) => {
+  const id = parse(zId, c.req.param('id'));
+  await configuredMethod(c.env.DB, id);
+  await storeQrImage(c, id);
+  return c.json({ ok: true });
+});
+
+adminSettingsRoutes.delete('/payment-methods/:id/qr', async (c) => {
+  const admin = requireAdmin(c);
+  const id = parse(zId, c.req.param('id'));
+  await configuredMethod(c.env.DB, id);
+  await removeMethodQr(c.env, admin, id, clientIp(c));
+  return c.json({ ok: true });
+});
+
+/** Upload the GCash QR image players scan on the payment screen. */
+adminSettingsRoutes.put('/settings/gcash-qr', async (c) => {
+  await storeQrImage(c);
   return c.json({ ok: true, qrUrl: '/api/facility/gcash-qr' });
 });
 

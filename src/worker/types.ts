@@ -77,6 +77,7 @@ export type BookingRow = {
   start_min: number;
   end_min: number;
   status: BookingStatus;
+  transition_id: string | null;
   amount_due: number;
   rate: 'member' | 'non_member';
   hold_expires_at: number | null;
@@ -95,6 +96,8 @@ export type BookingRow = {
   /** Console bookings: who the booking is for, as typed by staff (the account is still the staff member's). */
   booker_name: string | null;
   payment_method: PaymentMethod;
+  payment_method_id?: string | null;
+  payment_method_name?: string | null;
   /** Credit value used to pay for the booking; amount_due is the cash part. */
   credit_applied: number;
   /** Value already credited back for this booking (disruptions). */
@@ -119,6 +122,10 @@ export type ProofRow = {
   original_name: string | null;
   gcash_ref: string | null;
   amount_claimed: number | null;
+  payment_method_id?: string | null;
+  payment_method_name?: string | null;
+  account_name?: string | null;
+  account_number?: string | null;
   status: 'submitted' | 'approved' | 'rejected';
   created_at: number;
 };
