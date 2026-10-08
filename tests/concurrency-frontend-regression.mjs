@@ -49,7 +49,7 @@ async function app(t, role, extra) {
     if (p.endsWith('/rules')) return route.fulfill({ json: { settings: facility.rules } });
     if (p.endsWith('/badges')) return route.fulfill({ json: { notifications: 0, chats: 0, holds: [], unresolved: 0, pendingVerification: 0 } });
     if (p.endsWith('/schedule') || p === '/api/availability') return route.fulfill({ json: day(url.searchParams.get('activity')) });
-    if (p === '/api/bookings/quote') return route.fulfill({ json: { price: 50_000, amountDue: 50_000, creditApplied: 0 } });
+    if (p === '/api/bookings/quote') return route.fulfill({ json: { price: 50_000, amountDue: 50_000, creditApplied: 0, personalOverlaps: [] } });
     if (p === '/api/bookings/synthetic-booking') return route.fulfill({ json: { now, booking, actions: {}, proofs: [], timeline: [], payment: { methods: [{ id: 'gcash', name: 'GCash', accountName: 'Synthetic', accountNumber: '09000000000', qrUrl: null, enabled: true }], gcashName: 'Synthetic', gcashNumber: '09000000000', hasQr: false } } });
     return route.fulfill({ json: {} });
   });

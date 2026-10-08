@@ -4,7 +4,7 @@ import type { AppContext, AppEnv, SessionUser } from '../types';
 import { alternativesFor } from '../lib/availability';
 import { enforceRateLimit, requirePlayer } from '../lib/auth';
 import {
-  BOOKING_SELECT, bookingDTO, cancelByPlayer, createHold, creditQuote, PICK_A_TIME, hasSlotPick, listEvents, releaseHold, requestedStarts, zSlotPick,
+  BOOKING_SELECT, bookingDTO, cancelByPlayer, createHold, creditQuote, personalOverlaps, PICK_A_TIME, hasSlotPick, listEvents, releaseHold, requestedStarts, zSlotPick,
   type BookingJoin,
 } from '../lib/bookings';
 import { MESSAGE_MAX_CHARS, listMessages, markRead, playerUnreadChats, postMessage } from '../lib/chat';
@@ -115,7 +115,7 @@ const holdSchema = z
   })
   .refine(hasSlotPick, PICK_A_TIME);
 
-/** The price of some slots and how much of it the player's booking credit would pay. Holds nothing. */
+/** Price, credit, and advisory personal overlaps for review. Holds nothing; date is optional for legacy clients. */
 bookingRoutes.get('/quote', async (c) => {
   const user = requirePlayer(c);
   const q = query(
@@ -123,16 +123,25 @@ bookingRoutes.get('/quote', async (c) => {
     z.object({
       resourceId: zId,
       starts: z.string().regex(/^\d{1,4}(,\d{1,4}){0,95}$/, 'List start minutes like 960,1080'),
+      date: zDate.optional(),
     }),
   );
   const resource = await c.env.DB.prepare('SELECT price_member, price_non_member FROM resources WHERE id = ?')
     .bind(q.resourceId)
     .first<{ price_member: number; price_non_member: number }>();
   if (!resource) throw notFound('Court or table not found.');
-  const slots = new Set(q.starts.split(',').map(Number)).size;
+  const starts = parse(z.array(z.number().int().min(0).max(1439)), q.starts.split(',').map(Number));
+  const slots = new Set(starts).size;
   const price = (user.membership === 'member' ? resource.price_member : resource.price_non_member) * slots;
-  const quote = await creditQuote(c.env.DB, user.id, price, Date.now());
+  const now = Date.now();
+  const settings = await loadSettings(c.env.DB);
+  const [quote, overlaps] = await Promise.all([
+    creditQuote(c.env.DB, user.id, price, now),
+    q.date ? personalOverlaps(c.env.DB, user.id, { resourceId: q.resourceId, date: q.date, starts }, settings.slotMinutes, now) : Promise.resolve([]),
+  ]);
   return c.json({
+    now,
+    personalOverlaps: overlaps,
     price: quote.price,
     priceLabel: peso(quote.price),
     creditApplied: quote.creditApplied,

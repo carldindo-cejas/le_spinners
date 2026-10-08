@@ -569,7 +569,12 @@ let juanBooking;
   check('owner sees "mine"', mine?.state === 'mine' && mine.booking?.id === juanBooking.id, mine);
 
   const overlap = await juan.post('/api/bookings', { resourceId: 'court-2', date: D, start: slotA.start });
-  check('own overlapping booking → 422 OVERLAP_OWN', overlap.status === 422 && overlap.data.error.code === 'OVERLAP_OWN', overlap.data);
+  check('own overlapping booking on another facility → 201', overlap.status === 201 && overlap.data.booking?.status === 'TEMPORARY', overlap.data);
+  const overlapQuote = await juan.get(`/api/bookings/quote?resourceId=table-1&date=${D}&starts=${slotA.start}`);
+  check('review warns about both overlapping facilities', overlapQuote.status === 200 && overlapQuote.data.personalOverlaps?.length === 2, overlapQuote.data);
+  const sameFacility = await juan.post('/api/bookings', { resourceId: 'court-2', date: D, start: slotA.start });
+  check('same facility collision takes precedence over hold cap → 409', sameFacility.status === 409 && sameFacility.data.error.code === 'SLOT_TAKEN', sameFacility.data);
+  await juan.post(`/api/bookings/${overlap.data.booking.id}/release`, {});
 
   const second = await juan.post('/api/bookings', { resourceId: 'court-2', date: D, start: slotA.start + 60 });
   check('second hold allowed', second.status === 201, second.data);
@@ -1110,7 +1115,7 @@ section('Console bookings (personal bookings on site)');
   check('staff book on site free of charge → 201', staffFree.status === 201 && fb?.status === 'CONFIRMED' && fb?.amountDue === 0 && fb?.paymentMethod === 'none', staffFree.data);
   check('records the author: Staff · name', fb?.bookedBy?.source === 'staff' && Boolean(fb.bookedBy.name), fb?.bookedBy);
   const sameTime = await rhea.post('/api/staff/bookings', { resourceId: 'table-3', date: CD, start, rate: 'member', payment: 'none', bookerName: 'Rhea Lim' });
-  check('staff cannot double-book themselves → 422 OVERLAP_OWN', sameTime.status === 422 && sameTime.data.error.code === 'OVERLAP_OWN', sameTime.data);
+  check('staff can book different facilities at the same time → 201', sameTime.status === 201 && sameTime.data.booking?.status === 'CONFIRMED', sameTime.data);
 
   const ledger = await ana.get(`/api/admin/revenue/ledger?from=${localDate()}&to=${localDate()}&q=${b.ref}`);
   const row = ledger.data.rows?.find((r) => r.id === b.id);

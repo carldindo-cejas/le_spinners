@@ -230,7 +230,7 @@ try {
   const repeatBody = slot(0, 6), repeatKey = key();
   const repeated = await wave('10 identical request keys', Array.from({ length: 10 }, () => () => post('key replay', '/api/bookings', repeatBody, cookies[49], { 'Idempotency-Key': repeatKey })), rs => { rs.forEach(r => okay(r, [201])); assert.equal(new Set(rs.map(r => r.data.booking.id)).size, 1); });
   await release([{ booking: repeated[0].data.booking, cookie: cookies[49] }]);
-  const duplicate = await wave('10 same user different keys', Array.from({ length: 10 }, () => () => post('new key duplicate', '/api/bookings', slot(1, 6), cookies[48], { 'Idempotency-Key': key() })), rs => { assert.equal(rs.filter(r => r.status === 201).length, 1); rs.forEach(r => { okay(r, [201, 409, 422]); if (r.status === 422) assert.equal(r.data.error.code, 'OVERLAP_OWN'); if (r.status === 409) assert.ok(['SLOT_TAKEN', 'OVERLAP_OWN'].includes(r.data.error.code)); }); });
+  const duplicate = await wave('10 same user different keys', Array.from({ length: 10 }, () => () => post('new key duplicate', '/api/bookings', slot(1, 6), cookies[48], { 'Idempotency-Key': key() })), rs => { assert.equal(rs.filter(r => r.status === 201).length, 1); rs.forEach(r => { okay(r, [201, 409]); if (r.status === 409) assert.equal(r.data.error.code, 'SLOT_TAKEN'); }); });
   await release([{ booking: duplicate.find(r => r.status === 201).data.booking, cookie: cookies[48] }]);
   // Existing records expire at the exact coordinates being reused. Expiry is real clock based.
   const old = await prepare(10, 7);

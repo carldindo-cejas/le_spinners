@@ -600,7 +600,6 @@ const INVALID = {
   TIME_STARTED: { title: 'This time has already started', row: 'time', cta: 'Pick a later time', to: 'time' },
   OUTSIDE_WINDOW: { title: "That date isn't open yet", row: 'date', cta: 'Choose another date', to: 'date' },
   DATE_PAST: { title: 'That date has already passed', row: 'date', cta: 'Choose another date', to: 'date' },
-  OVERLAP_OWN: { title: 'You already play at this time', row: 'time', cta: 'See my bookings', to: 'bookings' },
   TOO_MANY_HOLDS: { title: 'You have unpaid holds', row: null, cta: 'See my bookings', to: 'bookings' },
   MAINTENANCE: { title: 'This is under maintenance', row: 'resource', cta: 'Choose another', to: 'resource' },
   OPEN_PLAY: { title: 'This is open play: free for all', row: 'resource', cta: 'Choose another', to: 'resource' },
@@ -629,6 +628,9 @@ export function reviewStep({ params }) {
   // The server's figures for the booking credit this booking would use (amounts never come from here).
   let quote = null;
   let useCredit = true;
+  let quoteLoading = true;
+  let quoteError = null;
+  let submitting = false;
   const credit = () => (quote && useCredit ? quote.creditApplied : 0);
   const due = () => (quote ? (useCredit ? quote.amountDue : quote.price) : amount);
   const coveredByCredit = () => credit() > 0 && due() === 0;
@@ -653,13 +655,29 @@ export function reviewStep({ params }) {
         <li><span class="n blue">2</span><span>Pay <b>${peso(due())}</b> using an enabled payment method and upload your screenshot.</span></li>
         <li><span class="n violet">3</span><span>Staff verify your payment. Then your booking is <b>confirmed</b>.</span></li>
       </ol>`;
-  const ctaLabel = () => (coveredByCredit() ? html`${icon('gift', 20)}Book with credit` : html`Reserve &amp; pay ${peso(due())}`);
+  const hasOverlap = () => Boolean(quote?.personalOverlaps.length);
+  const ctaLabel = () => hasOverlap()
+    ? (coveredByCredit() ? 'Continue with Credit' : 'Continue to Payment')
+    : (coveredByCredit() ? html`${icon('gift', 20)}Book with credit` : html`Reserve &amp; pay ${peso(due())}`);
+  const overlapNotice = () => {
+    if (quoteLoading) return html`<p class="small" role="status">Checking your booking details and existing reservations…</p>`;
+    if (quoteError) return html`<div class="banner warn booking-overlap" role="alert">${icon('alert', 20, 2.2)}
+      <div class="stack stack-8"><b>Couldn't check your existing bookings</b><p>Please retry before reserving so you can review any overlapping bookings.</p>
+        <button type="button" class="btn btn-secondary btn-sm" data-act="retry-quote">Retry</button></div></div>`;
+    if (!hasOverlap()) return '';
+    return html`<section class="banner warn booking-overlap" role="alert" aria-label="Overlapping booking warning">${icon('alert', 20, 2.2)}
+      <div class="stack stack-8"><b>You already have a booking during this time.</b>
+        <ul class="booking-overlap-list">${quote.personalOverlaps.map((booking) => html`<li>You have reserved <b>${booking.resourceName}</b> from ${booking.segments.map((segment) => rangeLabelFull(segment.start, segment.end)).join(', ')}.</li>`)}</ul>
+        <p>You're about to reserve <b>${res.name}</b> for ${timesLabel(starts, slotMin, { full: true })}.</p>
+        <p>You may be booking for a friend. Please review your reservation before proceeding.</p></div></section>`;
+  };
 
   const root = show(html`<div class="screen has-sticky screen-enter">
     ${wizardHeader({ step: 5, label: 'Review', sub: 'Almost there', backHref: timeHref, closeable: false })}
     ${rebookBanner(rebookContext(activity))}
     <h1 class="h1">Booking summary</h1>
     <div data-invalid></div>
+    <div data-overlap>${overlapNotice()}</div>
     <section class="card summary-card">
       <dl class="kv">
         <div><dt>Activity</dt><dd>${activityLabel(activity)}</dd></div>
@@ -678,8 +696,8 @@ export function reviewStep({ params }) {
     </section>
   </div>
   <div class="sticky-bar"><div class="sticky-inner" data-actions>
-    <button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="reserve">${ctaLabel()}</button>
-    <a class="btn btn-text btn-block" href="${timeHref}" data-back>Change booking</a>
+    <button type="button" class="btn btn-primary btn-lg btn-block glow" data-act="reserve" disabled>${ctaLabel()}</button>
+    <a class="btn btn-text btn-block" href="${timeHref}" data-change-booking>Change booking</a>
   </div></div>`);
   wireRebookBanner(root);
 
@@ -687,22 +705,45 @@ export function reviewStep({ params }) {
   const repaint = () => {
     render($('[data-money]', root), moneyRows());
     render($('[data-next]', root), nextSteps());
-    if (!reserve.disabled) render(reserve, ctaLabel());
+    render($('[data-overlap]', root), overlapNotice());
+    $('[data-change-booking]', root).textContent = hasOverlap() ? 'Review / Change Time' : 'Change booking';
+    reserve.disabled = submitting || quoteLoading || Boolean(quoteError);
+    if (!submitting) render(reserve, ctaLabel());
   };
   on(root, 'change', '[data-use-credit]', (_e, box) => {
     useCredit = box.checked;
     repaint();
   });
-  const loadQuote = () => api.get(`/api/bookings/quote?resourceId=${encodeURIComponent(resourceId)}&starts=${starts.join(',')}`).then((q) => {
-    quote = q;
+  const loadQuote = async () => {
+    quoteLoading = true;
+    quoteError = null;
     repaint();
-  });
-  loadQuote().catch(() => {
-    /* without a quote the booking still works; the next screen shows the server's amounts */
-  });
+    try {
+      const q = await api.get(`/api/bookings/quote?resourceId=${encodeURIComponent(resourceId)}&starts=${starts.join(',')}&date=${date}`);
+      const moneyValid = q && [q.price, q.creditApplied, q.amountDue].every((value) => Number.isSafeInteger(value) && value >= 0)
+        && q.creditApplied <= q.price && q.amountDue === q.price - q.creditApplied;
+      const overlapsValid = Array.isArray(q?.personalOverlaps) && q.personalOverlaps.every((booking) =>
+        booking && typeof booking.id === 'string' && booking.id && typeof booking.resourceId === 'string' && booking.resourceId && booking.resourceId !== resourceId
+        && typeof booking.resourceName === 'string' && booking.resourceName && booking.date === date
+        && ['TEMPORARY', 'REJECTED', 'PAYMENT_SUBMITTED', 'CONFIRMED'].includes(booking.status)
+        && Array.isArray(booking.segments) && booking.segments.length && booking.segments.every((segment) =>
+          segment && Number.isInteger(segment.start) && Number.isInteger(segment.end) && segment.start >= 0 && segment.end <= 1440 && segment.start < segment.end));
+      if (!moneyValid || !overlapsValid) throw new Error("Couldn't confirm the booking details. Please retry.");
+      quote = q;
+    } catch (err) {
+      quoteError = err;
+      throw err;
+    } finally {
+      quoteLoading = false;
+      repaint();
+    }
+  };
+  on(root, 'click', '[data-act="retry-quote"]', () => loadQuote().catch(() => {}));
+  loadQuote().catch(() => {});
 
   listen(reserve, 'click', async () => {
     if (reserve.disabled) return;
+    submitting = true;
     setBusy(reserve, true, coveredByCredit() ? 'Booking…' : 'Reserving…');
     const withCredit = Boolean(quote && quote.creditApplied > 0 && useCredit);
     try {
@@ -711,7 +752,9 @@ export function reviewStep({ params }) {
       const b = created.booking;
       navigate(b.status === 'CONFIRMED' ? `/bookings/${b.id}/confirmed` : `/bookings/${b.id}/held`, { replace: true });
     } catch (err) {
+      submitting = false;
       setBusy(reserve, false);
+      repaint();
       if (err.code === 'CREDIT_CHANGED') {
         await loadQuote().catch(() => {});
         toast(err.message, { type: 'warn', sub: 'Check the new total, then book again.' });
@@ -762,13 +805,13 @@ function openConflict(err, { activity, date, resourceId, starts, resName }) {
     if (a.start === starts[0]) return `Same time, another ${noun}`;
     return `Another ${noun}, ${minutesLabel(a.start)}`;
   };
-  const title = multi ? 'Some of your times were just taken' : 'This slot was just taken';
+  const title = multi ? 'Some of your times are already reserved' : 'This slot is already reserved';
   const m = openModal({
     sheet: true,
     role: 'alertdialog',
     label: title,
     content: () => html`<div class="row" data-gap="12"><span class="tile red">${icon('alert', 24)}</span><h2 class="h2">${title}</h2></div>
-      <p class="body">Another player reserved ${multi ? 'part of ' : ''}<b>${resName} · ${dateLabel(date)} · ${when(starts)}</b> a moment before you. Nothing was held or charged.</p>
+      <p class="body">${multi ? 'One or more selected times on ' : 'The selected time on '}<b>${resName} · ${dateLabel(date)} · ${when(starts)}</b> ${multi ? 'are' : 'is'} already reserved. Nothing was held or charged.</p>
       ${alts.length ? html`<p class="overline">${multi ? 'Other options' : 'Open times nearby'}</p>
         <div class="alt-list" role="radiogroup" aria-label="${multi ? 'Other options' : 'Open times nearby'}">${alts.map((a, i) => html`<button type="button" class="alt-option" role="radio" aria-checked="${pick === a ? 'true' : 'false'}" data-alt="${i}">
           <span class="radio"></span><span class="grow"><span class="row-title">${a.resourceName} · ${when(a.starts)}</span><br><span class="row-meta">${describe(a)}</span></span><span class="pill green sm">Available</span></button>`)}</div>

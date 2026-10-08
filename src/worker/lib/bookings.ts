@@ -487,10 +487,35 @@ function clashSql(who: string, dateParam: string, segsParam: string, nowParam: s
        AND ${OCCUPYING('b', nowParam)})`;
 }
 
+/** Advisory overlaps on the player's other facilities; availability stays resource-specific. */
+export async function personalOverlaps(
+  db: D1Database, userId: string, input: SlotInput, slotMinutes: number, now: number,
+) {
+  const selected = mergeSlots(input.starts, slotMinutes);
+  const { results } = await db.prepare(`
+    SELECT b.id, b.resource_id, r.name AS resource_name, b.date, b.status,
+           b.start_min, b.end_min, ${SEGMENTS_SQL('b')}
+      FROM bookings b JOIN resources r ON r.id = b.resource_id
+     WHERE b.user_id = ?1 AND b.resource_id != ?2 AND b.date = ?3
+       AND ${OCCUPYING('b', '?4')}
+       AND EXISTS (
+         SELECT 1 FROM booking_times t, json_each(?5) n
+          WHERE t.booking_id = b.id AND t.date = ?3
+            AND t.start_min < json_extract(n.value, '$[1]')
+            AND t.end_min > json_extract(n.value, '$[0]'))
+     ORDER BY b.start_min, b.id`)
+    .bind(userId, input.resourceId, input.date, now, JSON.stringify(selected.map(s => [s.start, s.end])))
+    .all<Pick<BookingJoin, 'id' | 'resource_id' | 'resource_name' | 'date' | 'status' | 'start_min' | 'end_min' | 'segments_json'>>();
+  return results.map(b => ({
+    id: b.id, resourceId: b.resource_id, resourceName: b.resource_name, date: b.date, status: b.status,
+    segments: segmentsOf(b).filter(s => selected.some(n => s.start < n.end && s.end > n.start)),
+  }));
+}
+
 /**
  * Inserts the booking and its times in one transaction. The booking row is inserted only
- * if none of its times overlap another active booking on the resource, or another active
- * booking of the same user, or a closure, and the court is still bookable (INSERT … WHERE
+ * if none of its times overlap another active booking on the resource or a closure,
+ * and the court is still bookable (INSERT … WHERE
  * NOT EXISTS, evaluated atomically, so a closure or maintenance saved a moment earlier still
  * wins); the times are inserted only if the booking was. `extra` statements (spending booking
  * credit) run in the same batch: if one fails, nothing is booked. Returns rows inserted (0 or 1).
@@ -517,7 +542,6 @@ async function insertBooking(
               'LS-' || replace(?4, '-', '') || '-' || printf('%03d', COALESCE((SELECT MAX(CAST(substr(ref, 13) AS INTEGER)) FROM bookings WHERE date = ?4), 0) + 1),
               ?2, ?3, ?4, ?5, ?6, ?11, ?7, ?8, ?9, ?10, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?19, ?20
         WHERE NOT ${clashSql('t.resource_id = ?3', '?4', '?18', '?10')}
-          AND NOT ${clashSql('b.user_id = ?2', '?4', '?18', '?10')}
           AND NOT EXISTS (
             SELECT 1 FROM closures c, json_each(?18) n
              WHERE c.date = ?4 AND (c.resource_id IS NULL OR c.resource_id = ?3)
@@ -557,7 +581,7 @@ async function explainRefusal(
   userId: string,
   input: { resourceId: string; date: string; segments: Segment[]; slots: number },
   now: number,
-  opts: { checkHolds: boolean; self: boolean },
+  opts: { checkHolds: boolean },
 ): Promise<never> {
   // A closure or a status change saved after checkSlots ran (the insert checks both atomically).
   const [closureRes, resourceRes] = await db.batch([
@@ -570,16 +594,17 @@ async function explainRefusal(
   if (!resource || resource.status === 'disabled') throw unprocessable('RESOURCE_UNAVAILABLE', 'That court or table is not available.');
   if (underMaintenance(resource, input.date)) throw unprocessable('MAINTENANCE', `${resource.name} is under maintenance.`);
   if (isOpenPlay(resource)) throw unprocessable('OPEN_PLAY', `${resource.name} is open play: free for all, so it can't be booked.`);
-  const own = await db
+  const occupied = await db
     .prepare(
       `SELECT b.id FROM booking_times t JOIN bookings b ON b.id = t.booking_id, json_each(?3) n
-        WHERE b.user_id = ?1 AND t.date = ?2
+        WHERE t.resource_id = ?1 AND t.date = ?2
           AND t.start_min < json_extract(n.value, '$[1]') AND t.end_min > json_extract(n.value, '$[0]')
           AND ${OCCUPYING('b', '?4')} LIMIT 1`,
     )
-    .bind(userId, input.date, JSON.stringify(input.segments.map((s) => [s.start, s.end])), now)
+    .bind(input.resourceId, input.date, JSON.stringify(input.segments.map((s) => [s.start, s.end])), now)
     .first<{ id: string }>();
-  if (own) throw unprocessable('OVERLAP_OWN', opts.self ? 'You already have a booking at this time.' : 'You already have a booking at this time on your account.', { bookingId: own.id });
+  const taken = () => conflict('SLOT_TAKEN', input.slots > 1 ? 'Some of those times are already reserved on this court or table.' : 'This time is already reserved on this court or table.');
+  if (occupied) throw taken();
   if (opts.checkHolds) {
     const holds = await db
       .prepare(`SELECT COUNT(*) AS n FROM bookings WHERE user_id = ? AND status = 'TEMPORARY' AND hold_expires_at > ?`)
@@ -589,7 +614,7 @@ async function explainRefusal(
       throw unprocessable('TOO_MANY_HOLDS', `You already have ${MAX_OPEN_HOLDS} unpaid holds. Pay for or release one first.`);
     }
   }
-  throw conflict('SLOT_TAKEN', input.slots > 1 ? 'Some of those times were just taken by another player.' : 'This slot was just taken by another player.');
+  throw taken();
 }
 
 /** "6:00 PM" for a single slot, otherwise every range: "4:00 PM – 5:00 PM, 7:00 PM – 8:00 PM". */
@@ -727,7 +752,7 @@ export async function createHold(
       }
       throw err;
     }
-    if (changes === 0) await explainRefusal(db, user.id, { resourceId, date, segments, slots }, now, { checkHolds: !paidByCredit, self: true });
+    if (changes === 0) await explainRefusal(db, user.id, { resourceId, date, segments, slots }, now, { checkHolds: !paidByCredit });
 
     return getBooking(db, id);
   } catch (err) {
@@ -780,7 +805,7 @@ export async function createConsoleBooking(
       confirmedAt: now,
       confirmedBy: staff.id,
     }, now, null, effects, staff);
-    if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false, self: false });
+    if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false });
 
     return getBooking(db, id);
   } catch (err) {

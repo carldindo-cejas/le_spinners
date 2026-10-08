@@ -33,11 +33,15 @@ function check(name) { evidence.checks.push(name); console.log('PASS PWA ' + nam
 try {
   browser = await chromium.launch();
   const context = await browser.newContext({ serviceWorkers: 'allow' });
+  await context.addInitScript(() => {
+    window.__pwaControlledAtNavigation = Boolean(navigator.serviceWorker.controller);
+  });
   const page = await context.newPage();
   await page.goto(base + '/login');
-  await page.evaluate(async () => { await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready; });
-  await page.reload();
-  await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
+  // The player app registers the worker and reloads on controllerchange.
+  // Wait for that controlled navigation instead of starting a second reload.
+  await page.waitForFunction(() => window.__pwaControlledAtNavigation &&
+    Boolean(navigator.serviceWorker.controller) && document.readyState === 'complete');
   check('install, activate and control');
   for (const route of ['/admin/login', '/staff/login', '/login']) await page.goto(base + route);
   await page.evaluate(async () => { await fetch('/js/core/booking-time.js'); await fetch('/api/pwa-probe'); });

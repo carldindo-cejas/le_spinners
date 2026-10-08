@@ -1,5 +1,5 @@
 import type { Role, SessionUser } from '../types';
-import { forbidden, unauthorized } from './errors';
+import { ApiError, forbidden, unauthorized } from './errors';
 
 /** Recheck the actor inside the same transaction as every dependent effect. */
 export async function authorizedBatch(
@@ -20,6 +20,10 @@ export async function authorizedBatch(
     return results.slice(1);
   } catch (error) {
     if (String(error).includes('mutation_authorized')) throw unauthorized('Your account or session changed. Please sign in again.');
+    if (/no such table:\s*(?:main\.)?mutation_authorization_guard\b/i.test(String(error))) {
+      console.error(JSON.stringify({ msg: 'required mutation authorization migration missing', migration: '0021_staff_account_management.sql' }));
+      throw new ApiError(503, 'OPERATIONS_UNAVAILABLE', 'Staff operations are temporarily unavailable. Please contact the administrator.');
+    }
     throw error;
   }
 }

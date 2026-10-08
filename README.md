@@ -69,6 +69,32 @@ Players can't cancel a booking: the app has no cancel button and `POST /api/book
 always answers `409 NOT_CANCELLABLE`. They can release an unpaid hold, and anything else goes
 through the booking chat.
 
+Players can reserve different courts or tables during the same or partially overlapping
+times. Booking review shows an amber warning listing their active reservations on other
+facilities, with **Review / Change Time** and **Continue to Payment** actions. Fully
+credit-funded bookings use **Continue with Credit**. Cancelled, completed, expired, and
+elapsed temporary/rejected holds do not produce warnings; gaps and adjacent times do not
+overlap. Availability and the atomic booking insert still block collisions on the same
+facility, regardless of the owner. The existing limit of two unpaid temporary holds remains;
+submit payment proof or release a hold before opening another.
+
+`GET /api/bookings/quote` accepts `date=YYYY-MM-DD` alongside `resourceId` and comma-separated
+`starts`, and returns `personalOverlaps` together with the existing price/credit fields.
+Review waits for this preview and offers Retry if it cannot be checked. The quote holds
+nothing; booking creation rechecks facility occupancy and configuration atomically.
+
+`npm run test:booking-reliability` covers booking overlap and approval regressions against
+transactional SQLite. `npm run test:booking-overlap-ui` covers the actual review/payment
+screens with synthetic API fixtures. Both are included in `npm run verify`.
+
+Apply **migration 0021** before deploying the current staff/approval API. It creates the
+transactional authorization guard used by staff writes and extends account/session
+invalidation to identity changes. A Worker released ahead of this migration cannot approve
+payments. `npm run verify:deployment` reads migration and schema metadata only;
+`npm run deploy` runs that check first and stops if required migrations or operation/payment
+tables are missing. It never applies migrations automatically. Review and apply them with
+`npm run db:migrate:remote`, then rerun the check before publishing.
+
 ## Disruptions and booking credits
 
 When Le Spinners can't honour a booking (weather, unsafe conditions, repairs, an emergency, its

@@ -48,7 +48,7 @@ async function scenario(name, width, run) {
     if (path === '/api/facility') return reply(facility);
     if (path.endsWith('/badges')) return reply({ holds: [], notifications: 0, chats: 0 });
     if (path === '/api/bookings') return reply({ now, bookings: [], credits: { available: 0 } });
-    if (path === '/api/bookings/quote') return reply({ price: 100000, creditApplied: 0, amountDue: 100000 });
+    if (path === '/api/bookings/quote') return reply({ price: 100000, creditApplied: 0, amountDue: 100000, personalOverlaps: [] });
     if (path === '/api/availability/days') {
       if (datesError) return route.fulfill({ status: 503, json: { error: { code: 'UNAVAILABLE', message: 'Synthetic date error' } } });
       const activity = url.searchParams.get('activity');

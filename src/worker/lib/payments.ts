@@ -23,6 +23,21 @@ function amountMatches(b: BookingJoin, claimed: number | null): 'match' | 'diffe
   return claimed === b.amount_due ? 'match' : 'differs';
 }
 
+/** Reconcile a lost D1 response using this decision's unique committed token. */
+async function paymentDecisionBatch(db: D1Database, staff: SessionUser, bookingId: string, transitionId: string, statements: D1PreparedStatement[]): Promise<boolean> {
+  try {
+    const [update] = await authorizedBatch(db, staff, statements);
+    return Boolean(update?.meta.changes);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    try {
+      const committed = await db.prepare('SELECT 1 FROM bookings WHERE id = ? AND transition_id = ?').bind(bookingId, transitionId).first();
+      if (committed) return true;
+    } catch { /* An unknown outcome must retain the original error. */ }
+    throw error;
+  }
+}
+
 /** Player uploads payment proof for a running hold (or during a resubmit window). */
 export async function submitProof(
   env: Bindings,
@@ -186,7 +201,7 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
           .bind(newId('m_'), bookingId, staff.id, chatMessage.slice(0, 1000), now + 1, ...g.params),
       ]
     : [];
-  const [update] = await authorizedBatch(db, staff, [
+  const changed = await paymentDecisionBatch(db, staff, bookingId, g.id, [
     db
       .prepare(`UPDATE bookings SET status = 'CONFIRMED', confirmed_at = ?1, confirmed_by = ?2, updated_at = ?1, transition_id = ?4
         WHERE id = ?3 AND status = 'PAYMENT_SUBMITTED' AND transition_id IS ?5
@@ -204,7 +219,7 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
       `Hi ${b.user_name},\n\nPayment verified. Your booking is confirmed.\n\n${activityLabel(b.activity)} · ${where}\nReference: ${b.ref}\nAmount: ${peso(b.amount_due)}${b.credit_applied > 0 ? ` ${b.payment_method_name || 'GCash'} + ${peso(b.credit_applied)} booking credit` : ''}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${bookingId}\n\nSee you on court!\nLe Spinners Recreational Hub`,
       bookingId, now, g),
   ]);
-  if (!update?.meta.changes) {
+  if (!changed) {
     const current = await getBooking(db,bookingId);
     if (current.status === 'PAYMENT_SUBMITTED') throw conflict('PROOF_CHANGED','The payment proof changed. Refresh this booking and review the current screenshot before deciding.');
     throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
@@ -228,7 +243,7 @@ export async function rejectPayment(
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const chatText = input.message?.trim() ||
     `${input.reason}${input.keepHold ? ` Please send a new screenshot within ${settings.resubmitMinutes} minutes.` : ''}`;
-  const [update] = await authorizedBatch(db, staff, [
+  const changed = await paymentDecisionBatch(db, staff, bookingId, g.id, [
     db
       .prepare(
         `UPDATE bookings SET status = ?1, rejected_at = ?2, rejected_by = ?3, reject_reason = ?4, hold_expires_at = ?5, warned_at = NULL, updated_at = ?2, transition_id = ?7
@@ -261,7 +276,7 @@ export async function rejectPayment(
     // Without a resubmit window the booking is over: any booking credit it used comes back.
     ...releaseStmts(db, 'b.id = ? AND b.transition_id = ?', [bookingId, g.id], now),
   ]);
-  if (!update?.meta.changes) {
+  if (!changed) {
     const current = await getBooking(db,bookingId);
     if (current.status === 'PAYMENT_SUBMITTED') throw conflict('PROOF_CHANGED','The payment proof changed. Refresh this booking and review the current screenshot before deciding.');
     throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');

@@ -982,9 +982,17 @@ export async function resolveItem(c: AppContext, actor: SessionUser, disruptionI
 
 /** After staff approve or reject a payment: finish any disruption that was waiting on it. Never throws. */
 export async function resolveDeferredForBooking(c: AppContext, actor: SessionUser, bookingId: string, ip: string) {
-  const { results } = await c.env.DB.prepare(`SELECT disruption_id FROM disruption_items WHERE booking_id = ? AND outcome = 'deferred'`)
-    .bind(bookingId)
-    .all<{ disruption_id: string }>();
+  let results: { disruption_id: string }[];
+  try {
+    ({ results } = await c.env.DB.prepare(`SELECT disruption_id FROM disruption_items WHERE booking_id = ? AND outcome = 'deferred'`)
+      .bind(bookingId)
+      .all<{ disruption_id: string }>());
+  } catch (error) {
+    // The payment decision has committed. Keep deferred items available for
+    // staff to retry instead of reporting the approval/rejection as failed.
+    console.error(JSON.stringify({ msg: 'deferred disruption lookup failed', requestId: c.get('requestId') ?? null, bookingId, err: String(error) }));
+    return [];
+  }
   const out: { disruptionId: string; outcome: string; credit?: number }[] = [];
   for (const r of results) {
     try {

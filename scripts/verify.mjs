@@ -16,11 +16,11 @@ if(mode==='static'){
   for(const file of files)run(['--check',file]);console.log(files.length+' syntax checks passed');
   run([cli,'types','--check']);run([path.join(root,'node_modules/typescript/bin/tsc'),'--noEmit']);
   const tests=fs.readdirSync(path.join(root,'tests')).filter(f=>/^readiness-.*\.mjs$/.test(f)).map(f=>'tests/'+f);
-  run(['--test',...tests,'tests/payment-methods.mjs','tests/calendar-maps.mjs','tests/polling.mjs','tests/booking-request.mjs','tests/concurrency-booking-regression.mjs','tests/concurrency-payments-regression.mjs','tests/concurrency-export-regression.mjs','tests/concurrency-resource-regression.mjs']);
+  run(['--test',...tests,'tests/payment-methods.mjs','tests/calendar-maps.mjs','tests/polling.mjs','tests/booking-request.mjs','tests/concurrency-booking-regression.mjs','tests/concurrency-payments-regression.mjs','tests/concurrency-export-regression.mjs','tests/concurrency-resource-regression.mjs','tests/booking-overlap-regression.mjs','tests/booking-approval-regression.mjs']);
   run([cli,'deploy','--dry-run','--outdir','.wrangler/verify-build']);
 } else if(mode==='browser'){
   const server=await serve(['tests/helpers/browser-server.mjs'],root,8805,{PORT:'8805'});
-  try{for(const test of ['public-pages','refund-retry','outbox-ui','images-browser','lifecycle-browser','logout-browser','redirect-browser','remaining-browser','facility-browser','pwa-browser','accessibility-browser','mobile-payments-browser','calendar-maps-browser','player-availability-browser','staff-management-browser'])run(['tests/'+test+'.mjs'],root,{BASE_URL:'http://127.0.0.1:8805'});run(['--test','tests/concurrency-frontend-regression.mjs']);}finally{stop(server);}
+  try{for(const test of ['public-pages','refund-retry','outbox-ui','images-browser','lifecycle-browser','logout-browser','redirect-browser','remaining-browser','facility-browser','pwa-browser','accessibility-browser','mobile-payments-browser','calendar-maps-browser','player-availability-browser','staff-management-browser'])run(['tests/'+test+'.mjs'],root,{BASE_URL:'http://127.0.0.1:8805'});run(['--test','tests/concurrency-frontend-regression.mjs','tests/booking-overlap-browser.mjs']);}finally{stop(server);}
 } else if(mode==='runtime'){
   // Only the disposable copy is ever seeded/reset; no remote binding flags are used.
   const scratch=fs.mkdtempSync(path.join(root,'.wrangler','verify-runtime-'));

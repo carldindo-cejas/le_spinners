@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:test": "wrangler dev --test-scheduled",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run verify:deployment && wrangler deploy",
+    "verify:deployment": "node scripts/check-deployment-schema.mjs --remote",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
@@ -33,6 +34,8 @@
     "test:capacity": "node tests/capacity.mjs",
     "test:concurrency": "node tests/concurrency-audit.mjs",
     "test:concurrency:regressions": "node --test tests/concurrency-booking-regression.mjs tests/concurrency-payments-regression.mjs tests/concurrency-export-regression.mjs tests/concurrency-resource-regression.mjs tests/concurrency-frontend-regression.mjs",
+    "test:booking-reliability": "node --test tests/booking-overlap-regression.mjs tests/booking-approval-regression.mjs",
+    "test:booking-overlap-ui": "node --test tests/booking-overlap-browser.mjs",
     "recover-account": "node scripts/recover-account.mjs",
     "verify:static": "node scripts/verify.mjs static",
     "verify:browser": "node scripts/verify.mjs browser",

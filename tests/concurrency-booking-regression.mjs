@@ -149,14 +149,15 @@ test('overlapping expiry passes cannot expire the new winner or duplicate old ef
   assert.equal(f.DB.count('booking_events', "type='created'"), 2);
 });
 
-test('atomic overlap checks preserve gaps and reject another resource on the same player', async t => {
+test('atomic overlap checks preserve gaps and allow another resource on the same player', async t => {
   const f = fixture(t), settings = await app.loadSettings(f.DB);
   await app.createHold(f.env, settings, f.player, { ...hold, starts: [600, 720], idempotencyKey: 'gaps-001' }, NOW);
   const gap = await app.createHold(f.env, settings, f.other, { ...hold, starts: [660], idempotencyKey: 'gaps-002' }, NOW);
   assert.equal(gap.start_min, 660);
   await assert.rejects(app.createHold(f.env, settings, f.other, { ...hold, starts: [720], idempotencyKey: 'gaps-003' }, NOW), { code: 'SLOT_TAKEN' });
-  await assert.rejects(app.createHold(f.env, settings, f.player, { ...hold, resourceId: 'table-1', idempotencyKey: 'gaps-004' }, NOW), { code: 'OVERLAP_OWN' });
-  assert.equal(f.DB.count('bookings'), 2);
+  const otherResource = await app.createHold(f.env, settings, f.player, { ...hold, resourceId: 'table-1', idempotencyKey: 'gaps-004' }, NOW);
+  assert.equal(otherResource.status, 'TEMPORARY');
+  assert.equal(f.DB.count('bookings'), 3);
 });
 
 test('manual credit failure rolls back effects and committed response loss replays', async t => {
