@@ -22,7 +22,7 @@ const zNewPassword = z.object({
   clientHash: zClientHash,
 });
 
-type PasswordRow = { password_hash: string; password_salt: string; password_iterations: number; password_scheme: string };
+type PasswordRow = Pick<UserRow, 'password_hash' | 'password_salt' | 'password_iterations' | 'password_scheme' | 'auth_version'>;
 const usable = (row: PasswordRow | null | undefined) => !!row && row.password_scheme === PASSWORD_SCHEME && !!row.password_hash;
 
 export const zEmail = z
@@ -69,7 +69,7 @@ authRoutes.post('/salt', async (c) => {
   const db = c.env.DB;
   const pepper = passwordPepper(c);
   const { email } = await jsonBody(c, z.object({ email: zEmail }));
-  const ipOk = await hitRateLimit(db, `salt:ip:${clientIp(c)}`, 60, 15 * MINUTE);
+  const ipOk = await hitRateLimit(db, `salt:ip:${clientIp(c)}`, 300, 15 * MINUTE);
   const emailOk = await hitRateLimit(db, `salt:email:${email}`, 20, 15 * MINUTE);
   if (!ipOk || !emailOk) throw tooMany('Too many sign-in attempts. Please wait 15 minutes and try again.');
 
@@ -116,7 +116,7 @@ authRoutes.post('/register', async (c) => {
     if (String(err).includes('UNIQUE')) throw conflict('EMAIL_TAKEN', 'An account with this email already exists. Sign in instead.');
     throw err;
   }
-  await createSession(c, { id, role: 'player' });
+  await createSession(c, { id, role: 'player', auth_version: 1, password_hash: hash });
   c.executionCtx.waitUntil(audit(c, id, 'register', 'user', id));
   const user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<UserRow>();
   return c.json({ user: user ? userDTO(user) : null }, 201);
@@ -134,9 +134,11 @@ function portalLogin(portal: Portal) {
     const pepper = passwordPepper(c);
     const body = await jsonBody(c, loginSchema);
     const ip = clientIp(c);
-    const ipOk = await hitRateLimit(db, `login:ip:${ip}`, 30, 15 * MINUTE);
-    const emailOk = await hitRateLimit(db, `login:email:${body.email}`, 8, 15 * MINUTE);
-    if (!ipOk || !emailOk) {
+    // Shared NAT arrivals have their own bounded budget; failures never reset on success.
+    const ipOk = await hitRateLimit(db, `login:ip:${ip}`, 300, 15 * MINUTE);
+    const burstOk = await hitRateLimit(db, `login:burst:${ip}`, 120, MINUTE);
+    const emailOk = await hitRateLimit(db, `login:email:${body.email}`, 30, 15 * MINUTE);
+    if (!ipOk || !burstOk || !emailOk) {
       c.executionCtx.waitUntil(audit(c, null, 'login_throttled', 'email', body.email, portal));
       throw tooMany('Too many sign-in attempts. Please wait 15 minutes and try again.');
     }
@@ -145,6 +147,14 @@ function portalLogin(portal: Portal) {
     const user = usable(found) ? found : null;
     // Unknown accounts run the same HMAC + comparison, so timing doesn't reveal them.
     const valid = await verifyClientHash(pepper, body.clientHash, user?.password_hash ?? null);
+    if (!user || !valid || user.role !== PORTAL_ROLE[portal] || user.status !== 'active') {
+      const ipFailure = await hitRateLimit(db, `login:failed:ip:${ip}`, 60, 15 * MINUTE);
+      const accountFailure = await hitRateLimit(db, `login:failed:email:${body.email}`, 8, 15 * MINUTE);
+      if (!ipFailure || !accountFailure) {
+        c.executionCtx.waitUntil(audit(c, user?.id ?? null, 'login_throttled', 'email', body.email, portal));
+        throw tooMany('Too many sign-in attempts. Please wait 15 minutes and try again.');
+      }
+    }
     if (!user || !valid) {
       c.executionCtx.waitUntil(audit(c, user?.id ?? null, 'login_failed', 'email', body.email, portal));
       throw invalidCredentials();
@@ -155,9 +165,8 @@ function portalLogin(portal: Portal) {
     }
     if (user.status !== 'active') throw forbidden('This account is disabled. Please contact Le Spinners.');
 
-    if (c.get('user')) await destroySession(c); // never reuse a previous session
+    // Rotation commits only if the verified credentials/version still own the new session.
     await createSession(c, user, body.remember ?? true);
-    await db.prepare('DELETE FROM rate_limits WHERE key = ?').bind(`login:email:${body.email}`).run();
     c.executionCtx.waitUntil(audit(c, user.id, 'login', 'user', user.id, portal));
     return c.json({ user: userDTO(user), home: homeFor(user.role) });
   };
@@ -210,7 +219,7 @@ meRoutes.post('/password', async (c) => {
   // currentClientHash is derived with the account's salt from /api/auth/salt, like sign-in.
   const body = await jsonBody(c, z.object({ currentClientHash: zClientHash, newPassword: zNewPassword }));
   const row = await db
-    .prepare('SELECT password_hash, password_salt, password_iterations, password_scheme FROM users WHERE id = ?')
+    .prepare('SELECT password_hash, password_salt, password_iterations, password_scheme, auth_version FROM users WHERE id = ?')
     .bind(user.id)
     .first<PasswordRow>();
   const current = usable(row) ? row : null;
@@ -219,16 +228,27 @@ meRoutes.post('/password', async (c) => {
   }
   if (body.newPassword.salt === current?.password_salt) throw new ApiError(422, 'VALIDATION_ERROR', RELOAD);
   const hash = await pepperHash(pepper, body.newPassword.clientHash);
-  await db.batch([
+  const now = Date.now();
+  const changeId = newId('auth_');
+  const version = current!.auth_version;
+  const won = `EXISTS (SELECT 1 FROM users WHERE id=? AND auth_change_id=? AND auth_version=?)`;
+  const winner = [user.id,changeId,version + 1];
+  const result = await db.batch([
     db
       .prepare(
-        `UPDATE users SET password_hash = ?, password_salt = ?, password_iterations = ?, password_scheme = ?, updated_at = ?
-          WHERE id = ?`,
+        `UPDATE users SET password_hash=?,password_salt=?,password_iterations=?,password_scheme=?,auth_change_id=?,updated_at=?
+          WHERE id=? AND status='active' AND auth_version=? AND password_hash=? AND auth_version=?
+            AND EXISTS (SELECT 1 FROM sessions WHERE id=? AND user_id=users.id AND auth_version=? AND expires_at>?)`,
       )
-      .bind(hash, body.newPassword.salt, PASSWORD_ITERATIONS, PASSWORD_SCHEME, Date.now(), user.id),
-    // Sign out everywhere else.
-    db.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ?').bind(user.id, user.session_id),
+      .bind(hash,body.newPassword.salt,PASSWORD_ITERATIONS,PASSWORD_SCHEME,changeId,now,user.id,version,current!.password_hash,
+        user.auth_version,user.session_id,version,now),
+    // Only the initiating live session advances. Other sessions cannot regain access.
+    db.prepare(`UPDATE sessions SET auth_version=? WHERE id=? AND user_id=? AND auth_version=? AND ${won}`)
+      .bind(version + 1,user.session_id,user.id,version,...winner),
+    db.prepare(`DELETE FROM sessions WHERE user_id=? AND id != ? AND ${won}`).bind(user.id,user.session_id,...winner),
+    db.prepare(`INSERT INTO audit_log(actor_id,action,entity,entity_id,ip,created_at)
+      SELECT ?,'password_changed','user',?,?,? WHERE ${won}`).bind(user.id,user.id,clientIp(c),now,...winner),
   ]);
-  c.executionCtx.waitUntil(audit(c, user.id, 'password_changed', 'user', user.id));
+  if (!result[0]?.meta.changes) throw conflict('CREDENTIALS_CHANGED','Your account or session changed. Sign in again and retry.');
   return c.json({ ok: true });
 });

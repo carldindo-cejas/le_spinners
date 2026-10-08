@@ -1,6 +1,7 @@
 import { $, $$, applyDynamic, fragment, html, on } from './dom.js';
 import { icon } from './icons.js';
 import { clock, mmss } from './format.js';
+import { createScope, currentScope, setElementScope } from './lifecycle.js';
 
 // ── Status pills ────────────────────────────────────────────────────────────
 
@@ -112,16 +113,109 @@ function swipeToDismiss(node, close) {
 
 // ── Dialogs and sheets ──────────────────────────────────────────────────────
 
-const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+const FOCUSABLE = 'a[href], button, input, textarea, select, [tabindex]';
+const dialogStack = [];
+const visibleControl = (el) => !el.matches(':disabled, [type="hidden"]') && !el.closest('[hidden], [inert]') && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+function focusableElements(root) { return $$(FOCUSABLE, root).filter((el) => el.tabIndex >= 0 && visibleControl(el)); }
+
+/** Only the top dialog contains keyboard focus, including nested proof decisions. */
+export function dialogFocus(panel) {
+  const entry = { panel };
+  dialogStack.push(entry);
+  const isActive = () => dialogStack.at(-1) === entry;
+  const focusInitial = () => {
+    const items = focusableElements(panel);
+    (items.find((el) => el.hasAttribute('autofocus')) || items[0] || panel).focus({ preventScroll: true });
+  };
+  const key = (e) => {
+    if (!isActive() || e.key !== 'Tab') return;
+    const items = focusableElements(panel), first = items[0], last = items.at(-1);
+    const active = document.activeElement;
+    if (!items.length || !panel.contains(active) || active === panel || (e.shiftKey ? active === first : active === last)) {
+      e.preventDefault();
+      (items.length ? e.shiftKey ? last : first : panel).focus({ preventScroll: true });
+    }
+  };
+  const focus = (e) => { if (isActive() && !panel.contains(e.target)) focusInitial(); };
+  document.addEventListener('keydown', key, true);
+  document.addEventListener('focusin', focus);
+  let disposed = false;
+  return { isActive, focusInitial, dispose() {
+    if (disposed) return;
+    disposed = true;
+    dialogStack.splice(dialogStack.indexOf(entry), 1);
+    document.removeEventListener('keydown', key, true);
+    document.removeEventListener('focusin', focus);
+  } };
+}
+
+/** Restore an equivalent control after a render; fall back inside the dialog. */
+export function preserveFocus(root, render, fallback = null) {
+  const active = document.activeElement, owned = root.contains(active);
+  const attributes = owned ? [...active.attributes].filter((a) => a.name === 'id' || a.name === 'name' || a.name.startsWith('data-') && a.name !== 'data-css').sort((a, b) => (a.name === 'id' ? 0 : a.name === 'name' ? 2 : 1) - (b.name === 'id' ? 0 : b.name === 'name' ? 2 : 1)) : [];
+  render();
+  if (!owned) return;
+  const items = $$(FOCUSABLE, root).filter(visibleControl);
+  const replacement = attributes.map((a) => items.find((el) => el.tagName === active.tagName && el.getAttribute(a.name) === a.value && (a.name !== 'name' || !active.matches('input[type="radio"], input[type="checkbox"]') || el.getAttribute('value') === active.getAttribute('value')))).find(Boolean);
+  if (replacement?.matches('[role="tab"], [role="radio"]')) {
+    const group = replacement.closest('[role="tablist"], [role="radiogroup"]');
+    for (const item of $$('[role="tab"], [role="radio"]', group)) item.tabIndex = item === replacement ? 0 : -1;
+  }
+  (replacement || fallback || focusableElements(root)[0] || root).focus({ preventScroll: true });
+}
+
+/** ARIA radios use arrow selection; tabs use arrow focus and explicit activation. */
+export function syncChoiceGroups(root) {
+  const selector = '[role="radiogroup"], [role="tablist"]';
+  const groups = root.matches?.(selector) ? [root, ...$$(selector, root)] : $$(selector, root);
+  for (const group of groups) {
+    const radio = group.getAttribute('role') === 'radiogroup';
+    const items = $$(`[role="${radio ? 'radio' : 'tab'}"]`, group).filter((el) => el.closest('[role="radiogroup"], [role="tablist"]') === group);
+    const eligible = items.filter((el) => !el.matches(':disabled, [aria-disabled="true"]') && !el.closest('[hidden], [inert]') && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden');
+    const selected = eligible.find((el) => el.getAttribute(radio ? 'aria-checked' : 'aria-selected') === 'true') || eligible[0];
+    for (const item of items) item.tabIndex = item === selected ? 0 : -1;
+  }
+}
+export function choiceKeys(e) {
+  const group = e.target.closest?.('[role="radiogroup"], [role="tablist"]');
+  if (!group) return;
+  const radio = group.getAttribute('role') === 'radiogroup';
+  const vertical = group.getAttribute('aria-orientation') === 'vertical';
+  const forward = radio || vertical ? ['ArrowRight', 'ArrowDown'] : ['ArrowRight'];
+  const backward = radio || vertical ? ['ArrowLeft', 'ArrowUp'] : ['ArrowLeft'];
+  if (![...forward, ...backward, 'Home', 'End'].includes(e.key)) return;
+  const items = $$(`[role="${radio ? 'radio' : 'tab'}"]`, group).filter((el) => !el.matches(':disabled, [aria-disabled="true"]') && visibleControl(el) && el.closest('[role="radiogroup"], [role="tablist"]') === group);
+  const index = items.indexOf(document.activeElement);
+  if (index < 0) return;
+  e.preventDefault();
+  const next = items[e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1 : (index + (forward.includes(e.key) ? 1 : -1) + items.length) % items.length];
+  for (const item of items) item.tabIndex = item === next ? 0 : -1;
+  next.focus();
+  if (radio) next.click();
+}
 let openCount = 0;
+export function lockScroll() {
+  let released = false;
+  openCount++;
+  document.body.style.setProperty('overflow', 'hidden');
+  return () => {
+    if (released) return;
+    released = true;
+    if (--openCount <= 0) document.body.style.removeProperty('overflow');
+  };
+}
 
 /**
  * Opens a modal dialog (or bottom sheet). `content(close)` returns the inner
  * template. Focus is trapped; Esc and scrim clicks close unless `locked()`.
  */
 export function openModal({ content, sheet = false, wide = false, label, role = 'dialog', onOpen, onClose, locked = () => false, className = '' }) {
+  const parent = currentScope();
+  parent?.assertCurrent();
+  const scope = createScope(parent);
   const previous = document.activeElement;
   const scrim = document.createElement('div');
+  setElementScope(scrim, scope);
   scrim.className = `scrim${sheet ? ' sheet-host' : ''}`;
   const panel = document.createElement('div');
   panel.className = `${sheet ? 'sheet' : 'dialog'}${wide ? ' wide' : ''}${className ? ` ${className}` : ''}`;
@@ -130,49 +224,39 @@ export function openModal({ content, sheet = false, wide = false, label, role = 
   if (label) panel.setAttribute('aria-label', label);
   panel.tabIndex = -1;
   scrim.append(panel);
+  const focus = dialogFocus(panel);
   let closed = false;
+  let unlock = () => {};
 
   const close = (result) => {
     if (closed) return;
     closed = true;
+    scope.dispose();
     document.removeEventListener('keydown', onKey, true);
+    focus.dispose();
     scrim.remove();
-    openCount--;
-    if (openCount <= 0) document.body.style.removeProperty('overflow');
-    if (previous && typeof previous.focus === 'function' && document.contains(previous)) previous.focus();
+    unlock();
+    if ((!parent || parent.isCurrent()) && previous && typeof previous.focus === 'function' && document.contains(previous)) previous.focus();
     if (onClose) onClose(result);
   };
+  scope.own(() => close());
 
   const renderContent = () => {
     panel.innerHTML = '';
     if (sheet) panel.append(fragment(html`<div class="sheet-handle" aria-hidden="true"></div>`));
     panel.append(fragment(content(close)));
     applyDynamic(panel);
+    syncChoiceGroups(panel);
   };
 
   function onKey(e) {
+    if (!focus.isActive()) return;
     if (e.key === 'Escape') {
       if (!locked()) {
         e.preventDefault();
         close();
       }
       return;
-    }
-    if (e.key !== 'Tab') return;
-    const items = $$(FOCUSABLE, panel).filter((el) => el.offsetParent !== null || el === document.activeElement);
-    if (!items.length) {
-      e.preventDefault();
-      panel.focus();
-      return;
-    }
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (e.shiftKey && (document.activeElement === first || document.activeElement === panel)) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
     }
   }
 
@@ -182,16 +266,17 @@ export function openModal({ content, sheet = false, wide = false, label, role = 
   on(panel, 'click', '[data-close]', () => {
     if (!locked()) close();
   });
-  document.addEventListener('keydown', onKey, true);
-  renderContent();
-  document.body.append(scrim);
-  openCount++;
-  document.body.style.setProperty('overflow', 'hidden');
-  const autofocus = $('[autofocus]', panel) || $(FOCUSABLE, panel) || panel;
-  autofocus.focus({ preventScroll: true });
-  const api = { close, panel, rerender: renderContent };
-  if (onOpen) onOpen(panel, api);
-  return api;
+  try {
+    document.addEventListener('keydown', onKey, true);
+    panel.addEventListener('keydown', choiceKeys);
+    renderContent();
+    document.body.append(scrim);
+    unlock = lockScroll();
+    focus.focusInitial();
+    const api = { close, panel, scope, signal: scope.signal, isOpen: () => !closed && scope.isCurrent(), rerender: () => { if (!closed && scope.isCurrent()) preserveFocus(panel, renderContent, panel); } };
+    if (onOpen) onOpen(panel, api);
+    return api;
+  } catch (error) { close(); throw error; }
 }
 
 // ── Countdown ───────────────────────────────────────────────────────────────
@@ -290,7 +375,7 @@ export async function copyText(text) {
     ta.value = text;
     ta.setAttribute('readonly', '');
     ta.className = 'sr-only';
-    document.body.append(ta);
+    (dialogStack.at(-1)?.panel || document.body).append(ta);
     ta.select();
     let ok = false;
     try {
@@ -304,6 +389,7 @@ export async function copyText(text) {
 }
 
 /** Shows server validation messages next to fields named like the details keys. */
+const errorDescriptions = new WeakMap();
 export function showFieldErrors(form, details) {
   clearFieldErrors(form);
   if (!details) return false;
@@ -316,7 +402,8 @@ export function showFieldErrors(form, details) {
     const holder = input.closest('.input-group') || input;
     if (holder.classList.contains('input-group')) holder.dataset.invalid = 'true';
     input.setAttribute('aria-invalid', 'true');
-    input.setAttribute('aria-describedby', id);
+    errorDescriptions.set(input, input.getAttribute('aria-describedby'));
+    input.setAttribute('aria-describedby', [input.getAttribute('aria-describedby'), id].filter(Boolean).join(' '));
     const field = input.closest('.field') || holder.parentElement;
     field.append(fragment(html`<p class="field-error" id="${id}" data-field-error>${icon('alert', 16, 2.2)}<span>${msg}</span></p>`));
     if (!first) first = input;
@@ -329,7 +416,12 @@ export function clearFieldErrors(form) {
   for (const el of $$('[data-field-error]', form)) el.remove();
   for (const el of $$('[aria-invalid="true"]', form)) {
     el.removeAttribute('aria-invalid');
-    el.removeAttribute('aria-describedby');
+    if (errorDescriptions.has(el)) {
+      const description = errorDescriptions.get(el);
+      if (description === null) el.removeAttribute('aria-describedby');
+      else el.setAttribute('aria-describedby', description);
+      errorDescriptions.delete(el);
+    }
   }
   for (const el of $$('[data-invalid]', form)) delete el.dataset.invalid;
 }
@@ -348,38 +440,16 @@ export function skeletonRows(n = 4, cls = 'sk-row') {
   return html`<div class="stack stack-8" aria-busy="true" aria-label="Loading">${Array.from({ length: n }, () => html`<div class="skeleton ${cls}"></div>`)}</div>`;
 }
 
-/** Polls `fn` every `ms` while the page is visible. Returns stop(). */
-export function poll(fn, ms, { immediate = false } = {}) {
-  let timer = null;
-  let stopped = false;
-  const run = async () => {
-    if (stopped || document.hidden) return;
-    try {
-      await fn();
-    } catch (err) {
-      console.warn('poll failed', err);
-    }
-    schedule();
-  };
-  const schedule = () => {
-    clearTimeout(timer);
-    if (!stopped) timer = setTimeout(run, ms);
-  };
-  const onVisible = () => {
-    if (!document.hidden && !stopped) run();
-  };
-  document.addEventListener('visibilitychange', onVisible);
-  if (immediate) run();
-  else schedule();
-  return () => {
-    stopped = true;
-    clearTimeout(timer);
-    document.removeEventListener('visibilitychange', onVisible);
-  };
-}
+export { poll } from './poll.js';
 
 /** A polite live region for screen-reader announcements. */
 let liveRegion = null;
+let announceTimer = null;
+export function clearSessionMessages() {
+  toastHost?.replaceChildren();
+  clearTimeout(announceTimer);
+  if (liveRegion) liveRegion.textContent = '';
+}
 export function announce(text) {
   if (!liveRegion) {
     liveRegion = document.createElement('div');
@@ -388,5 +458,6 @@ export function announce(text) {
     document.body.append(liveRegion);
   }
   liveRegion.textContent = '';
-  setTimeout(() => (liveRegion.textContent = text), 50);
+  clearTimeout(announceTimer);
+  announceTimer = setTimeout(() => (liveRegion.textContent = text), 50);
 }

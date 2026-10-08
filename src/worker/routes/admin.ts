@@ -14,11 +14,12 @@ import { lazyMaintenance } from '../lib/maintenance';
 import { approvePayment, listProofs, proofLink, rejectPayment, staffCancel } from '../lib/payments';
 import { loadSettings } from '../lib/settings';
 import { addDays, dateLabel, isValidDate, localNow, localToMs, offsetMinutes, peso } from '../lib/time';
-import { jsonBody, parse, query, zActivity, zDate, zId } from '../lib/validate';
+import { jsonBody, parse, query, zActivity, zDate, zId, zIdempotencyKey } from '../lib/validate';
 import { staffCreditRoutes } from './credits';
 import { disruptionRoutes } from './disruptions';
 import { facilityAdminRoutes } from './facilities';
 import { notificationDTO, readSchema } from './notifications';
+import { afterPage, pageRequest, pageResult } from '../lib/pagination';
 
 /**
  * Day-to-day operations: dashboard, payment verification, bookings, chat, staff
@@ -299,21 +300,27 @@ operationsRoutes.get('/bookings', async (c) => {
     where.push('b.date < ?');
     params.push(local.date);
   }
-  const order = q.scope === 'upcoming' ? 'b.date ASC, b.start_min ASC' : 'b.date DESC, b.start_min DESC';
-  const sql = `${BOOKING_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT 200`;
+  const direction = q.scope === 'upcoming' ? 'ASC' : 'DESC';
+  const page = pageRequest(c.req.query(),`console-bookings:${requireStaff(c).id}:${JSON.stringify(q)}:${q.scope && q.scope !== 'all' ? local.date : ''}`,['string','number','string']);
+  const after = afterPage(page,['b.date','b.start_min','b.id'],direction);
+  if (after.sql) { where.push(after.sql); params.push(...after.params); }
+  params.push(page.limit + 1);
+  const order = `b.date ${direction}, b.start_min ${direction}, b.id ${direction}`;
+  const sql = `${BOOKING_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`;
   const [list, counts] = await db.batch([
     db.prepare(sql).bind(...params),
     db.prepare('SELECT status, COUNT(*) AS n FROM bookings GROUP BY status'),
   ]);
   const rows = (list?.results ?? []) as BookingJoin[];
+  const result = pageResult(rows,page,b => [b.date,b.start_min,b.id]);
   const countMap: Record<string, number> = {};
   for (const r of (counts?.results ?? []) as { status: BookingStatus; n: number }[]) countMap[r.status] = r.n;
   const unread = await unreadByBooking(db, rows.map((b) => b.id));
   return c.json({
     now,
-    today: local.date,
+    today: local.date, page:result.page,
     counts: countMap,
-    bookings: rows.map((b) => ({ ...bookingDTO(b, now, settings, offset, true), unreadMessages: unread.get(b.id) ?? 0 })),
+    bookings: result.rows.map((b) => ({ ...bookingDTO(b, now, settings, offset, true), unreadMessages: unread.get(b.id) ?? 0 })),
   });
 });
 
@@ -388,12 +395,12 @@ const consoleBookingSchema = z
 
 operationsRoutes.post('/bookings', async (c) => {
   const staff = requireStaff(c);
+  const idempotencyKey = parse(zIdempotencyKey, c.req.header('Idempotency-Key') ?? '');
   const body = await jsonBody(c, consoleBookingSchema);
   const { settings } = await staffContext(c);
   const starts = requestedStarts(body, settings.slotMinutes);
   const now = Date.now();
-  const b = await createConsoleBooking(c.env, settings, staff, { resourceId: body.resourceId, date: body.date, starts, rate: body.rate, payment: body.payment, bookerName: body.bookerName }, now);
-  c.executionCtx.waitUntil(audit(c, staff.id, 'booking_created_on_site', 'booking', b.id, JSON.stringify({ payment: body.payment, slots: starts.length })));
+  const b = await createConsoleBooking(c.env, settings, staff, { resourceId: body.resourceId, date: body.date, starts, rate: body.rate, payment: body.payment, bookerName: body.bookerName, idempotencyKey, requestIp: clientIp(c) }, now);
   return c.json(await staffDetail(c, b.id, now), 201);
 });
 
@@ -466,10 +473,14 @@ operationsRoutes.get('/schedule', async (c) => {
 
 operationsRoutes.get('/messages', async (c) => {
   const now = Date.now();
-  const rows = await staffConversations(c.env.DB);
+  const q = query(c,z.object({filter:z.enum(['all','unread','verifying']).default('all'),q:z.string().trim().max(120).default('')}));
+  const page = pageRequest(c.req.query(),`console-messages:${requireStaff(c).id}:${JSON.stringify(q)}`,['number','string']);
+  const rows = await staffConversations(c.env.DB,page,q);
+  const result = pageResult(rows,page,r => [r.last_at,r.id]);
   return c.json({
     now,
-    conversations: rows.map((r) => ({
+    page:result.page,
+    conversations: result.rows.map((r) => ({
       bookingId: r.id,
       ref: r.ref,
       status: effectiveStatus({ status: r.status as BookingStatus, hold_expires_at: r.hold_expires_at }, now),
@@ -495,9 +506,10 @@ operationsRoutes.get('/bookings/:id/messages', async (c) => {
   const now = Date.now();
   const b = await getBooking(c.env.DB, id);
   const { settings, offset } = await staffContext(c);
-  const messages = await listMessages(c.env, id, { side: 'staff', userId: staff.id }, now);
+  const page = pageRequest(c.req.query(),`console-chat:${staff.id}:${id}`,['number','string']);
+  const messages = await listMessages(c.env, id, { side: 'staff', userId: staff.id }, now,page);
   c.executionCtx.waitUntil(markRead(c.env, id, 'staff', staff.id, now).catch((err) => console.error('markRead failed', err)));
-  return c.json({ now, booking: bookingDTO(b, now, settings, offset, true), messages });
+  return c.json({ now, booking: bookingDTO(b, now, settings, offset, true), page:messages.page, messages });
 });
 
 operationsRoutes.post('/bookings/:id/messages', async (c) => {
@@ -517,24 +529,29 @@ operationsRoutes.post('/bookings/:id/messages', async (c) => {
 
 operationsRoutes.get('/notifications', async (c) => {
   const db = c.env.DB;
-  const q = query(c, z.object({ filter: z.enum(['unresolved', 'all']).optional() }));
+  const q = query(c, z.object({ filter: z.enum(['unresolved', 'all', 'verification', 'messages', 'bookings']).default('all') }));
+  const page = pageRequest(c.req.query(),`console-notifications:${requireStaff(c).id}:${q.filter || 'all'}`,['number','string']);
+  const after = afterPage(page,['created_at','id']);
+  const group = q.filter === 'verification' ? " AND type='proof_submitted'" : q.filter === 'messages' ? " AND type='new_message'"
+    : q.filter === 'bookings' ? " AND type NOT IN ('proof_submitted','new_message')" : '';
   const [list, counts] = await db.batch([
     db.prepare(
       `SELECT id, type, title, body, link, booking_id, read_at, resolved_at, created_at
-         FROM notifications WHERE audience = 'staff'${q.filter === 'unresolved' ? ' AND resolved_at IS NULL' : ''}
-        ORDER BY created_at DESC LIMIT 100`,
-    ),
+         FROM notifications WHERE audience = 'staff'${q.filter !== 'all' ? ' AND resolved_at IS NULL' : ''}${group}
+        ${after.sql ? `AND ${after.sql}` : ''} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    ).bind(...after.params,page.limit + 1),
     db.prepare(
       `SELECT (SELECT COUNT(*) FROM notifications WHERE audience = 'staff' AND resolved_at IS NULL) AS unresolved,
               (SELECT COUNT(*) FROM notifications WHERE audience = 'staff' AND read_at IS NULL) AS unread`,
     ),
   ]);
   const n = ((counts?.results ?? [])[0] as { unresolved: number; unread: number } | undefined) ?? { unresolved: 0, unread: 0 };
+  const result = pageResult((list?.results ?? []) as Parameters<typeof notificationDTO>[0][],page,r => [r.created_at,r.id]);
   return c.json({
     now: Date.now(),
-    unresolved: n.unresolved,
+    unresolved: n.unresolved, page:result.page,
     unread: n.unread,
-    notifications: ((list?.results ?? []) as Parameters<typeof notificationDTO>[0][]).map(notificationDTO),
+    notifications: result.rows.map(notificationDTO),
   });
 });
 

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import * as z from 'zod';
 import type { AppEnv, ResourceRow } from '../types';
-import { audit, requireAdmin } from '../lib/auth';
+import { audit, clientIp, requireAdmin } from '../lib/auth';
 import { resourceStatus, type HoursRow } from '../lib/bookings';
 import { newId } from '../lib/crypto';
 import { ApiError, badRequest, unprocessable } from '../lib/errors';
@@ -9,7 +9,9 @@ import { sniffImage, stripMetadata } from '../lib/images';
 import { invalidateSettings, loadSettings } from '../lib/settings';
 import { dateLabel, hoursLabel, peso } from '../lib/time';
 import { resourceUpdateSchema, updateResource } from '../lib/facility';
-import { jsonBody, parse, zId } from '../lib/validate';
+import { listOutbox } from '../lib/outbox';
+import { beginUpload, commitQrUpload, markUploadStored, recoverUploadFailure, removeQr, storageHealth } from '../lib/storage';
+import { jsonBody, parse, query, zId } from '../lib/validate';
 import { zEmail } from './auth';
 
 export const adminSettingsRoutes = new Hono<AppEnv>();
@@ -153,23 +155,29 @@ adminSettingsRoutes.put('/settings/gcash-qr', async (c) => {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const kind = sniffImage(bytes);
   if (!kind) throw unprocessable('UNSUPPORTED_FILE_TYPE', 'Upload the QR code as a JPG, PNG or WEBP image.');
+  const clean = stripMetadata(bytes,kind);
   const key = `settings/gcash-qr/${newId()}.${kind.ext}`;
-  await c.env.PROOFS.put(key, stripMetadata(bytes, kind), { httpMetadata: { contentType: kind.type } });
-  const previous = (await loadSettings(c.env.DB)).gcashQrKey;
-  await upsertSetting(c.env.DB, 'gcash_qr_key', key, Date.now(), admin.id).run();
-  invalidateSettings();
-  if (previous && previous !== key) c.executionCtx.waitUntil(c.env.PROOFS.delete(previous));
-  c.executionCtx.waitUntil(audit(c, admin.id, 'gcash_qr_updated', 'settings', 'gcash_qr_key'));
+  const upload = await beginUpload(c.env,key,'qr',admin.id,null);
+  try {
+    const object = await c.env.PROOFS.put(key,clean,{httpMetadata:{contentType:kind.type},customMetadata:{uploadId:upload.id}});
+    if (!object) throw new Error('R2 upload was not stored');
+    await markUploadStored(c.env,upload);
+    await commitQrUpload(c.env,admin,upload,clientIp(c));
+  } catch (error) {
+    await recoverUploadFailure(c.env,upload);
+    // The audit carries the intent identity, even if another administrator has since replaced it.
+    let saved = false;
+    try { saved = Boolean(await c.env.DB.prepare("SELECT id FROM audit_log WHERE action='gcash_qr_updated' AND detail=? LIMIT 1").bind(upload.id).first()); }
+    catch { /* A durable staged/attached checkpoint survives unknown database state. */ }
+    if (!saved) throw error;
+    invalidateSettings();
+  }
   return c.json({ ok: true, qrUrl: '/api/facility/gcash-qr' });
 });
 
 adminSettingsRoutes.delete('/settings/gcash-qr', async (c) => {
   const admin = requireAdmin(c);
-  const previous = (await loadSettings(c.env.DB)).gcashQrKey;
-  await upsertSetting(c.env.DB, 'gcash_qr_key', '', Date.now(), admin.id).run();
-  invalidateSettings();
-  if (previous) c.executionCtx.waitUntil(c.env.PROOFS.delete(previous));
-  c.executionCtx.waitUntil(audit(c, admin.id, 'gcash_qr_removed', 'settings', 'gcash_qr_key'));
+  await removeQr(c.env,admin,clientIp(c));
   return c.json({ ok: true });
 });
 
@@ -181,35 +189,10 @@ adminSettingsRoutes.patch('/resources/:id', async (c) => {
   return c.json({ ok: true, ...(await updateResource(c, admin, id, body)) });
 });
 
-/** Recent email/SMS notifications, so staff can see what was queued or sent. */
+/** Queue health and recent messages. Delivery states do not claim inbox delivery. */
 adminSettingsRoutes.get('/outbox', async (c) => {
-  const { results } = await c.env.DB.prepare(
-    `SELECT id, channel, recipient, subject, status, attempts, last_error, booking_id, created_at, sent_at
-       FROM outbox ORDER BY created_at DESC LIMIT 50`,
-  ).all<{
-    id: string;
-    channel: string;
-    recipient: string;
-    subject: string | null;
-    status: string;
-    attempts: number;
-    last_error: string | null;
-    booking_id: string | null;
-    created_at: number;
-    sent_at: number | null;
-  }>();
-  return c.json({
-    items: results.map((o) => ({
-      id: o.id,
-      channel: o.channel,
-      recipient: o.recipient,
-      subject: o.subject,
-      status: o.status,
-      attempts: o.attempts,
-      lastError: o.last_error,
-      bookingId: o.booking_id,
-      createdAt: o.created_at,
-      sentAt: o.sent_at,
-    })),
-  });
+  const { state } = query(c, z.object({ state: z.enum(['all','ready','sending','retry','accepted','failed','needs_review','unsupported']).default('all') }));
+  return c.json(await listOutbox(c.env, state));
 });
+
+adminSettingsRoutes.get('/storage-health', async c => c.json(await storageHealth(c.env)));

@@ -1,3 +1,4 @@
+import { currentScope, elementScope, isAbort, setElementScope } from './lifecycle.js';
 /**
  * Tiny, safe templating. Every interpolated value is HTML-escaped unless it is
  * itself the result of `html` (or `raw`, reserved for app-made markup such as
@@ -65,6 +66,17 @@ export function render(el, template) {
   return el;
 }
 
+/** Separate route content from the stable shell element and its next view. */
+export function mount(el, template) {
+  const root = document.createElement('div');
+  root.className = 'route-mount';
+  if (currentScope()) setElementScope(root, currentScope());
+  render(root, template);
+  el.replaceChildren(root);
+  currentScope()?.own(() => root.remove());
+  return root;
+}
+
 export function fragment(template) {
   const t = document.createElement('template');
   t.innerHTML = toMarkup(template);
@@ -79,10 +91,27 @@ export const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 export function on(root, type, selector, handler, options) {
   const listener = (event) => {
     const target = event.target instanceof Element ? event.target.closest(selector) : null;
-    if (target && root.contains(target)) handler(event, target);
+    if (target && root.contains(target)) return handler(event, target);
+  };
+  return listen(root, type, listener, options);
+}
+
+/** Element listeners inherit their mount/dialog lifetime; global view listeners use the active route. */
+export function listen(root, type, handler, options) {
+  if (!root) return () => {};
+  const scope = elementScope(root);
+  if (scope && !scope.isCurrent()) return () => {};
+  const listener = (...args) => {
+    if (scope && !scope.isCurrent()) return;
+    try {
+      const result = handler(...args);
+      if (result?.catch) result.catch(error => { if (!isAbort(error)) console.error(error); });
+      return result;
+    } catch (error) { if (!isAbort(error)) console.error(error); }
   };
   root.addEventListener(type, listener, options);
-  return () => root.removeEventListener(type, listener, options);
+  const off = () => root.removeEventListener(type, listener, options);
+  return scope ? scope.own(off) : off;
 }
 
 export function setBusy(button, busy, busyLabel) {

@@ -16,17 +16,36 @@
     "db:reset:local": "node scripts/reset-local-db.mjs",
     "create-admin": "node scripts/create-admin.mjs",
     "test:smoke": "node tests/smoke.mjs",
-    "db:seed:generate": "node scripts/generate-seed-users.mjs"
+    "test:readiness": "node --test tests/readiness-p0.mjs tests/readiness-integrity-audit.mjs tests/readiness-recovery.mjs tests/polling.mjs tests/booking-request.mjs tests/readiness-outbox.mjs tests/readiness-images.mjs tests/readiness-storage.mjs tests/readiness-auth.mjs tests/readiness-lifecycle.mjs tests/readiness-logout.mjs tests/readiness-redirect.mjs tests/readiness-remaining.mjs tests/readiness-growth.mjs",
+    "test:refund-ui": "node tests/refund-retry.mjs",
+    "test:outbox-ui": "node tests/outbox-ui.mjs",
+    "test:images-browser": "node tests/images-browser.mjs",
+    "test:lifecycle-ui": "node tests/lifecycle-browser.mjs",
+    "test:logout-ui": "node tests/logout-browser.mjs",
+    "test:redirect-ui": "node tests/redirect-browser.mjs",
+    "db:seed:generate": "node scripts/generate-seed-users.mjs",
+    "test:remaining-ui": "node tests/remaining-browser.mjs",
+    "test:capacity": "node tests/capacity.mjs",
+    "recover-account": "node scripts/recover-account.mjs",
+    "verify:static": "node scripts/verify.mjs static",
+    "verify:browser": "node scripts/verify.mjs browser",
+    "verify:runtime": "node scripts/verify.mjs runtime",
+    "verify": "npm run verify:static && npm run verify:browser && npm run verify:runtime"
   },
   "dependencies": {
-    "hono": "^4.13.11",
-    "zod": "^4.6.5"
+    "hono": "4.13.11",
+    "zod": "4.6.5"
   },
   "devDependencies": {
-    "typescript": "^5.9.3",
-    "wrangler": "^4.143.1"
+    "esbuild": "0.28.1",
+    "playwright": "1.63.0",
+    "typescript": "5.9.3",
+    "wrangler": "4.143.1"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }

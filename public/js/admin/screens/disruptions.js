@@ -1,11 +1,14 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, dayClock, minutesLabel, relTime } from '../../core/format.js';
-import { errorState, showFieldErrors, clearFieldErrors, skeletonRows, statusPill, toast } from '../../core/ui.js';
+import { choiceKeys, errorState, showFieldErrors, clearFieldErrors, skeletonRows, statusPill, syncChoiceGroups, toast } from '../../core/ui.js';
 import { frame, navigate, refreshBadges, state } from '../shell.js';
 import { API, BASE } from '../console.js';
 import { CATEGORY_OPTIONS, openDisruptionDialog } from '../disrupt.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, showFieldErrors, clearFieldErrors, toast, frame, navigate, refreshBadges });
 
 /**
  * Disruptions (REBOOKING.md §11): every operator cancellation and every closure that cancelled
@@ -28,6 +31,7 @@ function card(d) {
 }
 
 export function disruptionsView({ query }) {
+  const { listen, frame, render, api, on } = viewTools();
   let filter = query.get('filter') === 'open' ? 'open' : 'all';
   const main = frame({
     key: 'disruptions',
@@ -58,7 +62,7 @@ export function disruptionsView({ query }) {
             <p class="empty-body">${filter === 'open' ? 'Every booking in every disruption is handled.' : 'When weather, repairs or an emergency stop play, record it here: affected players get booking credit.'}</p></div>`);
     } catch (err) {
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
   on(root, 'click', '[data-filter]', (_e, btn) => {
@@ -80,6 +84,7 @@ function nowHalfHour() {
 }
 
 export async function newDisruptionView() {
+  const { listen, frame, api, render, on, clearFieldErrors, showFieldErrors, refreshBadges, navigate } = viewTools();
   const main = frame({
     key: 'disruptions',
     eyebrow: 'Disruptions',
@@ -133,11 +138,14 @@ export async function newDisruptionView() {
       <div class="row row-wrap" data-gap="8"><button type="submit" class="btn btn-primary btn-md">${icon('eye', 18)}Preview affected bookings</button><a class="btn btn-secondary btn-md" href="${BASE}/disruptions">Cancel</a></div>
     </form>`);
   const form = $('[data-form]', root);
+  syncChoiceGroups(root);
+  listen(form, 'keydown', choiceKeys);
   const f = (n) => form.elements.namedItem(n);
 
   on(form, 'click', '[data-cat]', (_e, btn) => {
     category = btn.dataset.cat;
     for (const b of form.querySelectorAll('[data-cat]')) b.setAttribute('aria-checked', String(b.dataset.cat === category));
+    syncChoiceGroups(root);
   });
   on(form, 'click', '[data-quick]', (_e, btn) => {
     const date = f('date').value || today;
@@ -197,6 +205,7 @@ function itemCard(i) {
 }
 
 export async function disruptionDetailView({ params }) {
+  const { listen, frame, api, render, on, setBusy, toast, refreshBadges } = viewTools();
   const id = params.id;
   const main = frame({
     key: 'disruptions',
@@ -213,7 +222,7 @@ export async function disruptionDetailView({ params }) {
       d = await api.get(`${API}/disruptions/${encodeURIComponent(id)}`);
     } catch (err) {
       render(root, errorState(err, { retry: err.status !== 404, title: err.status === 404 ? 'Disruption not found' : undefined }));
-      $('[data-act="retry"]', root)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', root), 'click', load);
       return;
     }
     const x = d.disruption;

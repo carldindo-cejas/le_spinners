@@ -1,3 +1,5 @@
+import { createScope, isAbort, setCurrentScope } from './lifecycle.js';
+import { localTarget } from './navigation.js';
 /**
  * History-API router. Views are async functions that render into the page and
  * may return a cleanup function (timers, polling, listeners).
@@ -16,7 +18,7 @@ function compile(path) {
 }
 
 /** Routes with `absolute: true` live outside `base` (e.g. /revenue/ in the admin console). */
-export function createRouter({ routes, notFound, base = '', ignore = [] }) {
+export function createRouter({ routes, notFound, base = '', ignore = [], beforeView }) {
   const compiled = routes.map((r) => ({ ...r, ...compile(r.absolute ? r.path : base + r.path) }));
   let current = null;
   let navId = 0;
@@ -49,6 +51,11 @@ export function createRouter({ routes, notFound, base = '', ignore = [] }) {
       }
     }
     current = null;
+    const scope = createScope();
+    setCurrentScope(scope);
+    // Ownership exists before calling the async view, so early listeners/requests
+    // can be disposed even while initial loading is still pending.
+    current = { cleanup: () => scope.dispose() };
     const route = match || { view: notFound, name: 'not-found' };
     const ctx = {
       params,
@@ -56,21 +63,27 @@ export function createRouter({ routes, notFound, base = '', ignore = [] }) {
       path,
       route,
       state: history.state || {},
-      isCurrent: () => id === navId,
+      ...scope,
+      isCurrent: () => id === navId && scope.isCurrent(),
     };
     let result;
     try {
-      result = await route.view(ctx);
+      if (!beforeView?.(ctx)) result = await route.view(ctx);
     } catch (err) {
-      console.error(err);
+      if (!isAbort(err)) console.error(err);
+      scope.dispose();
     }
     if (id !== navId) {
-      if (typeof result === 'function') result();
+      if (typeof result === 'function') scope.own(result);
       return;
     }
-    current = { cleanup: typeof result === 'function' ? result : null };
+    if (typeof result === 'function') scope.own(result);
+    if (!scope.isCurrent()) return;
     const key = history.state && history.state.key;
-    window.scrollTo(0, restoreScroll && key && scrollPositions.has(key) ? scrollPositions.get(key) : 0);
+    let anchor = null;
+    try { anchor = url.hash && document.getElementById(decodeURIComponent(url.hash.slice(1))); } catch { /* malformed fragment */ }
+    if (anchor) anchor.scrollIntoView();
+    else window.scrollTo(0, restoreScroll && key && scrollPositions.has(key) ? scrollPositions.get(key) : 0);
   }
 
   function saveScroll() {
@@ -79,15 +92,11 @@ export function createRouter({ routes, notFound, base = '', ignore = [] }) {
   }
 
   function navigate(to, { replace = false, state = {} } = {}) {
-    const url = new URL(to, location.origin);
-    if (url.origin !== location.origin) {
-      location.href = url.href;
-      return;
-    }
+    const target = localTarget(to, { allowPath: handles }) || `${base}/`;
     saveScroll();
     const next = { ...state, key: Math.random().toString(36).slice(2), depth: replace ? depth() : depth() + 1 };
-    if (replace) history.replaceState(next, '', url.pathname + url.search + url.hash);
-    else history.pushState(next, '', url.pathname + url.search + url.hash);
+    if (replace) history.replaceState(next, '', target);
+    else history.pushState(next, '', target);
     return resolve();
   }
 
@@ -98,22 +107,29 @@ export function createRouter({ routes, notFound, base = '', ignore = [] }) {
   }
 
   function handles(pathname) {
-    if (base && !pathname.startsWith(base) && !compiled.some((r) => r.absolute && r.re.test(pathname))) return false;
-    return !ignore.some((prefix) => pathname.startsWith(prefix));
+    if (base && pathname !== base && !pathname.startsWith(base + '/') && !compiled.some((r) => r.absolute && r.re.test(pathname))) return false;
+    return !ignore.some((prefix) => prefix.endsWith('/') ? pathname.startsWith(prefix) : pathname === prefix || pathname.startsWith(prefix + '/'));
   }
 
-  document.addEventListener('click', (event) => {
+  const onClick = (event) => {
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     const a = event.target instanceof Element ? event.target.closest('a[href]') : null;
     if (!a || (a.target && a.target !== '_self') || a.hasAttribute('download') || a.hasAttribute('data-native')) return;
     const url = new URL(a.href, location.href);
     if (url.origin !== location.origin || !handles(url.pathname)) return;
+    // Let same-page section links scroll without tearing down the active view.
+    if (url.hash && url.pathname === location.pathname && url.search === location.search) return;
     event.preventDefault();
     navigate(url.pathname + url.search + url.hash, { replace: a.hasAttribute('data-replace') });
-  });
+  };
+  document.addEventListener('click', onClick);
 
-  window.addEventListener('popstate', () => resolve({ restoreScroll: true }));
+  const onPop = () => resolve({ restoreScroll: true });
+  window.addEventListener('popstate', onPop);
   if (!history.state || !history.state.key) history.replaceState({ key: 'root', depth: 0 }, '', location.href);
 
-  return { navigate, back, resolve, refresh: () => resolve({ restoreScroll: true }) };
+  return { navigate, back, resolve, refresh: () => resolve({ restoreScroll: true }),
+    invalidate() { navId++; current?.cleanup(); current = null; setCurrentScope(null); },
+    dispose() { navId++; current?.cleanup(); current = null; setCurrentScope(null); document.removeEventListener('click', onClick); window.removeEventListener('popstate', onPop); },
+  };
 }

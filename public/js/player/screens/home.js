@@ -1,10 +1,14 @@
+import { createViewTools } from '../../core/view.js';
+import { splitBookings } from '../../core/booking-time.js';
 import { api } from '../../core/api.js';
-import { html, render } from '../../core/dom.js';
+import { listen, html, render } from '../../core/dom.js';
 import { icon, logo, courtArt } from '../../core/icons.js';
 import { bookingTime, dateLabel, dayMonth, firstName, greeting, initials } from './util.js';
 import { errorState, memberTag, poll, skeletonRows, statusPill } from '../../core/ui.js';
 import { bellButton, show, state } from '../shell.js';
-import { ACTIVE, bookingCard, bookingHref, resourceTile, startCardCountdowns } from '../components.js';
+import { bookingCard, bookingHref, resourceTile, startCardCountdowns } from '../components.js';
+
+const viewTools = createViewTools({ listen, api, render, poll, show, startCardCountdowns });
 
 function rateLine(user) {
   if (user.membership === 'member') return html`${memberTag('member')}<span>Member rates apply</span>`;
@@ -55,10 +59,8 @@ function availableToday(days, now) {
   });
 }
 
-function upcomingBlock(bookings) {
-  const next = bookings
-    .filter((b) => ACTIVE.has(b.status) && b.startsAt + 3_600_000 > Date.now())
-    .sort((a, b) => a.startsAt - b.startsAt)[0];
+function upcomingBlock(bookings, now) {
+  const next = splitBookings(bookings, now).upcoming[0];
   if (!next) {
     return html`<div class="empty">
       <p class="empty-title">No upcoming bookings</p>
@@ -109,6 +111,7 @@ function facilityCard(f) {
 }
 
 export function homeView(ctx) {
+  const { listen, show, api, render, startCardCountdowns, setTimeout, poll } = viewTools(ctx);
   const u = state.user;
   const f = state.facility;
   const root = show(html`<div class="screen wide has-tabbar screen-enter">
@@ -172,25 +175,25 @@ export function homeView(ctx) {
 
   async function loadBookings() {
     try {
-      const res = await api.get('/api/bookings');
+      const [res, recent] = await Promise.all([api.get('/api/bookings?group=upcoming&order=soonest&limit=1'),api.get('/api/bookings?group=past&limit=2')]);
       stopCountdowns();
       const credit = res.credits;
       render(root.querySelector('[data-credit]'), credit && credit.available > 0
         ? html`<a class="card card-link credit-banner" href="/credits"><span class="tile blue">${icon('gift', 22)}</span>
             <span class="grow"><span class="strong">You have <span class="mono">${credit.availableLabel}</span> booking credit</span><br><span class="small">It pays for your next booking automatically.</span></span>${icon('chevron-right', 18, 2.2)}</a>`
         : '');
-      render(upcomingEl, upcomingBlock(res.bookings));
-      render(recentEl, recentBlock(res.bookings));
+      render(upcomingEl, upcomingBlock(res.bookings, res.now));
+      render(recentEl, recentBlock(recent.bookings));
       stopCountdowns = startCardCountdowns(upcomingEl, res.now, () => setTimeout(loadBookings, 1500));
     } catch (err) {
       render(upcomingEl, errorState(err));
-      upcomingEl.querySelector('[data-act="retry"]')?.addEventListener('click', loadBookings);
+      listen(upcomingEl.querySelector('[data-act="retry"]'), 'click', loadBookings);
     }
   }
 
   loadAvailability().catch((err) => {
     render(todayEl, errorState(err, { title: "Couldn't load live availability" }));
-    todayEl.querySelector('[data-act="retry"]')?.addEventListener('click', () => loadAvailability());
+    listen(todayEl.querySelector('[data-act="retry"]'), 'click', () => loadAvailability());
   });
   loadBookings();
   const stopPoll = poll(() => loadAvailability(), 30_000);

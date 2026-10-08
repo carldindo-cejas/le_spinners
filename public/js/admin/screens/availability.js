@@ -1,5 +1,6 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { isoDate, minutesLabel, relTime } from '../../core/format.js';
 import { clearFieldErrors, errorState, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
@@ -7,6 +8,8 @@ import { frame } from '../shell.js';
 import { API, BASE } from '../console.js';
 import { disruptionAsPromise, followUpNote, withImpactCheck } from '../impact.js';
 import { openDisruptionDialog } from '../disrupt.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, showFieldErrors, toast, frame });
 
 const HALF_HOURS = Array.from({ length: 49 }, (_, i) => i * 30);
 const timeLabel = (m) => (m === 1440 ? '12:00 AM (midnight)' : minutesLabel(m));
@@ -33,6 +36,7 @@ function closureRow(cl) {
 }
 
 export async function availabilityView() {
+  const { listen, frame, api, render, on, toast, setBusy, clearFieldErrors, showFieldErrors } = viewTools();
   const main = frame({
     key: 'availability',
     eyebrow: 'Facility',
@@ -48,7 +52,7 @@ export async function availabilityView() {
       d = await api.get(`${API}/availability`);
     } catch (err) {
       render(root, errorState(err));
-      $('[data-act="retry"]', root)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', root), 'click', load);
       return;
     }
     const today = d.today || isoDate(Date.now());

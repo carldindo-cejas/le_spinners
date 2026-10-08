@@ -1,4 +1,5 @@
-import { html } from '../core/dom.js';
+import { html, listen } from '../core/dom.js';
+import { currentScope } from '../core/lifecycle.js';
 import { icon } from '../core/icons.js';
 import { openModal, statusPill } from '../core/ui.js';
 import { BASE } from './console.js';
@@ -28,11 +29,11 @@ function confirmAffected(affected, message, { canDisrupt }) {
           <button type="button" class="btn ${canDisrupt ? 'btn-secondary' : 'btn-primary'} btn-block" data-act="apply">Apply change, keep these bookings</button>
           <button type="button" class="btn btn-secondary btn-block" data-close>Go back</button></div>`,
       onOpen: (panel, m) => {
-        panel.querySelector('[data-act="apply"]').addEventListener('click', () => {
+        listen(panel.querySelector('[data-act="apply"]'), 'click', () => {
           answer = 'apply';
           m.close();
         });
-        panel.querySelector('[data-act="disrupt"]')?.addEventListener('click', () => {
+        listen(panel.querySelector('[data-act="disrupt"]'), 'click', () => {
           answer = 'disrupt';
           m.close();
         });
@@ -52,17 +53,23 @@ function confirmAffected(affected, message, { canDisrupt }) {
  *   null                    staff went back
  */
 export async function withImpactCheck(send, { disrupt } = {}) {
+  const scope = currentScope();
   let confirmed = [];
   for (;;) {
+    scope?.assertCurrent();
     try {
-      return await send(confirmed);
+      const result = await send(confirmed);
+      scope?.assertCurrent();
+      return result;
     } catch (err) {
       if (err.code !== 'AFFECTS_BOOKINGS') throw err;
       const affected = (err.details && err.details.affected) || [];
       const choice = await confirmAffected(affected, err.message, { canDisrupt: Boolean(disrupt) });
+      scope?.assertCurrent();
       if (!choice) return null;
       if (choice === 'disrupt') {
         const out = await disrupt(affected);
+        scope?.assertCurrent();
         if (!out) return null;
         if (out.done) return out.result;
       }

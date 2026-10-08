@@ -1,12 +1,17 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render } from '../../core/dom.js';
+import { listen, $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, shortDate } from './util.js';
 import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { refreshBadges, show } from '../shell.js';
 
+const viewTools = createViewTools({ listen, api, on, render, openImage, poll, toast, refreshBadges, show });
+
 export function chatView({ params }) {
+  const { listen, show, render, on, openImage, api, refreshBadges, toast, poll } = viewTools();
   const id = params.id;
   let data = null;
   let lastKey = '';
@@ -29,6 +34,7 @@ export function chatView({ params }) {
   const form = $('[data-form]', root);
   const input = $('#chat-input', root);
   const syncCount = charCounter(input);
+  const pages = historyPager(api, root.querySelector('.chat-scroll'), () => load(false), {label:'Earlier messages'});
 
   function paintHead() {
     const b = data.booking;
@@ -40,7 +46,7 @@ export function chatView({ params }) {
     </div>
     <a class="chat-context" href="/bookings/${b.id}"><span class="mono">${b.ref}</span>${statusPill(b.status, { small: true })}</a>`);
     render($('[data-attach]', root), b.canSubmitProof ? html`<a class="icon-btn flat" href="/bookings/${b.id}/pay" aria-label="Upload payment screenshot">${icon('plus', 22, 2.2)}</a>` : '');
-    head.querySelector('[data-back]').addEventListener('click', (e) => {
+    listen(head.querySelector('[data-back]'), 'click', (e) => {
       if (history.state && history.state.depth > 0) {
         e.preventDefault();
         history.back();
@@ -62,28 +68,28 @@ export function chatView({ params }) {
 
   async function load(first = false) {
     try {
-      data = await api.get(`/api/bookings/${encodeURIComponent(id)}/messages`);
+      data = await pages.get(`/api/bookings/${encodeURIComponent(id)}/messages`);
       if (first) paintHead();
       paintLog(first);
       if (first) refreshBadges();
     } catch (err) {
       if (!first) return;
       render(log, html`<li>${errorState(err)}</li>`);
-      $('[data-act="retry"]', log)?.addEventListener('click', () => load(true));
+      listen($('[data-act="retry"]', log), 'click', () => load(true));
     }
   }
 
-  input.addEventListener('input', () => {
+  listen(input, 'input', () => {
     input.style.setProperty('height', 'auto');
     input.style.setProperty('height', `${Math.min(input.scrollHeight, 140)}px`);
   });
-  input.addEventListener('keydown', (e) => {
+  listen(input, 'keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       form.requestSubmit();
     }
   });
-  form.addEventListener('submit', async (e) => {
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     const body = input.value.trim();
     if (!body || !data) return;
@@ -94,7 +100,9 @@ export function chatView({ params }) {
       input.value = '';
       input.style.removeProperty('height');
       syncCount();
+      pages.reset();
       data.messages = res.messages;
+      load(false);
       paintLog(true);
     } catch (err) {
       toast(err.message, { type: 'error' });

@@ -1,8 +1,10 @@
+import { MAINTENANCE_BATCH_SIZE } from './limits';
 import type { Bindings, SessionUser } from '../types';
 import { conflict, notFound, unprocessable } from './errors';
-import { newId } from './crypto';
+import { newId, sha256Hex } from './crypto';
 import { outboxStmt, userNoticeStmt } from './notify';
 import { dateLabel, peso } from './time';
+import { afterPage } from './pagination';
 
 /**
  * Booking credits (REBOOKING.md §5–§6): value Le Spinners owes a player after cancelling or
@@ -20,6 +22,18 @@ import { dateLabel, peso } from './time';
 export const MAX_CREDITS_PER_BOOKING = 10;
 /** Upper bound for one manual credit (₱100,000). */
 export const MAX_MANUAL_CREDIT = 10_000_000;
+
+/** Recorded amounts only; external cash reconciliation and liability policy need operator acceptance. */
+export async function creditAccounting(db: D1Database, now: number) {
+  const row = await db.prepare(`SELECT
+    (SELECT COALESCE(SUM(amount_due),0) FROM bookings WHERE confirmed_at IS NOT NULL) AS verifiedCash,
+    (SELECT COALESCE(SUM(-amount),0) FROM credit_transactions WHERE kind='refund') AS recordedRefunds,
+    (SELECT COALESCE(SUM(remaining),0) FROM booking_credits WHERE state='active') AS activeCreditBalances,
+    (SELECT COALESCE(SUM(remaining),0) FROM booking_credits WHERE state='active' AND (expires_at IS NULL OR expires_at>?)) AS unexpiredCreditBalances,
+    (SELECT COALESCE(SUM(credit_applied),0) FROM bookings WHERE status IN ('CONFIRMED','COMPLETED')) AS creditFundedValue`).bind(now)
+    .first<{verifiedCash:number;recordedRefunds:number;activeCreditBalances:number;unexpiredCreditBalances:number;creditFundedValue:number}>();
+  return {...row,scope:'Recorded verified cash includes later-cancelled bookings. Refunds are recorded external credit payouts; these totals do not prove bank/cash reconciliation or an accepted liability policy.'};
+}
 
 export type CreditRow = {
   id: string;
@@ -144,26 +158,30 @@ export async function creditSummary(db: D1Database, userId: string, now: number)
 }
 
 /** Every credit of one player, newest first (the player's Booking credits screen). */
-export async function listUserCredits(db: D1Database, userId: string, now: number) {
+export async function listUserCredits(db: D1Database, userId: string, now: number, page?: import('./pagination').PageRequest) {
+  const after = page ? afterPage(page,['c.created_at','c.id'],'DESC',2) : {sql:'',params:[]};
   const { results } = await db
-    .prepare(`${CREDIT_SELECT} WHERE c.user_id = ?2 ORDER BY c.created_at DESC, c.id LIMIT 200`)
-    .bind(now, userId)
+    .prepare(`${CREDIT_SELECT} WHERE c.user_id = ?2${after.sql ? ` AND ${after.sql}` : ''} ORDER BY c.created_at DESC, c.id DESC LIMIT ?${3 + after.params.length}`)
+    .bind(now, userId,...after.params,page ? page.limit + 1 : 200)
     .all<CreditJoin>();
   return results;
 }
 
 /** Staff search: by player name or email, booking reference or credit id. */
-export async function searchCredits(db: D1Database, q: { q?: string; state?: 'spendable' | 'all' }, now: number) {
+export async function searchCredits(db: D1Database, q: { q?: string; state?: 'spendable' | 'all' }, now: number, page?: import('./pagination').PageRequest) {
   const where: string[] = [];
   const params: (string | number)[] = [now];
   if (q.q) {
     const like = `%${q.q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-    where.push(`(u.name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR sb.ref LIKE ? ESCAPE '\\' OR c.id = ?)`);
+    where.push(`(u.name LIKE ?2 ESCAPE '\\' OR u.email LIKE ?3 ESCAPE '\\' OR sb.ref LIKE ?4 ESCAPE '\\' OR c.id = ?5)`);
     params.push(like, like, like, q.q);
   }
   if (q.state === 'spendable') where.push(SPENDABLE('c', '?1'));
+  const after = page ? afterPage(page,['c.created_at','c.id'],'DESC',params.length) : {sql:'',params:[]};
+  if (after.sql) { where.push(after.sql); params.push(...after.params); }
+  params.push(page ? page.limit + 1 : 200);
   const { results } = await db
-    .prepare(`${CREDIT_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY c.created_at DESC, c.id LIMIT 200`)
+    .prepare(`${CREDIT_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY c.created_at DESC, c.id DESC LIMIT ?${params.length}`)
     .bind(...params)
     .all<CreditJoin>();
   return results;
@@ -299,7 +317,7 @@ export function redeemStmts(db: D1Database, input: { bookingId: string; userId: 
  * cancelled, or the proof finally rejected). `guardSql` narrows the bookings (alias `b`, bind
  * `params`). One `release` row per `redeem` row — the unique index on related_txn_id makes a second
  * release impossible — then `remaining` recomputed, a timeline event and one player notice.
- * Safe to run any number of times; the cron runs it with no guard as a safety net.
+ * Safe to run any number of times; cron supplies a bounded booking-id checkpoint.
  */
 export function releaseStmts(db: D1Database, guardSql: string, params: unknown[], now: number): D1PreparedStatement[] {
   const ended = `b.confirmed_at IS NULL AND b.status IN ('EXPIRED', 'CANCELLED') AND (${guardSql})`;
@@ -342,19 +360,16 @@ export function releaseStmts(db: D1Database, guardSql: string, params: unknown[]
   ];
 }
 
-/** Cron safety net: returns credit for every ended, unconfirmed booking that still holds some. */
+/** Cron safety net: returns credit for up to eight ended, unconfirmed bookings. */
 export async function reconcileCreditHolds(env: Bindings, now = Date.now()): Promise<number> {
   const db = env.DB;
-  const pending = await db
-    .prepare(
-      `SELECT 1 FROM credit_transactions t JOIN bookings b ON b.id = t.booking_id
-        WHERE t.kind = 'redeem' AND b.confirmed_at IS NULL AND b.status IN ('EXPIRED', 'CANCELLED')
-          AND NOT EXISTS (SELECT 1 FROM credit_transactions r WHERE r.related_txn_id = t.id AND r.kind = 'release')
-        LIMIT 1`,
-    )
-    .first();
-  if (!pending) return 0;
-  const [released] = await db.batch(releaseStmts(db, '1 = 1', [], now));
+  const { results } = await db.prepare(`
+    SELECT DISTINCT b.id FROM credit_transactions t JOIN bookings b ON b.id = t.booking_id
+    WHERE t.kind = 'redeem' AND b.confirmed_at IS NULL AND b.status IN ('EXPIRED', 'CANCELLED')
+      AND NOT EXISTS (SELECT 1 FROM credit_transactions r WHERE r.related_txn_id = t.id AND r.kind = 'release')
+    ORDER BY b.id LIMIT ?`).bind(MAINTENANCE_BATCH_SIZE).all<{ id: string }>();
+  if (!results.length) return 0;
+  const [released] = await db.batch(releaseStmts(db, 'b.id IN (SELECT value FROM json_each(?))', [JSON.stringify(results.map(b => b.id))], now));
   return released?.meta.changes ?? 0;
 }
 
@@ -457,14 +472,22 @@ export async function recordRefund(
   env: Bindings,
   admin: SessionUser,
   creditId: string,
-  input: { amount: number; method: 'gcash' | 'cash'; reference: string | null; note: string | null },
+  input: { amount: number; method: 'gcash' | 'cash'; reference: string | null; note: string | null; idempotencyKey: string },
   now = Date.now(),
 ) {
   const db = env.DB;
+  const requestHash = await sha256Hex(JSON.stringify({ amount: input.amount, method: input.method, reference: input.reference, note: input.note }));
+  type RefundResult = { transactionId: string; creditId: string; amount: number; remaining: number; recordedAt: number };
+  const replay = async (): Promise<RefundResult | null> => {
+    const seen = await db.prepare('SELECT request_hash, result_json FROM refund_operations WHERE actor_id = ? AND credit_id = ? AND idempotency_key = ?')
+      .bind(admin.id, creditId, input.idempotencyKey).first<{ request_hash: string; result_json: string }>();
+    if (!seen) return null;
+    if (seen.request_hash !== requestHash) throw conflict('IDEMPOTENCY_KEY_REUSED', 'This request key was already used for a different refund. Retry the original refund before recording another.');
+    return JSON.parse(seen.result_json) as RefundResult;
+  };
+  const seen = await replay();
+  if (seen) return seen;
   const c = await getCredit(db, creditId, now);
-  if (input.amount > c.remaining) {
-    throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { amount: [`At most ${peso(c.remaining)} is left on this credit.`] });
-  }
   const txn = newId('ct_');
   const how = input.method === 'gcash' ? `GCash${input.reference ? ` ref ${input.reference}` : ''}` : 'cash at the front desk';
   const note = `${how}${input.note ? ` · ${input.note}` : ''}`;
@@ -474,9 +497,10 @@ export async function recordRefund(
       .prepare(
         `INSERT INTO credit_transactions (id, credit_id, user_id, kind, amount, actor_id, actor_role, note, created_at)
          SELECT ?1, c.id, c.user_id, 'refund', -?2, ?3, 'staff', ?4, ?5
-           FROM booking_credits c WHERE c.id = ?6 AND c.state = 'active' AND c.remaining >= ?2`,
+           FROM booking_credits c WHERE c.id = ?6 AND c.state = 'active' AND c.remaining >= ?2
+             AND NOT EXISTS (SELECT 1 FROM refund_operations WHERE actor_id = ?3 AND credit_id = ?6 AND idempotency_key = ?7)`,
       )
-      .bind(txn, input.amount, admin.id, note, now, creditId),
+      .bind(txn, input.amount, admin.id, note, now, creditId, input.idempotencyKey),
     recomputeStmt(db, 'SELECT ?', [creditId], now),
     creditNotice(db, c.user_id, 'Refund recorded', `Le Spinners recorded a refund of ${peso(input.amount)} from your booking credit (${how}).`, now, guard),
     db
@@ -485,6 +509,20 @@ export async function recordRefund(
          SELECT ?, 'refund_recorded', 'credit', ?, ?, NULL, ? WHERE EXISTS (SELECT 1 FROM credit_transactions WHERE id = ?)`,
       )
       .bind(admin.id, creditId, JSON.stringify({ amount: input.amount, method: input.method, reference: input.reference }), now, txn),
+    db.prepare(
+      `INSERT INTO refund_operations (actor_id, credit_id, idempotency_key, request_hash, transaction_id, result_json, created_at)
+       SELECT ?1, c.id, ?2, ?3, ?4,
+              json_object('transactionId', ?4, 'creditId', c.id, 'amount', ?5, 'remaining', c.remaining, 'recordedAt', ?6), ?6
+         FROM booking_credits c WHERE c.id = ?7 AND EXISTS (SELECT 1 FROM credit_transactions WHERE id = ?4)`,
+    ).bind(admin.id, input.idempotencyKey, requestHash, txn, input.amount, now, creditId),
   ]);
-  if (!ins?.meta.changes) throw conflict('CREDIT_CHANGED', 'This credit changed while you were recording the refund. Reload and try again.');
+  // Check replay before balance validation: a lost full-refund response leaves no
+  // remaining balance but must still return the original successful operation.
+  const result = await replay();
+  if (result) return result;
+  if (!ins?.meta.changes) {
+    const fresh = await getCredit(db, creditId, now);
+    if (input.amount > fresh.remaining) throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { amount: [`At most ${peso(fresh.remaining)} is left on this credit.`] });
+  }
+  throw conflict('CREDIT_CHANGED', 'This credit changed while you were recording the refund. Reload and try again.');
 }

@@ -3,6 +3,7 @@ import { SEGMENTS_SQL, type BookingJoin } from './bookings';
 import { newId } from './crypto';
 import { resolveStaffStmt } from './notify';
 import { proofLink } from './payments';
+import { afterPage, pageResult, type PageRequest } from './pagination';
 
 /**
  * Booking chat: one private thread per booking between its player and staff.
@@ -29,23 +30,25 @@ function firstName(name: string | null): string {
   return (name ?? '').trim().split(/\s+/)[0] || 'Staff';
 }
 
-export async function listMessages(env: Bindings, bookingId: string, viewer: { side: ChatSide; userId: string }, now = Date.now()) {
+export async function listMessages(env: Bindings, bookingId: string, viewer: { side: ChatSide; userId: string }, now = Date.now(), page?: PageRequest) {
+  const after = page ? afterPage(page,['m.created_at','m.id']) : {sql:'',params:[]};
   const { results } = await env.DB.prepare(
     `SELECT m.id, m.sender_id, m.sender_role, m.kind, m.body, m.proof_id, m.created_at,
             u.name AS sender_name, p.status AS proof_status
        FROM messages m
        LEFT JOIN users u ON u.id = m.sender_id
        LEFT JOIN payment_proofs p ON p.id = m.proof_id
-      WHERE m.booking_id = ?
-      ORDER BY m.created_at DESC, m.rowid DESC
-      LIMIT 200`,
+      WHERE m.booking_id = ?${after.sql ? ` AND ${after.sql}` : ''}
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT ?`,
   )
-    .bind(bookingId)
+    .bind(bookingId,...after.params,page ? page.limit + 1 : 200)
     .all<MessageRow>();
-  results.reverse();
+  const result = page ? pageResult(results,page,m => [m.created_at,m.id]) : {rows:results,page:undefined};
+  result.rows.reverse();
 
   const out = [];
-  for (const m of results) {
+  for (const m of result.rows) {
     let senderName: string | null = null;
     if (m.sender_role === 'staff') senderName = viewer.side === 'player' ? `${firstName(m.sender_name)} · Le Spinners` : m.sender_name ?? 'Staff';
     else if (m.sender_role === 'player') senderName = viewer.side === 'player' ? 'You' : m.sender_name ?? 'Player';
@@ -72,7 +75,7 @@ export async function listMessages(env: Bindings, bookingId: string, viewer: { s
     }
     out.push(dto);
   }
-  return out;
+  return Object.assign(out,{page:result.page});
 }
 
 /** Moves the reader's marker up to the newest message from the other side. */
@@ -213,7 +216,17 @@ type ConversationRow = {
 };
 
 /** Staff inbox: every booking thread with at least one player or staff message. */
-export async function staffConversations(db: D1Database) {
+export async function staffConversations(db: D1Database, page?: PageRequest, filters: { filter?: 'all' | 'unread' | 'verifying'; q?: string } = {}) {
+  const after = page ? afterPage(page,['lm.created_at','b.id']) : {sql:'',params:[]};
+  const where: string[] = [], params: (string | number)[] = [];
+  if (filters.filter === 'unread') where.push(`EXISTS (SELECT 1 FROM messages x WHERE x.booking_id=b.id
+    AND x.sender_role='player' AND x.kind='text' AND x.created_at>COALESCE(rd.last_read_at,0))`);
+  if (filters.filter === 'verifying') where.push("b.status='PAYMENT_SUBMITTED'");
+  if (filters.q) {
+    const like = `%${filters.q.replace(/[\\%_]/g, c => `\\${c}`)}%`;
+    where.push("(u.name LIKE ? ESCAPE '\\' OR b.ref LIKE ? ESCAPE '\\')"); params.push(like,like);
+  }
+  if (after.sql) { where.push(after.sql); params.push(...after.params); }
   const { results } = await db
     .prepare(
       `SELECT b.id, b.ref, b.status, b.hold_expires_at, b.date, b.start_min, b.end_min, ${SEGMENTS_SQL('b')},
@@ -225,11 +238,12 @@ export async function staffConversations(db: D1Database) {
          FROM bookings b
          JOIN resources r ON r.id = b.resource_id
          JOIN users u ON u.id = b.user_id
-         JOIN messages lm ON lm.id = (SELECT id FROM messages WHERE booking_id = b.id AND kind != 'system' ORDER BY created_at DESC, rowid DESC LIMIT 1)
+         JOIN messages lm ON lm.id = (SELECT id FROM messages WHERE booking_id = b.id AND kind != 'system' AND created_at <= ? ORDER BY created_at DESC, id DESC LIMIT 1)
          LEFT JOIN message_reads rd ON rd.booking_id = b.id AND rd.reader = 'staff'
-        ORDER BY lm.created_at DESC
-        LIMIT 100`,
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY lm.created_at DESC, b.id DESC
+        LIMIT ?`,
     )
-    .all<ConversationRow>();
+    .bind(page?.asOf ?? Date.now(),...params,page ? page.limit + 1 : 100).all<ConversationRow>();
   return results;
 }

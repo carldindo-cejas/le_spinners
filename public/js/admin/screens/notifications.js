@@ -1,10 +1,14 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, safeUrl } from '../../core/dom.js';
+import { listen, $, html, on, render, safeUrl } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { relTime } from '../../core/format.js';
 import { errorState, poll, skeletonRows } from '../../core/ui.js';
 import { frame, navigate, refreshBadges, state } from '../shell.js';
 import { API, BASE, consoleLink, isAdminConsole } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, render, poll, frame, navigate, refreshBadges });
 
 const KIND = {
   proof_submitted: { label: 'Payment proof submitted', tile: 'violet', icon: 'shield-clock', action: 'Review payment', group: 'verification' },
@@ -28,6 +32,7 @@ const FILTERS = [
  * staff see only how many are set up (from /rules).
  */
 async function alertSetup() {
+  const { api } = viewTools();
   if (!state.alerts) {
     try {
       if (isAdminConsole) {
@@ -39,7 +44,8 @@ async function alertSetup() {
         const n = (k, noun) => `${k} ${noun}${k === 1 ? '' : 's'} set up by an administrator`;
         state.alerts = { email: res.alerts.emailRecipients, sms: res.alerts.smsRecipients, emailTo: n(res.alerts.emailRecipients, 'address'), smsTo: n(res.alerts.smsRecipients, 'number'), delivery: res.delivery };
       }
-    } catch {
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
       state.alerts = { email: 0, sms: 0, emailTo: '', smsTo: '', delivery: null };
     }
   }
@@ -48,12 +54,13 @@ async function alertSetup() {
 
 function channels(n, a) {
   const email = a.email ? (a.delivery?.email === 'resend' ? '✓' : 'queued') : 'off';
-  if (n.type === 'proof_submitted') return `In-app ✓ · Email ${email} · SMS ${a.sms ? 'queued' : 'off'}`;
+  if (n.type === 'proof_submitted') return `In-app ✓ · Email ${email} · SMS ${a.sms ? 'unsupported' : 'off'}`;
   if (n.type === 'booking_cancelled') return `In-app ✓ · Email ${email}`;
   return 'In-app ✓';
 }
 
 export async function notificationsView() {
+  const { listen, frame, render, on, api, navigate, refreshBadges, poll } = viewTools();
   const s = await alertSetup();
   let filter = 'unresolved';
   let data = null;
@@ -71,20 +78,19 @@ export async function notificationsView() {
         <section class="panel panel-body stack stack-12"><p class="eyebrow">How you're alerted</p>
           <div class="channel"><span class="tile sm blue">${icon('bell', 18)}</span><span><b>In-app</b><br><span class="small">Toasts, bell and sidebar badges for every event.</span></span><span class="pill green sm">On</span></div>
           <div class="channel"><span class="tile sm blue">${icon('send', 18)}</span><span><b>Email</b><br><span class="small">${s.email ? s.emailTo : 'No recipients yet'}</span></span><span class="pill ${s.email ? 'green' : 'neutral'} sm">${s.email ? (s.delivery?.email === 'resend' ? 'On' : 'Queued') : 'Off'}</span></div>
-          <div class="channel"><span class="tile sm blue">${icon('phone', 18)}</span><span><b>SMS</b><br><span class="small">${s.sms ? s.smsTo : 'No numbers yet'}</span></span><span class="pill amber sm">Queued</span></div>
-          <p class="small">SMS provider not connected yet. Messages are stored and will send once it's set up.${s.delivery?.email === 'resend' ? '' : ' Email sends once RESEND_API_KEY and EMAIL_FROM are set.'}</p>
+          <div class="channel"><span class="tile sm blue">${icon('phone', 18)}</span><span><b>SMS</b><br><span class="small">${s.sms ? s.smsTo : 'No numbers yet'}</span></span><span class="pill amber sm">Unsupported</span></div>
+          <p class="small">SMS delivery is unsupported. Stored SMS messages are not automatically sent.${s.delivery?.email === 'resend' ? '' : ' Email delivery is unconfigured.'}</p>
           ${isAdminConsole ? html`<a class="link-sm" href="/admin/settings#alerts">Alert settings</a>` : html`<p class="small">Recipients are managed by an administrator.</p>`}
         </section>
       </aside>
     </div></div>`,
   });
   const list = $('[data-list]', root);
+  const pages = historyPager(api, list.parentElement, load);
 
   function paint() {
-    const counts = { unresolved: data.unresolved, all: data.notifications.length };
-    for (const g of ['verification', 'messages', 'bookings']) counts[g] = data.notifications.filter((n) => !n.resolved && (KIND[n.type]?.group ?? 'bookings') === g).length;
-    render($('[data-filters]', root), FILTERS.map((f) => html`<button type="button" class="chip${f.violet ? ' violet' : ''}" data-filter="${f.key}" aria-pressed="${String(filter === f.key)}">${f.label}${f.key === 'all' ? '' : ` · ${counts[f.key]}`}</button>`));
-    const items = data.notifications.filter((n) => (filter === 'all' ? true : filter === 'unresolved' ? !n.resolved : !n.resolved && (KIND[n.type]?.group ?? 'bookings') === filter));
+    render($('[data-filters]', root), FILTERS.map((f) => html`<button type="button" class="chip${f.violet ? ' violet' : ''}" data-filter="${f.key}" aria-pressed="${String(filter === f.key)}">${f.label}${f.key === 'unresolved' ? ` · ${data.unresolved}` : ''}</button>`));
+    const items = data.notifications;
     if (!items.length) {
       render(list, html`<div class="empty empty-center"><span class="tile green lg">${icon('check-circle', 26)}</span><p class="empty-title">Nothing needs you right now</p><p class="empty-body">New payment proofs, messages and holds show up here.</p></div>`);
       return;
@@ -110,7 +116,8 @@ export async function notificationsView() {
 
   on(root, 'click', '[data-filter]', (_e, btn) => {
     filter = btn.dataset.filter;
-    paint();
+    pages.reset();
+    load();
   });
   on(root, 'click', '[data-open]', (e, a) => {
     e.preventDefault();
@@ -137,12 +144,12 @@ export async function notificationsView() {
 
   async function load() {
     try {
-      data = await api.get(`${API}/notifications?filter=all`);
+      data = await pages.get(`${API}/notifications?filter=${filter}`);
       paint();
     } catch (err) {
       if (!data) {
         render(list, errorState(err));
-        $('[data-act="retry"]', list)?.addEventListener('click', load);
+        listen($('[data-act="retry"]', list), 'click', load);
       }
     }
   }

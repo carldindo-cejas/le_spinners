@@ -1,5 +1,7 @@
+import { createViewTools } from '../../core/view.js';
+import { postBooking } from '../../core/booking-request.js';
 import { api } from '../../core/api.js';
-import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon, courtArt, tableArt, resourceGlyph } from '../../core/icons.js';
 import {
   activityLabel, activityNoun, dateLabel, dayMonth, durationLabel, hourLabel, longDate, mergeStarts, minutesLabel, peso, rangeLabel, rangeLabelFull,
@@ -9,10 +11,13 @@ import { errorState, memberTag, openModal, poll, skeletonRows, toast } from '../
 import { navigate, show, state, wizardHeader } from '../shell.js';
 import { endRebook, rebookBanner, rebookContext, wireRebookBanner } from '../rebook.js';
 
+const viewTools = createViewTools({ listen, api, on, render, setBusy, openModal, poll, toast, navigate, show });
+
 const ACTIVITIES = ['pickleball', 'table_tennis'];
 const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
 
 function badActivity(activity) {
+  const { navigate } = viewTools();
   if (ACTIVITIES.includes(activity)) return false;
   navigate('/book', { replace: true });
   return true;
@@ -29,6 +34,7 @@ function rateLabel(user) {
 // ── Step 1: activity (U04) ─────────────────────────────────────────────────
 
 export function activityStep() {
+  const { show, api } = viewTools();
   const f = state.facility;
   const member = state.user.membership === 'member';
   const root = show(html`<div class="screen screen-enter">
@@ -124,6 +130,7 @@ function dayButton(d, selected) {
 }
 
 export function dateStep({ params, query }) {
+  const { listen, show, render, on, navigate, api, poll } = viewTools();
   const activity = params.activity;
   if (badActivity(activity)) return;
   let days = [];
@@ -171,7 +178,7 @@ export function dateStep({ params, query }) {
   }
 
   on(strip, 'click', '[data-date]', (_e, btn) => select(btn.dataset.date));
-  cta.addEventListener('click', () => navigate(`/book/${activity}/${selected}`));
+  listen(cta, 'click', () => navigate(`/book/${activity}/${selected}`));
   on(root, 'click', '[data-act="calendar"]', () => openCalendar(days, selected, (d) => {
     select(d);
     paint({ scroll: true });
@@ -188,7 +195,7 @@ export function dateStep({ params, query }) {
     } catch (err) {
       render(strip, '');
       render(cardEl, errorState(err, { title: "Couldn't load live availability" }));
-      $('[data-act="retry"]', cardEl)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', cardEl), 'click', load);
     }
   }
   load();
@@ -200,6 +207,7 @@ export function dateStep({ params, query }) {
 }
 
 function openCalendar(days, selected, onPick) {
+  const { openModal, on } = viewTools();
   if (!days.length) return;
   const byDate = new Map(days.map((d) => [d.date, d]));
   const first = days[0].date;
@@ -316,6 +324,7 @@ function resourceCard(day, r, activity) {
 }
 
 function openMaintenance(r, activity, day) {
+  const { openModal } = viewTools();
   const noun = activityNoun(activity);
   const others = state.facility.resources.filter((x) => x.activity === activity && x.id !== r.id).map((x) => x.name);
   openModal({
@@ -335,6 +344,7 @@ function openMaintenance(r, activity, day) {
 }
 
 export function resourceStep({ params }) {
+  const { listen, navigate, show, render, on, api, toast, poll } = viewTools();
   const { activity, date } = params;
   if (badActivity(activity)) return;
   if (!isDate(date)) return navigate(`/book/${activity}`, { replace: true });
@@ -384,7 +394,7 @@ export function resourceStep({ params }) {
         return;
       }
       render(list, errorState(err, { title: "Couldn't load live availability" }));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
   load();
@@ -415,6 +425,7 @@ function timesLabel(starts, slotMinutes, { full = false } = {}) {
 }
 
 function slotButton(s, picked) {
+  const { on } = viewTools();
   const range = rangeLabel(s.start, s.end);
   if (s.state === 'available') {
     const on = picked.has(s.start);
@@ -441,6 +452,7 @@ function slotButton(s, picked) {
  * go into one booking: one hold, one payment (rate × slots), one reference.
  */
 export function timeStep({ params, query }) {
+  const { listen, navigate, show, render, on, api, toast, poll } = viewTools();
   const { activity, date, resourceId } = params;
   if (badActivity(activity)) return;
   if (!isDate(date)) return navigate(`/book/${activity}`, { replace: true });
@@ -525,13 +537,13 @@ export function timeStep({ params, query }) {
     paint();
     slotsEl.querySelector(`[data-start="${start}"]`)?.focus();
   });
-  clearBtn.addEventListener('click', () => {
+  listen(clearBtn, 'click', () => {
     picked.clear();
     syncUrl();
     paint();
   });
   // Arrow keys move between open times; Space or Enter picks one.
-  slotsEl.addEventListener('keydown', (e) => {
+  listen(slotsEl, 'keydown', (e) => {
     if (!['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
     const items = $$('.slot.available', slotsEl);
     const i = items.indexOf(document.activeElement);
@@ -539,7 +551,7 @@ export function timeStep({ params, query }) {
     e.preventDefault();
     items[(i + (e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : -1) + items.length) % items.length].focus();
   });
-  cta.addEventListener('click', () => {
+  listen(cta, 'click', () => {
     if (picked.size) navigate(`/book/${activity}/${date}/${resourceId}/${sorted().join(',')}`);
   });
 
@@ -574,7 +586,7 @@ export function timeStep({ params, query }) {
         return;
       }
       render(slotsEl, errorState(err, { title: "Couldn't load live availability" }));
-      $('[data-act="retry"]', slotsEl)?.addEventListener('click', () => load(true));
+      listen($('[data-act="retry"]', slotsEl), 'click', () => load(true));
     }
   }
   paintSummary();
@@ -598,6 +610,7 @@ const INVALID = {
 };
 
 export function reviewStep({ params }) {
+  const { listen, navigate, show, render, on, api, setBusy, toast } = viewTools();
   const { activity, date, resourceId } = params;
   const starts = parseStarts(params.start);
   if (badActivity(activity)) return;
@@ -688,11 +701,12 @@ export function reviewStep({ params }) {
     /* without a quote the booking still works; the next screen shows the server's amounts */
   });
 
-  reserve.addEventListener('click', async () => {
+  listen(reserve, 'click', async () => {
+    if (reserve.disabled) return;
     setBusy(reserve, true, coveredByCredit() ? 'Booking…' : 'Reserving…');
     const withCredit = Boolean(quote && quote.creditApplied > 0 && useCredit);
     try {
-      const created = await api.post('/api/bookings', { resourceId, date, starts, useCredit: withCredit, expectedCredit: withCredit ? quote.creditApplied : null });
+      const created = await postBooking('/api/bookings', { resourceId, date, starts, useCredit: withCredit, expectedCredit: withCredit ? quote.creditApplied : null }, user.id);
       endRebook();
       const b = created.booking;
       navigate(b.status === 'CONFIRMED' ? `/bookings/${b.id}/confirmed` : `/bookings/${b.id}/held`, { replace: true });
@@ -715,6 +729,7 @@ export function reviewStep({ params }) {
 }
 
 function showInvalid(root, err, kind, { activity, date, resourceId, starts }) {
+  const { render } = viewTools();
   const target = {
     time: `/book/${activity}/${date}/${resourceId}?start=${starts.join(',')}`,
     date: `/book/${activity}`,
@@ -729,6 +744,7 @@ function showInvalid(root, err, kind, { activity, date, resourceId, starts }) {
 }
 
 function openConflict(err, { activity, date, resourceId, starts, resName }) {
+  const { openModal, on, navigate } = viewTools();
   const slotMin = state.facility.rules.slotMinutes;
   const noun = activityNoun(activity);
   const multi = starts.length > 1;

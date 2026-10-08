@@ -1,14 +1,18 @@
+import { createViewTools } from './view.js';
 /** Account dialogs shared by the player app and the staff/admin consoles. */
 import { api } from './api.js';
 import { newPasswordCredentials, passwordProof } from './credentials.js';
-import { $, html, setBusy } from './dom.js';
+import { listen, $, html, setBusy } from './dom.js';
 import { icon } from './icons.js';
 import { clearFieldErrors, openModal, showFieldErrors, toast } from './ui.js';
+
+const viewTools = createViewTools({ listen, api, setBusy, clearFieldErrors, openModal, showFieldErrors, toast });
 
 const localDigits = (phone) => (phone || '').replace(/\D/g, '').replace(/^63(?=9\d{9}$)/, '').replace(/^0/, '');
 
 /** Name and mobile number. `onSaved(user)` gets the updated account. */
 export function openEditProfile(user, { onSaved, phoneHelp = 'For booking updates. Never shown to other players.' }) {
+  const { listen, openModal, clearFieldErrors, showFieldErrors, setBusy, api, toast } = viewTools();
   const digits = localDigits(user.phone);
   const m = openModal({
     sheet: true,
@@ -22,7 +26,7 @@ export function openEditProfile(user, { onSaved, phoneHelp = 'For booking update
       </form>`,
     onOpen: (panel) => {
       const form = $('[data-form]', panel);
-      form.addEventListener('submit', async (e) => {
+      listen(form, 'submit', async (e) => {
         e.preventDefault();
         clearFieldErrors(form);
         const name = form.elements.namedItem('name').value.trim();
@@ -34,11 +38,12 @@ export function openEditProfile(user, { onSaved, phoneHelp = 'For booking update
         const btn = form.querySelector('[type="submit"]');
         setBusy(btn, true, 'Saving…');
         try {
-          const res = await api.patch('/api/me', { name, phone: d ? `+63 ${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : '' });
+          const res = await api.patch('/api/me', { name, phone: d ? `+63 ${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : '' }, { signal: m.signal });
           m.close();
           toast('Profile updated');
           onSaved(res.user);
         } catch (err) {
+          if (err.name === 'AbortError') return;
           setBusy(btn, false);
           if (!showFieldErrors(form, err.details)) toast(err.message, { type: 'error' });
         }
@@ -53,6 +58,7 @@ export function openEditProfile(user, { onSaved, phoneHelp = 'For booking update
  * sees the password, so the length rule lives here and in create-admin).
  */
 export function openChangePassword(email, { minLength = 8 } = {}) {
+  const { listen, openModal, clearFieldErrors, showFieldErrors, setBusy, api, toast } = viewTools();
   const m = openModal({
     sheet: true,
     label: 'Change password',
@@ -64,7 +70,7 @@ export function openChangePassword(email, { minLength = 8 } = {}) {
       </form>`,
     onOpen: (panel) => {
       const form = $('[data-form]', panel);
-      form.addEventListener('submit', async (e) => {
+      listen(form, 'submit', async (e) => {
         e.preventDefault();
         clearFieldErrors(form);
         const currentPassword = form.elements.namedItem('currentPassword').value;
@@ -74,11 +80,13 @@ export function openChangePassword(email, { minLength = 8 } = {}) {
         const btn = form.querySelector('[type="submit"]');
         setBusy(btn, true, 'Saving…');
         try {
-          const [currentClientHash, credentials] = await Promise.all([passwordProof(email, currentPassword), newPasswordCredentials(newPassword)]);
-          await api.post('/api/me/password', { currentClientHash, newPassword: credentials });
+          const [currentClientHash, credentials] = await Promise.all([passwordProof(email, currentPassword, { signal: m.signal }), newPasswordCredentials(newPassword)]);
+          if (!m.isOpen()) return;
+          await api.post('/api/me/password', { currentClientHash, newPassword: credentials }, { signal: m.signal });
           m.close();
           toast('Password changed', { sub: 'Other devices were signed out.' });
         } catch (err) {
+          if (err.name === 'AbortError') return;
           setBusy(btn, false);
           if (!showFieldErrors(form, err.details)) toast(err.message, { type: 'error' });
         }

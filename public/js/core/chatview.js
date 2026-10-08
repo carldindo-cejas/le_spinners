@@ -1,7 +1,10 @@
-import { html } from './dom.js';
+import { createViewTools } from './view.js';
+import { listen, html } from './dom.js';
 import { icon } from './icons.js';
 import { clock, dayClock, initials, isoDate } from './format.js';
 import { openModal } from './ui.js';
+
+const viewTools = createViewTools({ listen, openModal });
 
 /** Per typed chat message. The server enforces the same limit (src/worker/lib/chat.ts). */
 export const MESSAGE_MAX_CHARS = 120;
@@ -12,6 +15,7 @@ export const MESSAGE_MAX_CHARS = 120;
  * Call the returned function after changing the text in code (quick reply, sent).
  */
 export function charCounter(input) {
+  const { listen } = viewTools();
   const el = document.createElement('p');
   el.className = 'char-count';
   el.id = `${input.id}-count`;
@@ -32,7 +36,7 @@ export function charCounter(input) {
       status.textContent = full ? `Limit reached: messages can be up to ${MESSAGE_MAX_CHARS} characters.` : '';
     }
   };
-  input.addEventListener('input', sync);
+  listen(input, 'input', sync);
   sync();
   return sync;
 }
@@ -75,6 +79,7 @@ export function messageList(messages, { side }) {
 }
 
 export function openImage(url, title = 'Payment screenshot') {
+  const { openModal } = viewTools();
   openModal({
     label: title,
     wide: true,

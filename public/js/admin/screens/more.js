@@ -1,13 +1,17 @@
+import { createViewTools } from '../../core/view.js';
 import { html } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { initials } from '../../core/format.js';
 import { frame, state } from '../shell.js';
 import { BASE, CONSOLE, REVENUE, isAdminConsole } from '../console.js';
 
+const viewTools = createViewTools({ frame });
+
 const row = (href, iconName, title, meta, extra = '') =>
   html`<a class="list-row" href="${href}"><span class="row-tile">${icon(iconName, 20)}</span><span class="grow"><span class="row-title">${title}</span><br><span class="row-meta">${meta}</span></span>${extra}${icon('chevron-right', 18, 2.2, 'chev')}</a>`;
 
 export function moreView() {
+  const { frame } = viewTools();
   const u = state.user;
   const n = state.badges.unresolved;
   frame({

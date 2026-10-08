@@ -1,18 +1,24 @@
+import { createViewTools } from '../../core/view.js';
+import { createScope, currentScope, setElementScope } from '../../core/lifecycle.js';
 import { api } from '../../core/api.js';
-import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, bytes, clock, dayClock, firstName, minutesBetween, monthDayYear, peso, shortDate, weekdayShort } from '../../core/format.js';
-import { copyText, errorState, memberTag, openModal, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
+import { choiceKeys, copyText, dialogFocus, errorState, lockScroll, memberTag, openModal, poll, preserveFocus, skeletonRows, statusPill, syncChoiceGroups, toast } from '../../core/ui.js';
 import { frame, navigate, refreshBadges, state } from '../shell.js';
 import { waitLabel } from './dashboard.js';
 import { miniChat } from '../minichat.js';
 import { API, BASE } from '../console.js';
 
+const viewTools = createViewTools({ listen, api, on, render, setBusy, copyText, openModal, poll, toast, frame, navigate, refreshBadges, miniChat });
+
 async function staffSettings() {
+  const { api } = viewTools();
   if (!state.settings) {
     try {
       state.settings = (await api.get(`${API}/rules`)).settings;
-    } catch {
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
       state.settings = { gcashNumber: '', resubmitMinutes: 10 };
     }
   }
@@ -84,6 +90,7 @@ function rejectedCard(b) {
 }
 
 export async function queueView({ query }) {
+  const { listen, frame, render, on, api, poll } = viewTools();
   let tab = ['pending', 'approved', 'rejected'].includes(query.get('tab')) ? query.get('tab') : 'pending';
   const s = await staffSettings();
   const root = frame({
@@ -93,10 +100,10 @@ export async function queueView({ query }) {
     template: html`<div class="page">
       <div class="cols c-main-aside">
         <div class="stack stack-16">
-          <div class="utabs only-desktop" role="tablist" data-tabs-d></div>
-          <div class="seg only-mobile" role="tablist" data-tabs-m></div>
+          <div class="utabs only-desktop" role="tablist" aria-label="Payment verification" data-tabs-d></div>
+          <div class="seg only-mobile" role="tablist" aria-label="Payment verification" data-tabs-m></div>
           <div class="row row-between"><p class="small" data-sort></p><p class="lock-line only-mobile">${icon('lock', 14, 2.2)}Proofs are private to staff</p></div>
-          <div class="stack stack-12" data-list>${skeletonRows(3, 'sk-card')}</div>
+          <div class="stack stack-12" role="tabpanel" id="verification-panel" tabindex="0" data-list>${skeletonRows(3, 'sk-card')}</div>
           <p class="banner violet compact only-mobile"><span><b>While pending,</b> these slots stay blocked for other players and no longer expire on the ${state.settings?.holdMinutes ?? 10}-minute timer.</span></p>
         </div>
         <aside class="stack stack-16 only-desktop">
@@ -114,6 +121,7 @@ export async function queueView({ query }) {
   });
   const list = $('[data-list]', root);
   let data = null;
+  let requestGeneration = 0;
 
   function paintTabs() {
     const c = data ? data.counts : { pending: 0, approved: 0, rejected: 0 };
@@ -122,8 +130,14 @@ export async function queueView({ query }) {
       { k: 'approved', d: `Approved today · ${c.approved}`, m: `Approved · ${c.approved}` },
       { k: 'rejected', d: `Rejected · ${c.rejected}`, m: `Rejected · ${c.rejected}` },
     ];
-    render($('[data-tabs-d]', root), tabs.map((t) => html`<button type="button" role="tab" data-tab="${t.k}" aria-selected="${tab === t.k ? 'true' : 'false'}">${t.d}</button>`));
-    render($('[data-tabs-m]', root), tabs.map((t) => html`<button type="button" role="tab" data-tab="${t.k}" aria-selected="${tab === t.k ? 'true' : 'false'}">${t.m}</button>`));
+    for (const [selector, suffix, label] of [['[data-tabs-d]', 'desktop', 'd'], ['[data-tabs-m]', 'mobile', 'm']]) {
+      const target = $(selector, root);
+      preserveFocus(target, () => {
+        render(target, tabs.map((t) => html`<button type="button" role="tab" id="verification-${suffix}-${t.k}" aria-controls="verification-panel" data-tab="${t.k}" aria-selected="${tab === t.k ? 'true' : 'false'}">${t[label]}</button>`));
+        syncChoiceGroups(target);
+      });
+    }
+    list.setAttribute('aria-labelledby', `verification-${matchMedia('(min-width: 1024px)').matches ? 'desktop' : 'mobile'}-${tab}`);
     render($('[data-sort]', root), tab === 'pending' ? html`Sorted by <b>oldest first</b>` : html`Today · newest first`);
   }
 
@@ -145,18 +159,23 @@ export async function queueView({ query }) {
     render(list, skeletonRows(3, 'sk-card'));
     load();
   });
+  listen(root, 'keydown', choiceKeys);
   on(list, 'click', '[data-view]', (_e, btn) => {
     const b = data.items.find((x) => x.id === btn.dataset.view);
     if (b && b.proof && b.proof.url) openViewer({ url: b.proof.url, booking: b, proof: b.proof, onDecision: () => load() });
   });
 
   async function load() {
+    const generation = ++requestGeneration, selectedTab = tab;
     try {
-      data = await api.get(`${API}/verifications?tab=${tab}`);
+      const response = await api.get(`${API}/verifications?tab=${selectedTab}`);
+      if (generation !== requestGeneration || selectedTab !== tab) return;
+      data = response;
       paint();
     } catch (err) {
+      if (generation !== requestGeneration || selectedTab !== tab) return;
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
   load();
@@ -166,6 +185,7 @@ export async function queueView({ query }) {
 // ── Proof stage: pan, zoom, rotate ─────────────────────────────────────────
 
 function attachStage(stage, img, readout) {
+  const { listen } = viewTools();
   const st = { zoom: 1, rot: 0, tx: 0, ty: 0 };
   const apply = () => {
     img.style.setProperty('--zoom', String(st.zoom));
@@ -180,7 +200,7 @@ function attachStage(stage, img, readout) {
   };
   const pointers = new Map();
   let pinch = null;
-  stage.addEventListener('pointerdown', (e) => {
+  listen(stage, 'pointerdown', (e) => {
     stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     stage.classList.add('dragging');
@@ -189,7 +209,7 @@ function attachStage(stage, img, readout) {
       pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), zoom: st.zoom };
     }
   });
-  stage.addEventListener('pointermove', (e) => {
+  listen(stage, 'pointermove', (e) => {
     const prev = pointers.get(e.pointerId);
     if (!prev) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -207,9 +227,9 @@ function attachStage(stage, img, readout) {
     if (pointers.size < 2) pinch = null;
     if (!pointers.size) stage.classList.remove('dragging');
   };
-  stage.addEventListener('pointerup', end);
-  stage.addEventListener('pointercancel', end);
-  stage.addEventListener('wheel', (e) => {
+  listen(stage, 'pointerup', end);
+  listen(stage, 'pointercancel', end);
+  listen(stage, 'wheel', (e) => {
     e.preventDefault();
     zoomBy(e.deltaY < 0 ? 1.1 : 1 / 1.1);
   }, { passive: false });
@@ -248,11 +268,17 @@ function zoomTools(prefix = '') {
 
 /** Full-screen proof viewer (A39). */
 export function openViewer({ url, booking: b, proof, onDecision, canDecide = true, checklistDone = false }) {
+  const parent = currentScope();
+  parent?.assertCurrent();
+  const scope = createScope(parent);
+  const { listen, render, on } = viewTools(scope);
   const host = document.createElement('div');
+  setElementScope(host, scope);
   host.className = 'viewer';
   host.setAttribute('role', 'dialog');
   host.setAttribute('aria-modal', 'true');
   host.setAttribute('aria-label', 'Payment proof viewer');
+  host.tabIndex = -1;
   render(host, html`<div class="v-top">
       <button type="button" class="icon-btn" data-close aria-label="Close viewer">${icon('x', 20, 2.2)}</button>
       <div class="grow"><p class="strong">${proof && proof.fileName ? proof.fileName : 'Payment screenshot'}</p><p class="small light-text">Uploaded by ${b.user.name}${proof && (proof.createdAt || proof.submittedAt) ? ` · ${dayClock(proof.createdAt || proof.submittedAt)}` : ''}</p></div>
@@ -274,22 +300,29 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
       ${canDecide && b.status === 'PAYMENT_SUBMITTED' ? html`<button type="button" class="btn btn-volt btn-block" data-decide="approve">Approve payment</button><button type="button" class="btn btn-ghost-light btn-block" data-decide="reject">Reject payment</button>` : ''}
     </aside>`);
   document.body.append(host);
-  document.body.style.setProperty('overflow', 'hidden');
+  const focus = dialogFocus(host);
+  const unlock = lockScroll();
   const previous = document.activeElement;
   const ctl = attachStage($('[data-stage]', host), $('[data-stage] img', host), $('[data-zv]', host));
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
+    scope.dispose();
+    focus.dispose();
     host.remove();
-    document.removeEventListener('keydown', onKey, true);
-    document.body.style.removeProperty('overflow');
-    if (previous && previous.focus) previous.focus();
+    unlock();
+    if ((!parent || parent.isCurrent()) && previous?.isConnected) previous.focus();
   };
   const onKey = (e) => {
+    if (!focus.isActive()) return;
     if (e.key === 'Escape' && !document.querySelector('.scrim')) {
       e.preventDefault();
       close();
     } else if (!document.querySelector('.scrim') && ctl.keys(e)) e.preventDefault();
   };
-  document.addEventListener('keydown', onKey, true);
+  scope.own(listen(document, 'keydown', onKey, true));
+  scope.own(close);
   on(host, 'click', '[data-close]', close);
   on(host, 'click', '[data-z]', (_e, btn) => ({ in: ctl.zoomIn, out: ctl.zoomOut, fit: ctl.fit, rotate: ctl.rotate })[btn.dataset.z]());
   on(host, 'click', '[data-decide]', (_e, btn) => {
@@ -307,6 +340,7 @@ export function openViewer({ url, booking: b, proof, onDecision, canDecide = tru
 // ── Approve (A43) and reject (A44) ─────────────────────────────────────────
 
 async function nextPending(exceptId) {
+  const { api } = viewTools();
   try {
     const res = await api.get(`${API}/verifications?tab=pending`);
     return res.items.find((x) => x.id !== exceptId) || null;
@@ -316,6 +350,7 @@ async function nextPending(exceptId) {
 }
 
 function openApprove(b, proof, onDone, { checklistDone = false } = {}) {
+  const { openModal, on, setBusy, api, refreshBadges, toast, navigate } = viewTools();
   const first = firstName(b.user.name);
   const items = checklistItems(b, proof);
   const dayName = new Date(`${b.date}T00:00:00Z`).toLocaleString('en-US', { weekday: 'long', timeZone: 'UTC' });
@@ -389,6 +424,7 @@ const REASONS = [
 ];
 
 function openReject(b, onDone) {
+  const { listen, openModal, on, setBusy, api, refreshBadges, toast, navigate } = viewTools();
   const first = firstName(b.user.name);
   const minutes = (state.settings && state.settings.resubmitMinutes) || 10;
   let choice = null;
@@ -418,11 +454,12 @@ function openReject(b, onDone) {
       on(panel, 'click', '[data-reason]', (_e, btn) => {
         choice = Number(btn.dataset.reason);
         for (const r of panel.querySelectorAll('[data-reason]')) r.setAttribute('aria-checked', String(Number(r.dataset.reason) === choice));
+        syncChoiceGroups(panel);
         msg.value = choice < REASONS.length ? `${REASONS[choice]} Please send a new screenshot in the booking chat or with "Submit new proof".` : '';
         if (choice === REASONS.length) msg.focus();
         sync();
       });
-      msg.addEventListener('input', sync);
+      listen(msg, 'input', sync);
       on(panel, 'click', '[data-act="reject"]', async () => {
         const other = choice === REASONS.length;
         const message = msg.value.trim();
@@ -460,6 +497,7 @@ function openReject(b, onDone) {
 // ── Verification detail (A38 / AM38) ───────────────────────────────────────
 
 export async function verifyDetailView({ params }) {
+  const { listen, frame, render, miniChat, on, copyText, toast, api } = viewTools();
   const id = params.id;
   await staffSettings();
   let d = null;
@@ -543,7 +581,7 @@ export async function verifyDetailView({ params }) {
       ${!decided ? html`<div class="decision-bar"><p data-decision-note></p><div class="btns"><button type="button" class="btn btn-danger-outline" data-act="reject">Reject payment</button><button type="button" class="btn btn-primary" data-act="approve" aria-describedby="decision-note">Approve payment</button></div></div>`
         : html`<div class="decision-bar"><p>${b.status === 'CONFIRMED' ? 'Decision recorded.' : 'Nothing to decide right now.'}</p><div class="btns"><a class="btn btn-dark" href="${BASE}/verify" data-next>Back to queue</a></div></div>`}`);
     for (const a of body.querySelectorAll('[data-back]')) {
-      a.addEventListener('click', (e) => {
+      listen(a, 'click', (e) => {
         if (history.state && history.state.depth > 0) {
           e.preventDefault();
           history.back();
@@ -601,7 +639,7 @@ export async function verifyDetailView({ params }) {
   });
   on(body, 'click', '[data-act="approve"]', (_e, btn) => {
     if (btn.disabled || ticked.size < checklistItems(d.booking, d.proofs[0]).length) {
-      $('[data-checklist]', body)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      $('[data-checklist]', body)?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
       return;
     }
     openApprove(d.booking, proofWithCheck(), load, { checklistDone: true });
@@ -626,7 +664,7 @@ export async function verifyDetailView({ params }) {
       paint();
     } catch (err) {
       render(body, html`<div class="page">${errorState(err, { title: err.status === 404 ? 'Booking not found' : undefined, retry: err.status !== 404 })}</div>`);
-      $('[data-act="retry"]', body)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', body), 'click', load);
     }
   }
   await load();

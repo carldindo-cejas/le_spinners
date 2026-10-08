@@ -1,4 +1,4 @@
-import { html } from '../core/dom.js';
+import { html, listen } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 
 /**
@@ -58,7 +58,7 @@ export function rebookBanner(ctx) {
 }
 
 export function wireRebookBanner(root) {
-  root.querySelector('[data-act="end-rebook"]')?.addEventListener('click', () => {
+  listen(root.querySelector('[data-act="end-rebook"]'), 'click', () => {
     endRebook();
     root.querySelector('[data-rebook]')?.remove();
   });

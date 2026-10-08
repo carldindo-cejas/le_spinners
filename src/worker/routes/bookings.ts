@@ -8,13 +8,14 @@ import {
   type BookingJoin,
 } from '../lib/bookings';
 import { MESSAGE_MAX_CHARS, listMessages, markRead, playerUnreadChats, postMessage } from '../lib/chat';
+import { afterPage, pageRequest, pageResult } from '../lib/pagination';
 import { creditSummary } from '../lib/credits';
 import { bookingCreditInfo } from '../lib/disruptions';
 import { ApiError, badRequest, conflict, notFound, unprocessable } from '../lib/errors';
 import { listProofs, proofLink, submitProof } from '../lib/payments';
 import { loadSettings, publicSettings } from '../lib/settings';
-import { offsetMinutes, peso } from '../lib/time';
-import { jsonBody, parse, query, zDate, zId } from '../lib/validate';
+import { localNow, offsetMinutes, peso } from '../lib/time';
+import { jsonBody, parse, query, zDate, zId, zIdempotencyKey } from '../lib/validate';
 
 const MINUTE = 60_000;
 
@@ -76,16 +77,25 @@ bookingRoutes.get('/', async (c) => {
   const now = Date.now();
   const settings = await loadSettings(c.env.DB);
   const offset = offsetMinutes(c.env.TZ_OFFSET_MINUTES);
+  const q = query(c,z.object({group:z.enum(['upcoming','past','cancelled']).optional(),order:z.enum(['soonest','newest']).optional()}));
+  const page = pageRequest(c.req.query(), `player-bookings:${user.id}:${JSON.stringify(q)}`, ['string','number','string']);
+  const direction = q.order === 'soonest' ? 'ASC' : 'DESC';
+  const after = afterPage(page, ['b.date','b.start_min','b.id'],direction);
+  const local = localNow(offset,now);
+  const upcoming = `(b.status='PAYMENT_SUBMITTED' OR (b.status IN ('TEMPORARY','REJECTED') AND b.hold_expires_at>?) OR (b.status='CONFIRMED' AND (b.date>? OR (b.date=? AND b.end_min>?))))`;
+  const group = q.group === 'cancelled' ? `b.status='CANCELLED'` : q.group === 'upcoming' ? upcoming : q.group === 'past' ? `b.status!='CANCELLED' AND NOT ${upcoming}` : '';
+  const groupParams = q.group && q.group !== 'cancelled' ? [now,local.date,local.date,local.minutes] : [];
   const [{ results }, unread, credits] = await Promise.all([
-    c.env.DB.prepare(`${BOOKING_SELECT} WHERE b.user_id = ? ORDER BY b.date DESC, b.start_min DESC LIMIT 200`).bind(user.id).all<BookingJoin>(),
+    c.env.DB.prepare(`${BOOKING_SELECT} WHERE b.user_id = ?${group ? ` AND (${group})` : ''}${after.sql ? ` AND ${after.sql}` : ''} ORDER BY b.date ${direction}, b.start_min ${direction}, b.id ${direction} LIMIT ?`).bind(user.id,...groupParams,...after.params,page.limit + 1).all<BookingJoin>(),
     playerUnreadChats(c.env.DB, user.id),
     creditSummary(c.env.DB, user.id, now),
   ]);
+  const result = pageResult(results, page, b => [b.date,b.start_min,b.id]);
   return c.json({
-    now,
+    now, page:result.page,
     /** Booking credit the player can spend now. */
     credits,
-    bookings: results.map((b) => ({ ...bookingDTO(b, now, settings, offset), unreadMessages: unread.get(b.id) ?? 0 })),
+    bookings: result.rows.map((b) => ({ ...bookingDTO(b, now, settings, offset), unreadMessages: unread.get(b.id) ?? 0 })),
   });
 });
 
@@ -134,13 +144,14 @@ bookingRoutes.get('/quote', async (c) => {
 /** Reserve & pay: creates a TEMPORARY booking that holds the chosen slots (or a CONFIRMED one paid by credit). */
 bookingRoutes.post('/', async (c) => {
   const user = requirePlayer(c);
+  const idempotencyKey = parse(zIdempotencyKey, c.req.header('Idempotency-Key') ?? '');
   const body = await jsonBody(c, holdSchema);
   await enforceRateLimit(c.env.DB, `hold:user:${user.id}`, 20, 60 * MINUTE);
   const settings = await loadSettings(c.env.DB);
   const input = { resourceId: body.resourceId, date: body.date, starts: requestedStarts(body, settings.slotMinutes) };
   const now = Date.now();
   try {
-    const b = await createHold(c.env, settings, user, { ...input, useCredit: body.useCredit ?? false, expectedCredit: body.expectedCredit ?? null }, now);
+    const b = await createHold(c.env, settings, user, { ...input, idempotencyKey, useCredit: body.useCredit ?? false, expectedCredit: body.expectedCredit ?? null }, now);
     return c.json(await playerDetail(c, b, now), 201);
   } catch (err) {
     if (err instanceof ApiError && err.code === 'SLOT_TAKEN') {
@@ -218,10 +229,11 @@ bookingRoutes.get('/:id/messages', async (c) => {
   const user = requirePlayer(c);
   const b = await ownBooking(c, user);
   const now = Date.now();
-  const messages = await listMessages(c.env, b.id, { side: 'player', userId: user.id }, now);
+  const page = pageRequest(c.req.query(),`player-chat:${user.id}:${b.id}`,['number','string']);
+  const messages = await listMessages(c.env, b.id, { side: 'player', userId: user.id }, now,page);
   c.executionCtx.waitUntil(markRead(c.env, b.id, 'player', user.id, now).catch((err) => console.error('markRead failed', err)));
   const settings = await loadSettings(c.env.DB);
-  return c.json({ now, booking: bookingDTO(b, now, settings, offsetMinutes(c.env.TZ_OFFSET_MINUTES)), messages });
+  return c.json({ now, booking: bookingDTO(b, now, settings, offsetMinutes(c.env.TZ_OFFSET_MINUTES)), page:messages.page, messages });
 });
 
 bookingRoutes.post('/:id/messages', async (c) => {

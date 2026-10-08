@@ -1,11 +1,14 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on } from '../../core/dom.js';
+import { listen, $, html, on } from '../../core/dom.js';
 import { icon, courtArt } from '../../core/icons.js';
 import { bookingTime, clock, dateLabel, dayClock, initials, isoDate, longDate, peso } from './util.js';
 import { copyText, errorState, memberTag, openModal, poll, ringSvg, skeletonRows, startCountdown, statusPill, toast } from '../../core/ui.js';
 import { navigate, show, state, subHeader } from '../shell.js';
 import { lockLine } from '../components.js';
 import { rebookFromBooking } from '../rebook.js';
+
+const viewTools = createViewTools({ listen, api, on, copyText, openModal, poll, startCountdown, toast, navigate, show });
 
 function when(ms) {
   return isoDate(ms) === isoDate(Date.now()) ? clock(ms) : dayClock(ms);
@@ -95,6 +98,7 @@ function chatPreview(d) {
 }
 
 function viewProof(d) {
+  const { openModal } = viewTools();
   const p = d.proofs[0];
   if (!p) return;
   openModal({
@@ -310,6 +314,7 @@ function cancelledDetails(d) {
 }
 
 export async function bookingView({ params }) {
+  const { listen, show, api, navigate, on, startCountdown, setTimeout, poll } = viewTools();
   show(html`<div class="screen">${skeletonRows(1, 'sk-card')}${skeletonRows(4)}</div>`);
   let d;
   const load = () => api.get(`/api/bookings/${encodeURIComponent(params.id)}`);
@@ -317,7 +322,7 @@ export async function bookingView({ params }) {
     d = await load();
   } catch (err) {
     const root = show(html`<div class="screen">${err.status === 404 ? html`<div class="empty"><p class="empty-title">Booking not found</p><p class="empty-body">It may belong to another account, or the link is old.</p><a class="btn btn-primary btn-md" href="/bookings">My bookings</a></div>` : errorState(err)}</div>`);
-    $('[data-act="retry"]', root)?.addEventListener('click', () => bookingView({ params }));
+    listen($('[data-act="retry"]', root), 'click', () => bookingView({ params }));
     return undefined;
   }
   const b = d.booking;
@@ -375,6 +380,7 @@ export async function bookingView({ params }) {
 // ── U33: booking confirmed ─────────────────────────────────────────────────
 
 export async function confirmedView({ params }) {
+  const { show, api, navigate, on, copyText, toast } = viewTools();
   show(html`<div class="screen">${skeletonRows(1, 'sk-card')}</div>`);
   let d;
   try {
@@ -421,6 +427,7 @@ export async function confirmedView({ params }) {
 
 /** Players can't cancel bookings (REBOOKING.md §4), so this screen only forwards old links. */
 export function cancelledView({ params }) {
+  const { navigate } = viewTools();
   navigate(`/bookings/${encodeURIComponent(params.id)}`, { replace: true });
 }
 

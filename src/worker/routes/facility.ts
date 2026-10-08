@@ -100,6 +100,28 @@ function checkPlayerDate(date: string, today: string, windowDays: number) {
   }
 }
 
+/** Public calendar: explicit allowlist, even for requests with a signed-in cookie.
+ * Never expose booking data, closure reasons, internal notes, or personalized states.
+ */
+facilityRoutes.get('/facility/calendar', async (c) => {
+  const q = query(c, z.object({ activity: zActivity.optional(), date: zDate }));
+  const settings = await loadSettings(c.env.DB);
+  const now = Date.now();
+  const local = localNow(offsetMinutes(c.env.TZ_OFFSET_MINUTES), now);
+  checkPlayerDate(q.date, local.date, settings.bookingWindowDays);
+  const day = await dayAvailability(c.env, settings, { activity: q.activity ?? null, date: q.date },
+    { staff: false, userId: null, membership: 'none' }, now);
+  return c.json({
+    now, today: local.date, lastDate: addDays(local.date, settings.bookingWindowDays),
+    date: day.date, dateLabel: day.dateLabel, open: day.open, hours: day.hours,
+    slotMinutes: day.slotMinutes, tzOffsetMinutes: offsetMinutes(c.env.TZ_OFFSET_MINUTES),
+    resources: day.resources.map((r) => ({
+      id: r.id, name: r.name, activity: r.activity, status: r.status,
+      slots: r.slots.map((s) => ({ start: s.start, end: s.end, label: s.label, state: s.state })),
+    })),
+  });
+});
+
 /** One day of slots for an activity. No names, ids or amounts of other players. */
 facilityRoutes.get('/availability', async (c) => {
   const user = requirePlayer(c);

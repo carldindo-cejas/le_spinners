@@ -24,15 +24,14 @@ if (localPepper() !== devPepper()) {
   );
   process.exit(1);
 }
-const isWindows = process.platform === 'win32';
 const BUCKET = 'le-spinners-proofs';
 
 function wrangler(args) {
   console.log(`\n> wrangler ${args.join(' ')}`);
-  const result = spawnSync(isWindows ? 'npx.cmd' : 'npx', ['wrangler', ...args], {
+  const result = spawnSync(process.execPath, [join(root, 'node_modules/wrangler/bin/wrangler.js'), ...args], {
     cwd: root,
     stdio: 'inherit',
-    shell: isWindows,
+    windowsHide: true,
     env: { ...process.env, CI: process.env.CI ?? 'true' }, // skip interactive confirmations for local-only work
   });
   if (result.status !== 0) {
@@ -62,6 +61,14 @@ for (const name of ['maria', 'pedro', 'juan']) {
 // A labelled demo QR so the payment screen shows the QR panel (replace it in Settings).
 wrangler(['r2', 'object', 'put', `${BUCKET}/settings/gcash-qr/demo.png`, '--file', join('db', 'seed-proofs', 'demo-gcash-qr.png'), '--content-type', 'image/png', '--local']);
 sizes.push(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('gcash_qr_key', 'settings/gcash-qr/demo.png', 0);`);
+// Demo rows are seeded after migrations; adopt their references just as 0014 does for a populated upgrade.
+if (existsSync(join(root, 'migrations', '0014_storage_uploads.sql'))) {
+  sizes.push(`INSERT OR IGNORE INTO storage_uploads(id,r2_key,kind,owner_id,booking_id,state,next_attempt_at,created_at,updated_at)
+    SELECT 'legacy-proof/' || id,r2_key,'proof',user_id,booking_id,'attached',created_at + 86400000,created_at,created_at FROM payment_proofs;`);
+  sizes.push(`INSERT OR IGNORE INTO storage_uploads(id,r2_key,kind,owner_id,state,next_attempt_at,created_at,updated_at)
+    SELECT 'legacy-qr/current',value,'qr',updated_by,'attached',updated_at + 86400000,updated_at,updated_at FROM settings
+    WHERE key='gcash_qr_key' AND value != '';`);
+}
 // Written to a file (not --command) so Windows shells don't split the SQL on spaces.
 mkdirSync(join(root, '.wrangler', 'tmp'), { recursive: true });
 writeFileSync(join(root, '.wrangler', 'tmp', 'seed-proof-sizes.sql'), sizes.join('\n'));

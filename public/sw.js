@@ -2,13 +2,14 @@
    - API calls are never cached: availability, holds and payments are live.
    - Pages and static files are network-first with an offline fallback. */
 
-const VERSION = 'ls-2026-10-02-5';
+const VERSION = 'ls-2026-10-07-readiness-history-1';
 const SHELL = [
   '/',
   '/admin/',
   '/staff/',
   '/css/app.css',
   '/css/player.css',
+  '/css/landing.css',
   '/css/admin.css',
   '/manifest.webmanifest',
   '/icons/favicon.svg',
@@ -37,11 +38,12 @@ function timeout(ms) {
   return new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
 }
 
-async function networkFirst(request, fallbackUrl) {
+async function networkFirst(event, fallbackUrl) {
+  const request = event.request;
   const cache = await caches.open(VERSION);
   try {
     const response = await Promise.race([fetch(request), timeout(4000)]);
-    if (response && response.ok && response.type === 'basic') cache.put(request, response.clone());
+    if (response && response.ok && response.type === 'basic') event.waitUntil(cache.put(request, response.clone()).catch(() => undefined));
     return response;
   } catch {
     const cached = (await cache.match(request)) || (fallbackUrl && (await cache.match(fallbackUrl)));
@@ -59,10 +61,10 @@ self.addEventListener('fetch', (event) => {
   if (request.mode === 'navigate') {
     // Each app falls back to its own shell. Shells hold no account data; screens load it live.
     const shell = url.pathname.startsWith('/admin') || url.pathname.startsWith('/revenue') ? '/admin/' : url.pathname.startsWith('/staff') ? '/staff/' : '/';
-    event.respondWith(networkFirst(request, shell));
+    event.respondWith(networkFirst(event, shell));
     return;
   }
   if (/\.(?:js|css|png|svg|webmanifest|woff2?)$/.test(url.pathname)) {
-    event.respondWith(networkFirst(request));
+    event.respondWith(networkFirst(event));
   }
 });

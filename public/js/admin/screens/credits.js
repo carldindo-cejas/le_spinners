@@ -1,10 +1,15 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { dayClock, relTime } from '../../core/format.js';
 import { errorState, openModal, skeletonRows, toast } from '../../core/ui.js';
 import { frame, state } from '../shell.js';
 import { API, BASE, isAdminConsole } from '../console.js';
+import { newIdempotencyKey } from '../disrupt.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, openModal, toast, frame });
 
 /**
  * Booking credits (REBOOKING.md §11): what players can spend, where each credit came from and
@@ -24,6 +29,7 @@ function row(c) {
 }
 
 export function creditsView({ query }) {
+  const { listen, frame, render, api, on } = viewTools();
   let q = query.get('q') || '';
   let only = query.get('state') === 'spendable' ? 'spendable' : 'all';
   const main = frame({
@@ -42,15 +48,16 @@ export function creditsView({ query }) {
   });
   const root = $('[data-page]', main);
   const list = $('[data-list]', root);
+  const pages = historyPager(api, list.parentElement, load);
 
   async function load() {
     render($('[data-chips]', root), [['all', 'All'], ['spendable', 'Can be spent']].map(([k, label]) => html`<button type="button" class="chip" data-state="${k}" aria-pressed="${String(only === k)}">${label}</button>`));
     try {
-      const d = await api.get(`${API}/credits?state=${only}${q ? `&q=${encodeURIComponent(q)}` : ''}`);
+      const d = await pages.get(`${API}/credits?state=${only}${q ? `&q=${encodeURIComponent(q)}` : ''}`);
       render(list, d.credits.length ? d.credits.map(row) : html`<p class="panel-body small">${q ? `No credits match "${q}".` : 'No booking credits yet.'}</p>`);
     } catch (err) {
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
   const sync = () => {
@@ -74,6 +81,7 @@ export function creditsView({ query }) {
 }
 
 function actionDialog({ title, intro, fields, submitLabel, danger = false, send, onDone }) {
+  const { listen, openModal, setBusy, toast } = viewTools();
   let busy = false;
   const m = openModal({
     label: title,
@@ -81,7 +89,8 @@ function actionDialog({ title, intro, fields, submitLabel, danger = false, send,
     content: () => html`<h2 class="dialog-title">${title}</h2><p class="body">${intro}</p>${fields}
       <div class="dialog-actions"><button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'} btn-block" data-act="go">${submitLabel}</button><button type="button" class="btn btn-secondary btn-block" data-close>Go back</button></div>`,
     onOpen: (panel) => {
-      panel.querySelector('[data-act="go"]').addEventListener('click', async (e) => {
+      listen(panel.querySelector('[data-act="go"]'), 'click', async (e) => {
+        if (busy) return;
         const btn = e.currentTarget;
         busy = true;
         setBusy(btn, true, 'Saving…');
@@ -102,6 +111,7 @@ function actionDialog({ title, intro, fields, submitLabel, danger = false, send,
 }
 
 export async function creditDetailView({ params }) {
+  const { listen, frame, api, render, on, toast } = viewTools();
   const id = params.id;
   const main = frame({
     key: 'credits',
@@ -119,7 +129,7 @@ export async function creditDetailView({ params }) {
       d = await api.get(`${API}/credits/${encodeURIComponent(id)}`);
     } catch (err) {
       render(root, errorState(err, { retry: err.status !== 404, title: err.status === 404 ? 'Credit not found' : undefined }));
-      $('[data-act="retry"]', root)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', root), 'click', load);
       return;
     }
     const c = d.credit;
@@ -167,6 +177,8 @@ export async function creditDetailView({ params }) {
   });
   on(root, 'click', '[data-act="refund"]', () => {
     const c = d.credit;
+    // One intended refund keeps its identity through network/server retries.
+    const key = newIdempotencyKey();
     actionDialog({
       title: `Record a cash refund for ${c.user.name}`,
       intro: `Only after Le Spinners actually paid it (GCash or cash at the desk). It spends that much of the credit, so it can't also be used. Up to ${c.remainingLabel}.`,
@@ -184,7 +196,7 @@ export async function creditDetailView({ params }) {
           method: panel.querySelector('#cr-method').value,
           reference: panel.querySelector('#cr-ref').value.trim() || null,
           note: panel.querySelector('#cr-note').value.trim() || null,
-        });
+        }, { headers: { 'Idempotency-Key': key } });
       },
       onDone: () => {
         toast('Refund recorded', { sub: `${c.user.name} was notified.` });

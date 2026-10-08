@@ -1,9 +1,12 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { dayClock, relTime } from '../../core/format.js';
 import { clearFieldErrors, errorState, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame, state } from '../shell.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, showFieldErrors, toast, frame });
 
 const SECTIONS = [
   { id: 'rules', label: 'Booking rules' },
@@ -11,7 +14,8 @@ const SECTIONS = [
   { id: 'pricing', label: 'Pricing' },
   { id: 'alerts', label: 'Admin alerts' },
   { id: 'facility', label: 'Facility info' },
-  { id: 'outbox', label: 'Sent & queued' },
+  { id: 'outbox', label: 'Message delivery' },
+  { id: 'storage', label: 'Upload recovery' },
 ];
 
 const pesos = (c) => (c / 100).toFixed(c % 100 ? 2 : 0);
@@ -24,6 +28,7 @@ function toCentavos(v) {
 }
 
 export async function settingsView() {
+  const { listen, frame, api, render, setBusy, toast, on, clearFieldErrors, showFieldErrors } = viewTools();
   const root = frame({
     key: 'settings',
     eyebrow: 'Admin',
@@ -32,12 +37,13 @@ export async function settingsView() {
   });
   const body = $('[data-body]', root);
   let d;
-  let outbox = [];
+  let delivery;
+  let storage;
   try {
-    [d, { items: outbox }] = await Promise.all([api.get('/api/admin/settings'), api.get('/api/admin/outbox')]);
+    [d, delivery, storage] = await Promise.all([api.get('/api/admin/settings'), api.get('/api/admin/outbox'), api.get('/api/admin/storage-health')]);
   } catch (err) {
     render(body, errorState(err));
-    $('[data-act="retry"]', body)?.addEventListener('click', settingsView);
+    listen($('[data-act="retry"]', body), 'click', settingsView);
     return undefined;
   }
   state.settings = d.settings;
@@ -93,7 +99,7 @@ export async function settingsView() {
         <div class="field"><label class="label" for="st-emails">Email — send to</label><input class="input" id="st-emails" name="staffAlertEmails" value="${s.staffAlertEmails.join(', ')}" placeholder="ana@example.com, desk@example.com" ${dis}>
           <p class="help">Up to 5, separated by commas. ${d.delivery.email === 'resend' ? 'Email is sending through Resend.' : 'Emails are queued until RESEND_API_KEY and EMAIL_FROM are set (see README).'}</p></div>
         <div class="field"><label class="label" for="st-sms">SMS — admin mobile numbers <span class="pill amber sm">Not connected</span></label><input class="input" id="st-sms" name="staffAlertSms" value="${s.staffAlertSms.join(', ')}" placeholder="+63 917 555 0100" ${dis}>
-          <p class="help">Texts are written to the outbox as "queued" and will send once an SMS provider is connected.</p></div>
+          <p class="help">SMS delivery is not connected. Queued texts remain unsent.</p></div>
       </section>
 
       <section class="panel panel-body stack stack-16 set-card" id="facility"><h2 class="h3">Facility info</h2>
@@ -102,22 +108,48 @@ export async function settingsView() {
         <div class="field"><span class="label">Time zone</span><p class="body">Asia/Manila (UTC+8)</p></div>
       </section>
 
-      <section class="panel panel-body stack stack-12 set-card" id="outbox"><div><h2 class="h3">Sent &amp; queued</h2><p class="small">The latest email and SMS alerts.</p></div>
-        ${outbox.length ? html`<div class="table-wrap"><table class="grid"><thead><tr><th>Channel</th><th>To</th><th>Subject</th><th>Status</th><th>When</th></tr></thead><tbody>
-          ${outbox.slice(0, 15).map((o) => html`<tr><td>${o.channel === 'sms' ? 'SMS' : 'Email'}</td><td class="ellipsis">${o.recipient}</td><td>${o.subject || '—'}</td><td><span class="pill sm ${o.status === 'sent' ? 'green' : o.status === 'failed' ? 'red' : 'amber'}">${o.status}</span></td><td><span title="${dayClock(o.createdAt)}">${relTime(o.createdAt)}</span></td></tr>`)}
-        </tbody></table></div>` : html`<p class="small">Nothing yet.</p>`}
+      <section class="panel panel-body stack stack-12 set-card" id="outbox"><div><h2 class="h3">Message delivery</h2><p class="small">Provider acceptance does not confirm arrival in the recipient's inbox.</p></div>
+        <div class="row row-wrap" data-gap="8"><label class="label" for="delivery-filter">Show</label><select class="input" id="delivery-filter" data-delivery-filter>
+          <option value="all">Recent messages</option><option value="needs_review">Needs review</option><option value="failed">Send rejected</option><option value="retry">Retry scheduled</option><option value="sending">Sending</option><option value="ready">Queued email</option><option value="unsupported">SMS not connected</option><option value="accepted">Accepted</option>
+        </select><button type="button" class="btn btn-secondary btn-xs" data-act="delivery-refresh">Refresh</button></div>
+        <div class="stack stack-12" data-delivery>${deliveryView(delivery)}</div>
+      </section>
+
+      <section class="panel panel-body stack stack-12 set-card" id="storage"><div><h2 class="h3">Upload recovery</h2><p class="small">Current QR codes and payment screenshots in booking history are retained.</p></div>
+        ${storage.cleanupEnabled === false ? html`<p class="banner info">Upload cleanup is paused. Pending files remain tracked.</p>` : ''}
+        <p class="small" data-storage-summary>${storage.expiredUploads || 0} uploads waiting for recovery · ${storage.cleanupPending || 0} waiting for cleanup · ${storage.deleteFailures || 0} cleanup retries · ${storage.needsReview || 0} need review</p>
+        ${storage.oldestPendingAt ? html`<p class="small">Oldest pending item: ${dayClock(storage.oldestPendingAt)}</p>` : ''}
+        <p class="help">Cleanup retries run automatically. Items that need review require an operator to investigate.</p>
+        ${storage.legacyScanEnabled === false ? html`<p class="help">Historical file scanning is disabled until the existing files have been reviewed.</p>` : ''}
       </section>
 
       ${ro ? '' : html`<div class="save-bar"><p>Changes are logged with your name.</p><button type="button" class="btn btn-secondary btn-sm" data-act="discard">Discard</button><button type="submit" class="btn btn-primary btn-sm" data-act="save">Save settings</button></div>`}
     </form>
   </div>`);
 
+  let deliveryBusy = false;
+  const refreshDelivery = async () => {
+    if (deliveryBusy) return;
+    deliveryBusy = true;
+    const button = $('[data-act="delivery-refresh"]', body);
+    const filter = $('[data-delivery-filter]', body);
+    filter.disabled = true;
+    setBusy(button, true, 'Refreshing…');
+    try {
+      delivery = await api.get(`/api/admin/outbox?state=${encodeURIComponent(filter.value)}`);
+      render($('[data-delivery]', body), deliveryView(delivery));
+    } catch (err) { toast(err.message, { type: 'error' }); }
+    finally { deliveryBusy = false; filter.disabled = false; setBusy(button, false); }
+  };
+  listen($('[data-delivery-filter]', body), 'change', refreshDelivery);
+  listen($('[data-act="delivery-refresh"]', body), 'click', refreshDelivery);
+
   const form = $('[data-form]', body);
   if (ro) return undefined;
   const val = (n) => form.elements.namedItem(n).value.trim();
 
-  on(body, 'click', '[data-act="discard"]', () => settingsView());
-  form.addEventListener('submit', async (e) => {
+  on(body, 'click', '[data-act="discard"]', () => state.router.refresh());
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     clearFieldErrors(form);
     const payload = {};
@@ -153,7 +185,7 @@ export async function settingsView() {
       for (const [id, body2] of priceChanges) await api.patch(`/api/admin/resources/${encodeURIComponent(id)}`, body2);
       toast('Settings saved', { sub: 'Players see the changes right away.' });
       state.settings = null;
-      settingsView();
+      state.router.refresh();
     } catch (err) {
       setBusy(btn, false);
       const mapped = {};
@@ -165,7 +197,7 @@ export async function settingsView() {
   });
 
   const qrInput = $('[data-qr-file]', body);
-  qrInput?.addEventListener('change', async () => {
+  listen(qrInput, 'change', async () => {
     const file = qrInput.files && qrInput.files[0];
     qrInput.value = '';
     if (!file) return;
@@ -174,7 +206,7 @@ export async function settingsView() {
     try {
       await api.upload('/api/admin/settings/gcash-qr', fd, { method: 'PUT' });
       toast('GCash QR updated', { sub: 'Players see the new QR on the payment screen.' });
-      settingsView();
+      state.router.refresh();
     } catch (err) {
       toast(err.message, { type: 'error' });
     }
@@ -183,7 +215,7 @@ export async function settingsView() {
     try {
       await api.delete('/api/admin/settings/gcash-qr');
       toast('QR removed', { sub: 'Players pay using the GCash number.' });
-      settingsView();
+      state.router.refresh();
     } catch (err) {
       toast(err.message, { type: 'error' });
     }
@@ -191,3 +223,14 @@ export async function settingsView() {
   return undefined;
 }
 
+function deliveryView(delivery) {
+  const summary = delivery.summary || {};
+  const items = delivery.items || [];
+  return html`<p class="small" data-delivery-summary>${summary.needs_review || 0} need review · ${summary.failed || 0} rejected · ${summary.retry || 0} waiting to retry · ${summary.unsupported || 0} unsent SMS</p>
+    ${delivery.emailEnabled === false ? html`<p class="banner info">Email sending is not configured. Queued emails remain unsent.</p>` : ''}
+    ${delivery.emailPausedUntil > Date.now() ? html`<p class="banner info">Email sending is paused until ${dayClock(delivery.emailPausedUntil)} after a provider limit response.</p>` : ''}
+    ${items.length ? html`<div class="table-wrap"><table class="grid"><thead><tr><th>Channel</th><th>To</th><th>Subject</th><th>Status</th><th>When</th></tr></thead><tbody>
+      ${items.map(o => html`<tr><td>${o.channel === 'sms' ? 'SMS' : 'Email'}</td><td class="ellipsis">${o.recipient}</td><td>${o.subject || '—'}</td><td><span class="pill sm ${o.deliveryState === 'accepted' ? 'green' : ['failed', 'needs_review'].includes(o.deliveryState) ? 'red' : 'amber'}">${o.statusLabel || o.status}</span>
+        <span class="sub">${o.attempts} attempt${o.attempts === 1 ? '' : 's'}${o.nextAttemptAt ? ` · next ${dayClock(o.nextAttemptAt)}` : ''}</span>${o.lastError ? html`<span class="sub">${o.lastError}</span>` : ''}</td><td><span title="${dayClock(o.createdAt)}">${relTime(o.createdAt)}</span></td></tr>`)}
+    </tbody></table></div><p class="help">Up to 50 most recent messages in this view. Use Needs review or Send rejected to find older problems.</p>` : html`<p class="small">No messages in this view.</p>`}`;
+}

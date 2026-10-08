@@ -3,7 +3,9 @@ import { completePast, sweepExpired, warnExpiringHolds } from './bookings';
 import { reconcileCreditHolds } from './credits';
 import { closeUnpaidDeferred } from './disruptions';
 import { flushOutbox } from './notify';
+import { reconcileUploads } from './storage';
 import { loadSettings } from './settings';
+import { HOUSEKEEPING_BATCH_SIZE } from './limits';
 import { DAY_MS } from './time';
 
 type Task = [name: string, run: () => Promise<unknown>];
@@ -25,6 +27,7 @@ export async function runMaintenance(env: Bindings, now = Date.now(), opts: { cr
     tasks.push(['creditsReturned', () => reconcileCreditHolds(env, now)]);
     tasks.push(['deferredClosed', () => closeUnpaidDeferred(env, now)]);
     tasks.push(['outbox', () => flushOutbox(env)]);
+    tasks.push(['uploads', () => reconcileUploads(env)]);
     if (new Date(now).getUTCMinutes() === 0) tasks.push(['housekeeping', () => housekeeping(env, now)]);
   }
   const report: Record<string, unknown> = {};
@@ -55,8 +58,8 @@ export function lazyMaintenance(env: Bindings, now = Date.now()): Promise<unknow
 
 async function housekeeping(env: Bindings, now: number) {
   await env.DB.batch([
-    env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now),
-    env.DB.prepare('DELETE FROM rate_limits WHERE window_start < ?').bind(now - DAY_MS),
+    env.DB.prepare('DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE expires_at < ? ORDER BY expires_at LIMIT ?)').bind(now, HOUSEKEEPING_BATCH_SIZE),
+    env.DB.prepare('DELETE FROM rate_limits WHERE key IN (SELECT key FROM rate_limits WHERE window_start < ? ORDER BY window_start LIMIT ?)').bind(now - DAY_MS, HOUSEKEEPING_BATCH_SIZE),
   ]);
   return 'ok';
 }

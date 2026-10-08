@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { pageRequest, pageResult } from '../lib/pagination';
 import * as z from 'zod';
 import type { AppEnv } from '../types';
 import { requireAdmin, requirePlayer, requireStaff } from '../lib/auth';
@@ -15,8 +16,10 @@ export const creditRoutes = new Hono<AppEnv>();
 creditRoutes.get('/', async (c) => {
   const user = requirePlayer(c);
   const now = Date.now();
-  const [rows, summary] = await Promise.all([listUserCredits(c.env.DB, user.id, now), creditSummary(c.env.DB, user.id, now)]);
-  return c.json({ now, summary, credits: rows.map((r) => creditDTO(r, now)) });
+  const page = pageRequest(c.req.query(),`player-credits:${user.id}`,['number','string']);
+  const [rows, summary] = await Promise.all([listUserCredits(c.env.DB, user.id, now, page), creditSummary(c.env.DB, user.id, now)]);
+  const result = pageResult(rows,page,r => [r.created_at,r.id]);
+  return c.json({ now, summary, page:result.page, credits: result.rows.map((r) => creditDTO(r, now)) });
 });
 
 creditRoutes.get('/:id', async (c) => {
@@ -32,11 +35,13 @@ creditRoutes.get('/:id', async (c) => {
 export const staffCreditRoutes = new Hono<AppEnv>();
 
 staffCreditRoutes.get('/credits', async (c) => {
-  requireStaff(c);
+  const actor = requireStaff(c);
   const q = query(c, z.object({ q: z.string().trim().max(80).optional(), state: z.enum(['spendable', 'all']).optional() }));
   const now = Date.now();
-  const rows = await searchCredits(c.env.DB, { q: q.q || undefined, state: q.state ?? 'all' }, now);
-  return c.json({ now, credits: rows.map((r) => creditDTO(r, now, true)) });
+  const page = pageRequest(c.req.query(),`console-credits:${actor.id}:${JSON.stringify(q)}`,['number','string']);
+  const rows = await searchCredits(c.env.DB, { q: q.q || undefined, state: q.state ?? 'all' }, now, page);
+  const result = pageResult(rows,page,r => [r.created_at,r.id]);
+  return c.json({ now, page:result.page, credits: result.rows.map((r) => creditDTO(r, now, true)) });
 });
 
 staffCreditRoutes.get('/credits/:id', async (c) => {
@@ -75,6 +80,9 @@ adminCreditRoutes.post('/:id/void', async (c) => {
 adminCreditRoutes.post('/:id/refund', async (c) => {
   const admin = requireAdmin(c);
   const id = parse(zId, c.req.param('id'));
+  const key = c.req.header('Idempotency-Key');
+  if (!key) throw badRequest('Send an Idempotency-Key header.');
+  const idempotencyKey = parse(idempotencyKeySchema, key);
   const body = await jsonBody(
     c,
     z.strictObject({
@@ -87,7 +95,8 @@ adminCreditRoutes.post('/:id/refund', async (c) => {
   if (body.method === 'gcash' && !body.reference) {
     throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { reference: ['Enter the GCash reference number of the refund.'] });
   }
-  await recordRefund(c.env, admin, id, { amount: body.amount, method: body.method, reference: body.reference || null, note: body.note || null });
+  const refund = await recordRefund(c.env, admin, id, { amount: body.amount, method: body.method, reference: body.reference || null, note: body.note || null, idempotencyKey });
   const now = Date.now();
-  return c.json({ credit: creditDTO(await getCredit(c.env.DB, id, now), now, true), history: await creditLedger(c.env.DB, id, true) });
+  // `refund` is the durable original result; credit/history are current read models.
+  return c.json({ refund, credit: creditDTO(await getCredit(c.env.DB, id, now), now, true), history: await creditLedger(c.env.DB, id, true) });
 });

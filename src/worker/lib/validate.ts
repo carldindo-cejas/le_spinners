@@ -1,6 +1,7 @@
 import * as z from 'zod';
 import type { AppContext } from '../types';
 import { ApiError, badRequest } from './errors';
+import { isValidDate } from './time';
 
 function toDetails(error: z.ZodError): Record<string, string[]> {
   const details: Record<string, string[]> = {};
@@ -34,6 +35,8 @@ export function query<T extends z.ZodType>(c: AppContext, schema: T): z.infer<T>
 }
 
 // Shared field schemas
-export const zDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD');
+export const zDate = z.string().refine(isValidDate, 'Use a real date (YYYY-MM-DD).');
 export const zActivity = z.enum(['pickleball', 'table_tennis']);
 export const zId = z.string().min(1).max(64).regex(/^[A-Za-z0-9_-]+$/, 'Invalid id');
+
+export const zIdempotencyKey = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/, 'Send an Idempotency-Key header (8–100 letters, digits, - or _).');

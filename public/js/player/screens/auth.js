@@ -1,14 +1,18 @@
+import { createViewTools } from '../../core/view.js';
+import { getLogout } from '../../core/logout.js';
+import { logoutNotice } from '../../core/logout-view.js';
+import { loginReturnTarget } from '../../core/navigation.js';
 import { api } from '../../core/api.js';
 import { newPasswordCredentials, passwordProof } from '../../core/credentials.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon, logo, courtArt } from '../../core/icons.js';
 import { clearFieldErrors, showFieldErrors, toast } from '../../core/ui.js';
 import { navigate, show, startBadges, state } from '../shell.js';
 
+const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, showFieldErrors, toast, navigate, show });
+
 function safeNext(query) {
-  const next = query.get('next') || '/';
-  if (!next.startsWith('/') || next.startsWith('//') || next.startsWith('/admin') || next.startsWith('/staff') || next.startsWith('/login') || next.startsWith('/register')) return '/';
-  return next;
+  return loginReturnTarget(query.get('next'));
 }
 
 function passwordField({ name = 'password', autocomplete = 'current-password', label = 'Password', extra = '' }) {
@@ -22,6 +26,7 @@ function passwordField({ name = 'password', autocomplete = 'current-password', l
 }
 
 function wirePasswordToggles(root) {
+  const { on, render } = viewTools();
   on(root, 'click', '[data-act="toggle-pw"]', (_e, btn) => {
     const input = btn.parentElement.querySelector('input');
     const showing = input.type === 'text';
@@ -33,19 +38,25 @@ function wirePasswordToggles(root) {
 }
 
 async function afterSignIn(user, next) {
-  state.user = user;
+  const { api, scope } = viewTools();
   try {
     state.facility = await api.get('/api/facility');
-  } catch {
+  } catch (error) {
+    if (error.name === 'AbortError') return;
     /* keep the old copy */
   }
+  if (scope && !scope.isCurrent()) return;
+  state.user = user;
   startBadges();
-  navigate(next, { replace: true });
+  // The identity change disposes the old sign-in scope; this confirmed handoff
+  // intentionally starts a fresh route for the new identity.
+  state.router.navigate(next, { replace: true });
 }
 
 // ── U01 Log in ─────────────────────────────────────────────────────────────
 
 export function loginView({ query }) {
+  const { scope, listen, show, clearFieldErrors, showFieldErrors, setBusy, api } = viewTools();
   const next = safeNext(query);
   const root = show(html`<div class="auth screen-enter">
     <div class="auth-court">${courtArt()}</div>
@@ -54,6 +65,7 @@ export function loginView({ query }) {
       <h1 class="h1">Welcome back</h1>
       <p class="body">Log in to book courts and tables, and to follow your bookings.</p>
     </div>
+    ${logoutNotice()}
     <form novalidate data-form="login">
       <div class="banner error compact" role="alert" data-form-error hidden></div>
       <div class="field">
@@ -74,7 +86,7 @@ export function loginView({ query }) {
   wirePasswordToggles(root);
   const form = $('[data-form="login"]', root);
   const errorBox = $('[data-form-error]', root);
-  form.addEventListener('submit', async (e) => {
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     clearFieldErrors(form);
     errorBox.hidden = true;
@@ -90,7 +102,7 @@ export function loginView({ query }) {
     try {
       const clientHash = await passwordProof(email, password);
       // Player accounts only: staff and admin accounts get the same error as a wrong password.
-      const res = await api.post('/api/auth/user/login', { email, clientHash, remember: data.get('remember') === 'on' }, { quiet401: true });
+      const res = await getLogout().authenticate(() => api.post('/api/auth/user/login', { email, clientHash, remember: data.get('remember') === 'on' }, { quiet401: true }), { signal: scope?.signal });
       await afterSignIn(res.user, next);
     } catch (err) {
       setBusy(btn, false);
@@ -115,10 +127,11 @@ function strength(pw) {
 }
 
 export function registerView({ query }) {
+  const { scope, listen, show, on, clearFieldErrors, showFieldErrors, setBusy, api, toast } = viewTools();
   const next = safeNext(query);
   let member = false;
   const root = show(html`<div class="auth screen-enter">
-    <a class="icon-btn" href="/login" aria-label="Back to log in">${icon('chevron-left', 22, 2.2)}</a>
+    <a class="icon-btn" href="/login${next !== '/' ? `?next=${encodeURIComponent(next)}` : ''}" aria-label="Back to log in">${icon('chevron-left', 22, 2.2)}</a>
     <div class="stack stack-8">
       <h1 class="h1">Create your account</h1>
       <p class="body">Book courts and tables, pay with GCash, and chat with staff about each booking.</p>
@@ -169,7 +182,7 @@ export function registerView({ query }) {
   const errorBox = $('[data-form-error]', root);
   const meter = $('#pw-meter', root);
 
-  f('password').addEventListener('input', () => {
+  listen(f('password'), 'input', () => {
     const s = strength(f('password').value);
     meter.className = `pw-meter s${s.score} ${s.cls}`;
     meter.querySelector('.pw-label').textContent = s.label;
@@ -182,7 +195,7 @@ export function registerView({ query }) {
     if (member) f('memberCode').focus();
   });
 
-  form.addEventListener('submit', async (e) => {
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     clearFieldErrors(form);
     errorBox.hidden = true;
@@ -206,7 +219,7 @@ export function registerView({ query }) {
     setBusy(btn, true, 'Creating account…');
     try {
       const body = { name, email, password: await newPasswordCredentials(password), ...(digits ? { phone: `+63 ${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}` } : {}), ...(code ? { memberCode: code } : {}) };
-      const res = await api.post('/api/auth/register', body, { quiet401: true });
+      const res = await getLogout().authenticate(() => api.post('/api/auth/register', body, { quiet401: true }), { signal: scope?.signal });
       toast('Account created', { sub: code ? 'Staff will confirm your member code.' : 'You can book right away.' });
       await afterSignIn(res.user, next);
     } catch (err) {

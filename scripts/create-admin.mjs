@@ -19,6 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { adminAccountSql } from './lib/admin-account.mjs';
 import {
   ask,
   askHidden,
@@ -43,6 +44,11 @@ if (role !== 'admin' && role !== 'staff') {
 }
 
 const sql = (v) => `'${String(v).replace(/'/g, "''")}'`;
+// Invoke the installed CLI directly, keeping SQL/paths outside shell parsing.
+function execute(options) {
+  return spawnSync(process.execPath,[join(root,'node_modules','wrangler','bin','wrangler.js'),'d1','execute','DB',
+    remote?'--remote':'--local',...options,'--json'],{cwd:root,encoding:'utf8',windowsHide:true});
+}
 
 const email = normalizeEmail(await ask('Email: '));
 const name = (await ask('Full name: ')).trim();
@@ -88,26 +94,33 @@ const salt = newPasswordSalt();
 const hash = pepperHash(pepper, await deriveClientHash(password, salt, PASSWORD_ITERATIONS));
 const id = `u_${toBase64Url(randomBytes(16))}`;
 const now = Date.now();
-const statement = `INSERT INTO users (id, email, name, password_hash, password_salt, password_iterations, password_scheme, role, membership, status, created_at, updated_at)
-VALUES (${sql(id)}, ${sql(email)}, ${sql(name)}, ${sql(hash)}, ${sql(salt)}, ${PASSWORD_ITERATIONS}, ${sql(PASSWORD_SCHEME)}, ${sql(role)}, 'none', 'active', ${now}, ${now})
-ON CONFLICT (email) DO UPDATE SET name = excluded.name, password_hash = excluded.password_hash, password_salt = excluded.password_salt,
-  password_iterations = excluded.password_iterations, password_scheme = excluded.password_scheme, role = excluded.role, status = 'active', updated_at = excluded.updated_at;
-DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = ${sql(email)});`;
+const preflight=execute([`--command=SELECT id,auth_version FROM users WHERE email=${sql(email)}`]);
+if(preflight.status!==0) {
+  console.error('Account lookup failed. Check database access and apply migration 0015 before provisioning.');
+  process.exit(preflight.status??1);
+}
+const expected=JSON.parse(preflight.stdout)[0]?.results?.[0]??null;
+const changeId=`auth_${toBase64Url(randomBytes(16))}`;
+const statement=adminAccountSql({id,email,name,hash,salt,iterations:PASSWORD_ITERATIONS,scheme:PASSWORD_SCHEME,role,now,changeId,expected});
 
 // A short-lived file inside the project (.wrangler/ is git-ignored); relative so paths with spaces are safe on Windows.
 const rel = `.wrangler/tmp/create-admin-${randomBytes(6).toString('hex')}.sql`;
 mkdirSync(join(root, '.wrangler', 'tmp'), { recursive: true });
 writeFileSync(join(root, rel), statement, { mode: 0o600 });
-const isWindows = process.platform === 'win32';
 let result;
 try {
-  result = spawnSync(isWindows ? 'npx.cmd' : 'npx', ['wrangler', 'd1', 'execute', 'DB', remote ? '--remote' : '--local', `--file=${rel}`], {
-    cwd: root,
-    stdio: 'inherit',
-    shell: isWindows,
-  });
+  result=execute([`--file=${rel}`]);
 } finally {
   rmSync(join(root, rel), { force: true });
 }
-if (result.status !== 0) process.exit(result.status ?? 1);
+if(result.status!==0) {
+  // A CLI/database error may contain SQL; never echo credential-bearing output.
+  console.error('Account provisioning failed. Check database access/schema and retry the controlled reset.');
+  process.exit(result.status??1);
+}
+const applied=JSON.parse(result.stdout).some(batch=>batch.results?.some(row=>row.applied===1));
+if(!applied) {
+  console.error('The account changed during provisioning or its outcome could not be confirmed. Check its current state before retrying.');
+  process.exit(1);
+}
 console.log(`\n${role === 'admin' ? 'Admin' : 'Staff'} account ready for ${email} (${remote ? 'deployed' : 'local'} database). Sign in at /${role}/login.`);

@@ -35,7 +35,7 @@ type Ctx = {
 };
 
 type Viewer =
-  | { staff: false; userId: string; membership: Membership }
+  | { staff: false; userId: string | null; membership: Membership }
   | { staff: true };
 
 type PlayerSlot = { start: number; end: number; label: string; state: SlotState; booking?: { id: string; status: BookingStatus } };

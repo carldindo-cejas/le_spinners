@@ -1,15 +1,19 @@
+import { createViewTools } from '../../core/view.js';
+import { getLogout } from '../../core/logout.js';
+import { logoutNotice } from '../../core/logout-view.js';
+import { loginReturnTarget } from '../../core/navigation.js';
 import { api } from '../../core/api.js';
 import { passwordProof } from '../../core/credentials.js';
-import { $, html, on, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, setBusy } from '../../core/dom.js';
 import { icon, logo, courtArt } from '../../core/icons.js';
 import { clearFieldErrors, showFieldErrors } from '../../core/ui.js';
 import { bare, navigate, startBadges, state } from '../shell.js';
-import { BASE, CONSOLE, HOME, REVENUE, isAdminConsole } from '../console.js';
+import { CONSOLE, HOME } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, setBusy, clearFieldErrors, showFieldErrors, bare, navigate });
 
 function safeNext(query) {
-  const next = query.get('next') || `${BASE}/`;
-  if (isAdminConsole && next.startsWith(REVENUE)) return next;
-  return next.startsWith(`${BASE}/`) && !next.startsWith(`${BASE}/login`) && !next.startsWith('//') ? next : `${BASE}/`;
+  return loginReturnTarget(query.get('next'), { portal: CONSOLE.kind });
 }
 
 // Copy per console. Both use the staff sign-in layout from the design.
@@ -31,6 +35,7 @@ const COPY = {
 }[CONSOLE.kind];
 
 export function loginView({ query }) {
+  const { scope, listen, navigate, bare, on, clearFieldErrors, showFieldErrors, setBusy, api } = viewTools();
   // Already signed in: go to this console, or to the account's own dashboard.
   if (state.user) {
     if (state.user.role === CONSOLE.role) navigate(safeNext(query), { replace: true });
@@ -52,6 +57,7 @@ export function loginView({ query }) {
     </section>
     <div class="sl-form-wrap">
       <form class="sl-form" novalidate data-form>
+        ${logoutNotice()}
         <div class="stack stack-8 only-desktop"><h2 class="h2">${COPY.title}</h2><p class="small">${COPY.lead}</p></div>
         <div class="banner error compact" role="alert" data-error hidden></div>
         <div class="field"><label class="label" for="s-email">${COPY.emailLabel}</label><input class="input" id="s-email" name="email" type="email" autocomplete="username" required maxlength="254" autofocus></div>
@@ -73,7 +79,7 @@ export function loginView({ query }) {
     btn.setAttribute('aria-pressed', String(show));
     btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
   });
-  form.addEventListener('submit', async (e) => {
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     clearFieldErrors(form);
     err.hidden = true;
@@ -88,10 +94,10 @@ export function loginView({ query }) {
     try {
       const clientHash = await passwordProof(email, password);
       // The server checks the account's role; a wrong-portal account gets the same error as a wrong password.
-      const res = await api.post(CONSOLE.loginApi, { email, clientHash }, { quiet401: true });
+      const res = await getLogout().authenticate(() => api.post(CONSOLE.loginApi, { email, clientHash }, { quiet401: true }), { signal: scope?.signal });
       state.user = res.user;
       startBadges();
-      navigate(safeNext(query), { replace: true });
+      state.router.navigate(safeNext(query), { replace: true });
     } catch (ex) {
       setBusy(btn, false);
       err.hidden = false;

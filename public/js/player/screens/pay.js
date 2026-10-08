@@ -1,5 +1,6 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, bytes, clock, dateLabel, monthDayYear, peso, shortDate } from './util.js';
 import {
@@ -8,20 +9,25 @@ import {
 import { navigate, show, state, subHeader } from '../shell.js';
 import { lockLine } from '../components.js';
 
+const viewTools = createViewTools({ listen, api, on, render, setBusy, announce, copyText, openModal, startCountdown, toast, navigate, show });
+
 const MAX_MB = 10;
 const OK_TYPES = { 'image/jpeg': 'JPG', 'image/png': 'PNG', 'image/webp': 'WEBP' };
 
 async function loadDetail(id) {
+  const { api } = viewTools();
   return api.get(`/api/bookings/${encodeURIComponent(id)}`);
 }
 
 function loadingScreen() {
+  const { show } = viewTools();
   show(html`<div class="screen">${skeletonRows(1, 'sk-card')}${skeletonRows(4)}</div>`);
 }
 
 function failScreen(err, retry) {
+  const { listen, show } = viewTools();
   const root = show(html`<div class="screen">${err.status === 404 ? html`<div class="empty"><p class="empty-title">Booking not found</p><p class="empty-body">It may belong to another account, or the link is old.</p><a class="btn btn-primary btn-md" href="/bookings">My bookings</a></div>` : errorState(err)}</div>`);
-  $('[data-act="retry"]', root)?.addEventListener('click', retry);
+  listen($('[data-act="retry"]', root), 'click', retry);
 }
 
 const holding = (b) => (b.status === 'TEMPORARY' || b.status === 'REJECTED') && b.canSubmitProof;
@@ -29,6 +35,7 @@ const holding = (b) => (b.status === 'TEMPORARY' || b.status === 'REJECTED') && 
 // ── S05: slot held right after "Reserve & pay" ─────────────────────────────
 
 export async function heldView({ params }) {
+  const { navigate, show, startCountdown, announce, on } = viewTools();
   loadingScreen();
   let d;
   try {
@@ -93,6 +100,7 @@ export async function heldView({ params }) {
 }
 
 function confirmRelease(b, trigger) {
+  const { openModal, on, setBusy, api, toast, navigate } = viewTools();
   openModal({
     label: 'Release this slot?',
     content: (close) => html`<span class="tile neutral">${icon('circle-slash', 24)}</span>
@@ -171,6 +179,7 @@ function gcashCard(d, b) {
 }
 
 export async function payView({ params, query }) {
+  const { scope, listen, navigate, show, render, on, copyText, toast, setTimeout, setBusy, api, startCountdown, announce } = viewTools();
   loadingScreen();
   let d;
   try {
@@ -252,6 +261,7 @@ export async function payView({ params, query }) {
   const matchEl = $('[data-match]', root);
   let file = null;
   let preview = null;
+  scope?.own(() => { if (preview) URL.revokeObjectURL(preview); preview = null; });
   let problem = null;
   let uploading = false;
   let ended = false;
@@ -311,7 +321,7 @@ export async function payView({ params, query }) {
     render(matchEl, html`<span class="row row-wrap" data-gap="8"><span class="pill red sm">${icon('alert', 12, 2.4)}Amount differs</span><span class="small">The booking total is ${b.amountLabel}. Staff will check the screenshot.</span></span>`);
   }
 
-  input.addEventListener('change', () => {
+  listen(input, 'change', () => {
     const f = input.files && input.files[0];
     input.value = '';
     if (!f) return;
@@ -328,8 +338,8 @@ export async function payView({ params, query }) {
     input.focus();
   });
   on(slot, 'click', '[data-act="retry-upload"]', () => doUpload());
-  form.elements.namedItem('amountPesos').addEventListener('input', paintMatch);
-  form.addEventListener('submit', (e) => {
+  listen(form.elements.namedItem('amountPesos'), 'input', paintMatch);
+  listen(form, 'submit', (e) => {
     e.preventDefault();
     doUpload();
   });
@@ -421,6 +431,7 @@ export async function payView({ params, query }) {
 // ── U26: GCash full screen ─────────────────────────────────────────────────
 
 export async function gcashView({ params }) {
+  const { navigate, show, on, copyText, toast, render, startCountdown } = viewTools();
   loadingScreen();
   let d;
   try {
@@ -470,6 +481,7 @@ export async function gcashView({ params }) {
 // ── U29: proof submitted ───────────────────────────────────────────────────
 
 export async function submittedView({ params }) {
+  const { navigate, show } = viewTools();
   loadingScreen();
   let d;
   try {

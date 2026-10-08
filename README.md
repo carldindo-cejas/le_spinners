@@ -3,6 +3,21 @@
 A mobile-first booking app (PWA) for pickleball courts and table tennis tables, with
 consoles for staff and administrators.
 
+Visitors at `/` see a public landing page with sports and rates, booking instructions,
+facility hours, directions, FAQs, and a **Court Calendar**. The calendar shows courts and
+tables without signing in: pick a date, filter by sport or resource, and select an available
+time to continue through sign-in or registration into booking. Signed-in players keep their
+dashboard at `/`; `/welcome` opens the landing page for any role.
+
+The calendar refreshes every 30 seconds while visible, online and active, and on return to the page. It uses
+facility time and the configured booking window. Holds, payment verification, confirmed
+bookings, closures, maintenance, and open play follow the same rules as the booking flow.
+Failed or offline refreshes remove stale bookable times. Browsing never reserves a slot.
+`GET /api/facility/calendar?date=YYYY-MM-DD&activity=pickleball` is public (`activity` is
+optional), with an explicit response allowlist: resource information and slot states only.
+Booking owners, references, payment details, private notes, and personalized booking states
+are excluded even when the visitor is signed in.
+
 Each role has its own sign-in page and dashboard. An account can only sign in through the
 page for its role:
 
@@ -155,14 +170,80 @@ The suite edits the local database, so run `npm run db:reset:local` before each 
 
 `npm run typecheck` type-checks the Worker.
 
+Production-readiness work is tracked in [SYSTEM_REPORT_IMPLEMENTATION.md](SYSTEM_REPORT_IMPLEMENTATION.md).
+The first integrity fixes and migration procedure are documented in
+[specs/readiness-p0.md](specs/readiness-p0.md). With Node 24, run `npm run test:readiness`
+for isolated date, payment-transition, schedule-race, refund/booking replay, maintenance recovery, polling and upgrade regressions.
+Booking creation now requires an `Idempotency-Key` header; see [specs/readiness-recovery.md](specs/readiness-recovery.md) for client compatibility, bounded catch-up, current quota projections and remaining staging checks.
+Outbox claims, replay bounds and safe rollback are described in [specs/readiness-outbox.md](specs/readiness-outbox.md).
+Image acceptance and upload recovery are described in [specs/readiness-storage.md](specs/readiness-storage.md).
+The new Worker requires migrations **0009–0015**. Follow the readiness migration/recovery
+procedure before any live rollout; current local test results do not establish production readiness.
+
+Credential/session versioning and administrative reset requirements are described in
+[specs/readiness-auth.md](specs/readiness-auth.md). Password changes retain only their
+initiating live session. Resetting credentials, changing roles or disabling an account
+invalidates earlier versions; re-enabling an account does not revive old sessions.
+Provisioning with `npm run create-admin` requires migration 0015 and rejects a concurrent
+account change instead of silently replacing its credentials.
+
+Route cancellation, authentication generations and dialog/listener cleanup are described in
+[specs/readiness-lifecycle.md](specs/readiness-lifecycle.md). `npm run test:readiness`
+includes their deterministic regressions. For actual-browser checks with synthetic APIs,
+start the read-only `node tests/helpers/browser-server.mjs` in one terminal and run
+`npm run test:lifecycle-ui` in another. It uses localhost:8799 and needs Playwright/Chromium;
+`PLAYWRIGHT_MODULE` and `BROWSER_EXECUTABLE` can select an existing installation.
+Truthful retryable logout is described in [specs/readiness-logout.md](specs/readiness-logout.md).
+Run `npm run test:logout-ui` against the same fixture server. Pending/failed sign-out hides
+private screens and blocks session restoration until a server acknowledgement, followed by
+explicit fresh sign-in. Intended-device/PWA, storage-fallback and real cookie-ordering checks
+remain pending in the tracker.
+
+Validated login/registration return targets and portal routing are described in
+[specs/readiness-redirect.md](specs/readiness-redirect.md). `npm run test:redirect-ui`
+uses the same localhost fixture server. Untrusted targets fall back to the matching
+portal home; valid deep links retain their query and fragment through reauthentication.
+
+The public calendar has a separate integration check with isolated local fixtures (leave
+your normal development database intact):
+
+```bash
+npx wrangler d1 migrations apply DB --local --persist-to .wrangler/landing-test-state
+npx wrangler d1 execute DB --local --persist-to .wrangler/landing-test-state --file=db/facility.sql
+npx wrangler dev --local --persist-to .wrangler/landing-test-state --port 8791
+# In another terminal:
+node tests/public-calendar.mjs
+```
+
+This test writes fixtures only to `.wrangler/landing-test-state` and expects that isolated
+server on port 8791. It checks anonymous access, privacy for every role, booking states,
+nonconsecutive slots, date limits, closures, maintenance, and open play.
+
+## Repeatable readiness verification
+
+Use Node 24+ (CI pins 24.14.0). Install the exact locked toolchain and matching browser, then run the maintained suites:
+
+```sh
+npm ci
+npx playwright install chromium
+npm run verify
+npm audit --audit-level=high
+```
+
+Linux CI uses `npx playwright install --with-deps chromium`. Verification checks generated bindings, syntax, TypeScript, deterministic regressions, all browser suites, the dry-run bundle, and real local D1/R2/auth/calendar flows. It owns localhost ports 8805 and 8810–8812 and creates disposable state under `.wrangler`; stop other fixtures on those ports first. It never resets your normal development database or sends provider mail. The capacity component is a 15-second read ramp; mixed staging load, real-device PWA, accessibility and independent review remain release gates.
+
+See [history/time/auth contracts](specs/readiness-remaining.md), [toolchain and CI evidence](specs/readiness-tooling.md), and [migration, retention, recovery and incident procedures](specs/readiness-operations.md). Existing-account operator recovery is `npm run recover-account` (local by default); remote recovery needs an explicitly mapped named environment and the reviewed identity/recovery procedure. Production readiness remains tracked in [SYSTEM_REPORT_IMPLEMENTATION.md](SYSTEM_REPORT_IMPLEMENTATION.md).
+
 ## Deploy to Cloudflare
 
-Sign-in and registration fit the **Workers Free** plan: the slow password derivation
-(PBKDF2) runs in the browser, and the Worker only computes one HMAC. Payment screenshots
-are different. Each upload is decoded and rebuilt inside the Worker to strip metadata,
-which can exceed the Free plan's 10 ms of CPU for large photos ("Worker exceeded
-resource limits"). Use the **Workers Paid** plan if uploads fail that way. Local
-development has no CPU limit.
+Password derivation (PBKDF2) runs in the browser; the Worker verifies an HMAC and
+performs authentication database work. Image uploads validate container bytes and
+rebuild retained segments without decoding pixels. Both paths, complete cron work,
+polling and near-limit concurrent uploads still need intended-plan CPU/query/quota
+measurements. The readiness plan proposes **Workers Paid with D1 Paid**, pending
+account and cost acceptance; local passes do not establish production headroom.
+See [the workload budget](specs/readiness-recovery.md) and
+[the image contract](specs/readiness-storage.md) before selecting a launch plan.
 
 1. Sign in: `npx wrangler login`
 2. Create the database and copy the printed `database_id` into `wrangler.jsonc`
@@ -236,13 +317,18 @@ npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put EMAIL_FROM        # e.g. Le Spinners <alerts@your-domain.com>
 ```
 
-Without them, emails stay queued and can be seen under **Settings → Sent & queued**.
+Without them, emails stay queued and can be seen under **Settings → Message delivery**.
+The queue distinguishes provider acceptance, scheduled retries, rejected sends and uncertain
+deliveries requiring review. Provider acceptance does not confirm inbox arrival. Retries reuse
+the stored provider key and frozen payload, stop after five claims or before the replay window
+expires, and recover abandoned leases. See the [outbox recovery procedure](specs/readiness-outbox.md)
+before changing credentials, migrating, rolling back or reviewing old attempted messages.
 
 ### SMS
 
-SMS alerts are written to the outbox with status `queued`. No SMS provider is connected
-yet. Adding one later means sending the queued rows in `flushOutbox`
-(`src/worker/lib/notify.ts`); the rest of the app doesn't change.
+SMS alerts are retained as unsent outbox records and labeled **SMS not connected**.
+No SMS provider is connected. A future integration needs its own claim, replay and recovery
+contract; historical queued texts must be reviewed before sending.
 
 ## Security and privacy
 
@@ -306,11 +392,21 @@ yet. Adding one later means sending the queued rows in `flushOutbox`
 - **No double booking.** Each hold is a single atomic `INSERT … WHERE NOT EXISTS
   (overlap)`, backed by a partial unique index.
 - **Payment screenshots:**
-  - File type is checked from the file's bytes (JPG, PNG or WEBP only), up to 10 MB.
-  - Before storing, the image is rebuilt from only the parts needed to draw it. EXIF
-    (GPS, camera), XMP, text chunks, C2PA content credentials, comments, embedded
-    thumbnails and anything appended after the image are removed. The same applies to
-    the GCash QR that staff upload.
+  - Static JPG, PNG and WEBP are detected from their bytes. Container structure,
+    required headers/order, lengths and PNG CRCs are checked; malformed or truncated
+    containers are rejected. Proofs allow 10 MB, QR images 5 MB; both allow at most
+    8192 pixels per side and 16 million pixels. Animation and unsupported encodings are rejected.
+  - Before storing, private EXIF fields (GPS/camera), XMP, text, C2PA, comments,
+    thumbnails and trailing bytes are removed. A valid orientation tag is rebuilt on
+    its own; ICC profiles and supported rendering/color information are retained.
+    This validates containers without decoding compressed pixels or sanitizing ICC
+    profile internals. It cannot prove every accepted bitstream is decodable or erase
+    information visible in pixels. The same contract applies to GCash QR uploads.
+  - Upload ownership is stored before R2 writes; attachment commits with the proof
+    or QR setting. Failed/abandoned uploads receive fenced cleanup and retry records.
+    Settings → Upload recovery shows pending work and manual review counts. Historical
+    orphan discovery remains disabled until existing files and retention are reviewed;
+    see the [migration/reconciliation procedure](specs/readiness-storage.md).
   - Files are stored in a private bucket under random names.
   - A screenshot is served only through a signed link that expires in 5–10 minutes,
     **and** only to the booking's player or to staff, with `Cache-Control: private, no-store`.
@@ -356,4 +452,4 @@ Tournaments, user and staff account management screens (accounts are created wit
 `npm run create-admin`, and membership is still confirmed in the database), moving a booking
 to another court or time, staff booking for a walk-in player with their credit, credit expiry
 (no policy decided), a real SMS provider, push notifications, and live WebSocket chat (the app
-refreshes every 10–15 seconds instead).
+refreshes active screens every 10–60 seconds, with hidden/offline/idle pauses).

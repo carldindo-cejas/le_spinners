@@ -6,6 +6,7 @@ import { SEGMENTS_SQL, activityLabel, bookedMinutes, paymentMethodLabel, segment
 import { unprocessable } from '../lib/errors';
 import { addDays, dateLabel, daysBetween, isValidDate, localNow, localToMs, MINUTE_MS, offsetMinutes, peso, weekdayOf } from '../lib/time';
 import { query, zActivity, zDate, zId } from '../lib/validate';
+import { creditAccounting } from '../lib/credits';
 
 /**
  * Revenue reporting for the admin console (/revenue/). Read-only: nothing here
@@ -19,9 +20,10 @@ import { query, zActivity, zDate, zId } from '../lib/validate';
  *   - Proofs waiting for verification, rejected proofs, holds and expired or
  *     released bookings are never revenue.
  *   - A verified booking that was later cancelled ("cancelled after payment") is
- *     reported separately and left out of collected revenue: refunds are handled
- *     by staff outside the app and the schema has no refund record, so whether
- *     that money was returned is unknown.
+ *     reported separately and left out of status-based collected revenue. Credit
+ *     refunds are recorded in credit_transactions; /accounting separates those
+ *     payouts and active credit balances from verified cash. External settlement
+ *     and the business liability policy still require reconciliation/acceptance.
  * Reporting periods use facility time (TZ_OFFSET_MINUTES, Asia/Manila); weeks run Monday–Sunday.
  */
 export const revenueRoutes = new Hono<AppEnv>();
@@ -77,6 +79,12 @@ function change(current: number, previous: number) {
 }
 
 // ── Summary cards ──────────────────────────────────────────────────────────
+
+revenueRoutes.get('/accounting', async (c) => {
+  requireAdmin(c);
+  const now=Date.now();
+  return c.json({now,...await creditAccounting(c.env.DB,now)});
+});
 
 revenueRoutes.get('/summary', async (c) => {
   const db = c.env.DB;

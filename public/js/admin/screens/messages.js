@@ -1,11 +1,15 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render } from '../../core/dom.js';
+import { listen, $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { bookingTime, firstName, initials, relTime, shortDate } from '../../core/format.js';
 import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../../core/chatview.js';
 import { errorState, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
 import { frame, refreshBadges } from '../shell.js';
 import { API, BASE } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, render, openImage, poll, toast, frame, refreshBadges });
 
 export const QUICK = ['Verifying now — a few minutes.', 'Please upload a clearer screenshot.', 'Please send your GCash reference no.'];
 const STATUS_WORD = {
@@ -28,6 +32,7 @@ function convRow(c, activeId) {
 }
 
 export function messagesView({ params }) {
+  const { listen, frame, render, on, openImage, api, toast, setTimeout, refreshBadges, poll } = viewTools();
   const activeId = params.id || null;
   let filter = 'all';
   let conversations = null;
@@ -55,19 +60,18 @@ export function messagesView({ params }) {
     </div>`,
   });
   const convsEl = $('[data-convs]', root);
+  const threadEl = activeId ? $('[data-thread]', root) : null;
+  const listPages = historyPager(api, convsEl.parentElement, loadList, {label:'Conversations'});
   let search = '';
+  let searchTimer;
 
   function paintList() {
-    const unread = conversations.filter((c) => c.unread).length;
-    const verifying = conversations.filter((c) => c.status === 'PAYMENT_SUBMITTED').length;
     render($('[data-filters]', root), [
-      html`<button type="button" class="chip" data-filter="unread" aria-pressed="${String(filter === 'unread')}">Unread · ${unread}</button>`,
+      html`<button type="button" class="chip" data-filter="unread" aria-pressed="${String(filter === 'unread')}">Unread</button>`,
       html`<button type="button" class="chip" data-filter="all" aria-pressed="${String(filter === 'all')}">All</button>`,
-      html`<button type="button" class="chip violet" data-filter="verifying" aria-pressed="${String(filter === 'verifying')}">Verifying · ${verifying}</button>`,
+      html`<button type="button" class="chip violet" data-filter="verifying" aria-pressed="${String(filter === 'verifying')}">Verifying</button>`,
     ]);
-    const q = search.toLowerCase();
-    const items = conversations.filter((c) => (filter === 'unread' ? c.unread : filter === 'verifying' ? c.status === 'PAYMENT_SUBMITTED' : true))
-      .filter((c) => !q || c.userName.toLowerCase().includes(q) || c.ref.toLowerCase().includes(q));
+    const items = conversations;
     render(convsEl, items.length ? items.map((c) => convRow(c, activeId)) : html`<div class="pad-16"><p class="strong">${filter === 'unread' ? 'All caught up' : 'No conversations'}</p><p class="small">${filter === 'unread' ? 'No unread messages right now.' : 'Messages from players show up here.'}</p></div>`);
   }
 
@@ -125,11 +129,11 @@ export function messagesView({ params }) {
     const form = threadEl.querySelector('[data-form]');
     const input = threadEl.querySelector('#reply');
     const syncCount = charCounter(input);
-    input.addEventListener('input', () => {
+    listen(input, 'input', () => {
       input.style.setProperty('height', 'auto');
       input.style.setProperty('height', `${Math.min(input.scrollHeight, 140)}px`);
     });
-    input.addEventListener('keydown', (e) => {
+    listen(input, 'keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         form.requestSubmit();
@@ -141,7 +145,7 @@ export function messagesView({ params }) {
       input.focus();
     });
     on(threadEl, 'click', '[data-proof]', (_e, btn) => openImage(btn.dataset.proof));
-    form.addEventListener('submit', async (e) => {
+    listen(form, 'submit', async (e) => {
       e.preventDefault();
       const body = input.value.trim();
       if (!body) return;
@@ -152,8 +156,8 @@ export function messagesView({ params }) {
         input.value = '';
         input.style.removeProperty('height');
         syncCount();
-        thread.messages = res.messages;
-        paintThread(true);
+        threadPages.reset();
+        await loadThread(true);
         loadList();
       } catch (err) {
         toast(err.message, { type: 'error' });
@@ -166,43 +170,48 @@ export function messagesView({ params }) {
 
   on(root, 'click', '[data-filter]', (_e, btn) => {
     filter = btn.dataset.filter;
-    paintList();
+    listPages.reset();
+    loadList();
   });
   on(root, 'input', '[data-search]', (_e, el) => {
     search = el.value.trim();
-    paintList();
+    clearTimeout(searchTimer);
+    listPages.reset();
+    searchTimer = setTimeout(loadList, 250);
   });
 
   async function loadList() {
     try {
-      const res = await api.get(`${API}/messages`);
+      const res = await listPages.get(`${API}/messages?filter=${filter}&q=${encodeURIComponent(search)}`);
       conversations = res.conversations;
       paintList();
     } catch (err) {
       if (!conversations) {
         render(convsEl, errorState(err));
-        $('[data-act="retry"]', convsEl)?.addEventListener('click', loadList);
+        listen($('[data-act="retry"]', convsEl), 'click', loadList);
       }
     }
   }
 
+  const threadPages = activeId ? historyPager(api, threadEl, () => loadThread(false), {label:'Earlier messages'}) : null;
   async function loadThread(first = false) {
     if (!activeId) return;
     try {
       const [t, d] = await Promise.all([
-        api.get(`${API}/bookings/${encodeURIComponent(activeId)}/messages`),
+        threadPages.get(`${API}/bookings/${encodeURIComponent(activeId)}/messages`),
         first || !detail ? api.get(`${API}/bookings/${encodeURIComponent(activeId)}`) : Promise.resolve(detail),
       ]);
       thread = t;
       detail = d;
       paintThread(first);
+      threadPages.mount();
       if (first) paintContext();
       if (first) setTimeout(refreshBadges, 300);
     } catch (err) {
       const el = $('[data-thread]', root);
       if (first) {
         render(el, html`<div class="pad-16">${errorState(err, { retry: err.status !== 404, title: err.status === 404 ? 'Conversation not found' : undefined })}</div>`);
-        $('[data-act="retry"]', el)?.addEventListener('click', () => loadThread(true));
+        listen($('[data-act="retry"]', el), 'click', () => loadThread(true));
       }
     }
   }

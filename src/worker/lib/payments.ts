@@ -5,8 +5,9 @@ import { MAX_UPLOAD_BYTES, sniffImage, stripMetadata } from './images';
 import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt } from './notify';
 import type { Settings } from './settings';
 import { dateLabel, minutesLabel, peso } from './time';
-import { activityLabel, changedAt, effectiveStatus, eventStmt, getBooking, slotLabel, systemMessageStmt, type BookingJoin } from './bookings';
+import { activityLabel, bookingTransition, effectiveStatus, eventStmt, getBooking, slotLabel, systemMessageStmt, type BookingJoin } from './bookings';
 import { releaseStmts } from './credits';
+import { attachUploadStmt, beginUpload, markUploadStored, recoverUploadFailure } from './storage';
 
 /**
  * Proof links are signed for a 5-minute bucket and stay valid for 5–10 minutes.
@@ -49,22 +50,30 @@ export async function submitProof(
 
   const proofId = newId('p_');
   const key = `proofs/${bookingId}/${proofId}.${kind.ext}`;
-  await env.PROOFS.put(key, clean, {
-    httpMetadata: { contentType: kind.type },
-    customMetadata: { bookingId, userId: user.id },
-  });
+  const upload = await beginUpload(env,key,'proof',user.id,bookingId,Date.now());
+  try {
+    const object = await env.PROOFS.put(key, clean, {
+      httpMetadata: { contentType: kind.type },
+      customMetadata: { bookingId, userId: user.id, uploadId:upload.id },
+    });
+    if (!object) throw new Error('R2 upload was not stored');
+    await markUploadStored(env,upload);
+  } catch (error) { await recoverUploadFailure(env,upload); throw error; }
 
-  const g = changedAt(bookingId, 'submitted_at', now);
+  now = Date.now();
+
+  const g = bookingTransition(bookingId);
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const match = amountMatches(b, fields.amount);
   const resubmitted = b.status === 'REJECTED';
   const stmts: D1PreparedStatement[] = [
     db
       .prepare(
-        `UPDATE bookings SET status = 'PAYMENT_SUBMITTED', submitted_at = ?1, hold_expires_at = NULL, updated_at = ?1
-          WHERE id = ?2 AND user_id = ?3 AND status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1`,
+        `UPDATE bookings SET status = 'PAYMENT_SUBMITTED', submitted_at = ?1, hold_expires_at = NULL, updated_at = ?1, transition_id = ?4
+          WHERE id = ?2 AND user_id = ?3 AND status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1
+            AND EXISTS (SELECT 1 FROM storage_uploads WHERE id = ?5 AND state='staged' AND claim_id = ?6 AND lease_until > ?1)`,
       )
-      .bind(now, bookingId, user.id),
+      .bind(now, bookingId, user.id, g.id,upload.id,upload.token),
     db
       .prepare(
         `INSERT INTO payment_proofs (id, booking_id, user_id, r2_key, content_type, size, original_name, gcash_ref, amount_claimed, status, created_at)
@@ -121,10 +130,24 @@ export async function submitProof(
     stmts.push(outboxStmt(db, 'sms', phone, null, sms, bookingId, now, g));
   }
 
-  const [update] = await db.batch(stmts);
+  stmts.push(attachUploadStmt(env,upload,now));
+  let update: D1Result | undefined;
+  try { [update] = await db.batch(stmts); }
+  catch (error) {
+    // Fencing cleanup is safe even if D1 committed but its response was lost.
+    await recoverUploadFailure(env,upload);
+    try {
+      const saved = await db.prepare('SELECT id FROM payment_proofs WHERE id=? AND r2_key=?').bind(proofId,key).first();
+      if (saved) return getBooking(db,bookingId);
+    } catch { /* Unknown state stays durably tracked; do not blindly delete. */ }
+    throw error;
+  }
   if (!update?.meta.changes) {
-    await env.PROOFS.delete(key);
-    throw conflict('HOLD_EXPIRED', 'Your temporary reservation expired before the proof arrived, so the slot was released.');
+    await recoverUploadFailure(env,upload);
+    const current = await getBooking(db,bookingId);
+    if (current.status === 'PAYMENT_SUBMITTED') throw conflict('ALREADY_SUBMITTED','Payment proof was already submitted for this booking.');
+    if (effectiveStatus(current,Date.now()) === 'EXPIRED') throw conflict('HOLD_EXPIRED', 'Your temporary reservation expired before the proof arrived, so the slot was released.');
+    throw conflict('UPLOAD_EXPIRED','The image could not be saved. Refresh this booking and upload the screenshot again.');
   }
   return getBooking(db, bookingId);
 }
@@ -133,7 +156,7 @@ export async function submitProof(
 export async function approvePayment(env: Bindings, staff: SessionUser, bookingId: string, now = Date.now(), chatMessage: string | null = null) {
   const db = env.DB;
   const b = await getBooking(db, bookingId);
-  const g = changedAt(bookingId, 'confirmed_at', now);
+  const g = bookingTransition(bookingId);
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const extra: D1PreparedStatement[] = chatMessage
     ? [
@@ -147,8 +170,8 @@ export async function approvePayment(env: Bindings, staff: SessionUser, bookingI
     : [];
   const [update] = await db.batch([
     db
-      .prepare(`UPDATE bookings SET status = 'CONFIRMED', confirmed_at = ?1, confirmed_by = ?2, updated_at = ?1 WHERE id = ?3 AND status = 'PAYMENT_SUBMITTED'`)
-      .bind(now, staff.id, bookingId),
+      .prepare(`UPDATE bookings SET status = 'CONFIRMED', confirmed_at = ?1, confirmed_by = ?2, updated_at = ?1, transition_id = ?4 WHERE id = ?3 AND status = 'PAYMENT_SUBMITTED'`)
+      .bind(now, staff.id, bookingId, g.id),
     db
       .prepare(`UPDATE payment_proofs SET status = 'approved' WHERE booking_id = ? AND status = 'submitted' AND ${g.sql}`)
       .bind(bookingId, ...g.params),
@@ -175,7 +198,7 @@ export async function rejectPayment(
 ) {
   const db = env.DB;
   const b = await getBooking(db, bookingId);
-  const g = changedAt(bookingId, 'rejected_at', now);
+  const g = bookingTransition(bookingId);
   const holdUntil = input.keepHold ? now + settings.resubmitMinutes * 60_000 : null;
   const nextStatus = input.keepHold ? 'REJECTED' : 'EXPIRED';
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
@@ -184,10 +207,10 @@ export async function rejectPayment(
   const [update] = await db.batch([
     db
       .prepare(
-        `UPDATE bookings SET status = ?1, rejected_at = ?2, rejected_by = ?3, reject_reason = ?4, hold_expires_at = ?5, warned_at = NULL, updated_at = ?2
+        `UPDATE bookings SET status = ?1, rejected_at = ?2, rejected_by = ?3, reject_reason = ?4, hold_expires_at = ?5, warned_at = NULL, updated_at = ?2, transition_id = ?7
           WHERE id = ?6 AND status = 'PAYMENT_SUBMITTED'`,
       )
-      .bind(nextStatus, now, staff.id, input.reason, holdUntil, bookingId),
+      .bind(nextStatus, now, staff.id, input.reason, holdUntil, bookingId, g.id),
     db
       .prepare(`UPDATE payment_proofs SET status = 'rejected' WHERE booking_id = ? AND status = 'submitted' AND ${g.sql}`)
       .bind(bookingId, ...g.params),
@@ -211,7 +234,7 @@ export async function rejectPayment(
       `Hi ${b.user_name},\n\nWe couldn't verify your payment for ${where} (${b.ref}).\n\nReason: ${input.reason}\n\n${input.keepHold ? `Your slot is held for ${settings.resubmitMinutes} more minutes. Send a new screenshot here: ${env.APP_ORIGIN}/bookings/${bookingId}` : 'The slot was released. You can book again anytime.'}\n\nLe Spinners Recreational Hub`,
       bookingId, now, g),
     // Without a resubmit window the booking is over: any booking credit it used comes back.
-    ...releaseStmts(db, 'b.id = ? AND b.rejected_at = ?', [bookingId, now], now),
+    ...releaseStmts(db, 'b.id = ? AND b.transition_id = ?', [bookingId, g.id], now),
   ]);
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This booking is no longer waiting for verification. Someone may have handled it already.');
 }
@@ -220,15 +243,15 @@ export async function rejectPayment(
 export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: string, reason: string, now = Date.now()) {
   const db = env.DB;
   const b = await getBooking(db, bookingId);
-  const g = changedAt(bookingId, 'cancelled_at', now);
+  const g = bookingTransition(bookingId);
   const where = `${b.resource_name} · ${dateLabel(b.date)} · ${slotLabel(b)}`;
   const [update] = await db.batch([
     db
       .prepare(
-        `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = ?3, hold_expires_at = NULL, updated_at = ?1
+        `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = ?3, hold_expires_at = NULL, updated_at = ?1, transition_id = ?5
           WHERE id = ?4 AND status IN ('TEMPORARY', 'REJECTED')`,
       )
-      .bind(now, staff.id, reason, bookingId),
+      .bind(now, staff.id, reason, bookingId, g.id),
     eventStmt(db, bookingId, 'cancelled', staff.id, 'staff', reason, now, g),
     systemMessageStmt(db, bookingId, `Booking cancelled by staff · ${reason}`, now, g),
     userNoticeStmt(db, b.user_id, { type: 'booking_cancelled', title: 'Booking cancelled by Le Spinners', body: `${where} · ${reason}`, link: `/bookings/${bookingId}`, bookingId }, now, g),
@@ -236,7 +259,7 @@ export async function staffCancel(env: Bindings, staff: SessionUser, bookingId: 
     outboxStmt(db, 'email', b.user_email ?? '', 'Le Spinners — Booking cancelled',
       `Hi ${b.user_name},\n\nYour booking ${b.ref} (${where}) was cancelled by Le Spinners.\nReason: ${reason}\n\nQuestions? Reply in the booking chat: ${env.APP_ORIGIN}/bookings/${bookingId}/chat\n\nLe Spinners Recreational Hub`,
       bookingId, now, g),
-    ...releaseStmts(db, 'b.id = ? AND b.cancelled_at = ?', [bookingId, now], now),
+    ...releaseStmts(db, 'b.id = ? AND b.transition_id = ?', [bookingId, g.id], now),
   ]);
   if (!update?.meta.changes) {
     throw conflict('NOT_CANCELLABLE', 'Only unpaid holds can be cancelled here. For a paid or confirmed booking, use "Cancel & credit": it issues the player a booking credit.');

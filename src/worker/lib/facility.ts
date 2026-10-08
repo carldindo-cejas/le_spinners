@@ -6,6 +6,7 @@ import { newId } from './crypto';
 import { conflict, forbidden, notFound, unprocessable } from './errors';
 import { addDays, dateLabel, localNow, offsetMinutes, peso } from './time';
 import { zActivity, zDate, zId } from './validate';
+import { scheduleBatch, scheduleVersion } from './schedule';
 
 /**
  * Facility changes (maintenance, open play, disabling a court, closures, weekly hours) never
@@ -58,10 +59,13 @@ export async function affectedBookings(c: AppContext, scope: ImpactScope, now = 
        FROM bookings b JOIN resources r ON r.id = b.resource_id JOIN users u ON u.id = b.user_id
       WHERE ${OCCUPYING('b', '?1')} AND (b.date > ?2 OR (b.date = ?2 AND b.end_min > ?3)) AND ${where}
       ORDER BY b.date, b.start_min, r.sort_order
-      LIMIT 500`,
+      LIMIT 501`,
   )
     .bind(now, local.date, local.minutes, ...params)
     .all<AffectedRow>();
+  if (results.length > 500) {
+    throw unprocessable('TOO_MANY_BOOKINGS', 'This change affects more than 500 active bookings. Choose a shorter time range or fewer courts and tables before confirming.');
+  }
   return results;
 }
 
@@ -170,6 +174,7 @@ export async function updateResource(c: AppContext, actor: SessionUser, id: stri
   const db = c.env.DB;
   const now = Date.now();
   const today = localNow(offsetMinutes(c.env.TZ_OFFSET_MINUTES), now).date;
+  const version = await scheduleVersion(db);
   const current = await getResource(db, id);
   const next = {
     name: body.name ?? current.name,
@@ -202,18 +207,23 @@ export async function updateResource(c: AppContext, actor: SessionUser, id: stri
   }
 
   const [status, openPlay] = storedStatus(next.status);
-  const row = { status, open_play: openPlay };
-  await db
-    .prepare(
-      `UPDATE resources SET name = ?, price_member = ?, price_non_member = ?, status = ?, open_play = ?, maintenance_note = ?, maintenance_until = ?, updated_at = ?
-        WHERE id = ?`,
-    )
-    .bind(next.name, next.price_member, next.price_non_member, row.status, row.open_play, next.maintenance_note, next.maintenance_until, now, id)
-    .run();
+  // Never write omitted fields, especially administrator-only prices. The
+  // revision guard also rejects stale affected-booking confirmations.
+  const fields: string[] = [];
+  const values: (string | number | null)[] = [];
+  const set = (column: string, value: string | number | null) => { fields.push(`${column} = ?`); values.push(value); };
+  if (body.name !== undefined) set('name', next.name);
+  if (body.priceMember !== undefined) set('price_member', next.price_member);
+  if (body.priceNonMember !== undefined) set('price_non_member', next.price_non_member);
+  if (body.status !== undefined) { set('status', status); set('open_play', openPlay); }
+  if (body.maintenanceNote !== undefined || body.status !== undefined) set('maintenance_note', next.maintenance_note);
+  if (body.maintenanceUntil !== undefined || body.status !== undefined) set('maintenance_until', next.maintenance_until);
+  set('updated_at', now);
+  await scheduleBatch(db, version, [db.prepare(`UPDATE resources SET ${fields.join(', ')} WHERE id = ?`).bind(...values, id)]);
   const changed = Object.keys(body).filter((k) => k !== 'confirmAffected').join(',');
   const detail = affected.length ? `${changed}; affected ${affected.map((a) => a.ref).join(' ')}` : changed;
   c.executionCtx.waitUntil(audit(c, actor.id, 'resource_updated', 'resource', id, detail));
-  return { resource: resourceDTO({ ...current, ...next, ...row }), affected };
+  return { resource: resourceDTO(await getResource(db, id)), affected };
 }
 
 /** Adds a court or table. Staff-added ones copy the prices of the same activity. */
@@ -266,16 +276,16 @@ export async function createClosure(c: AppContext, actor: SessionUser, body: z.i
   const db = c.env.DB;
   const now = Date.now();
   const today = localNow(offsetMinutes(c.env.TZ_OFFSET_MINUTES), now).date;
+  const version = await scheduleVersion(db);
   if (body.date < today) throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { date: ['Pick today or a later date.'] });
   if (body.date > addDays(today, 366)) throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { date: ['Pick a date within the next year.'] });
   const resource = body.resourceId ? await getResource(db, body.resourceId) : null;
   const rows = await affectedBookings(c, { kind: 'closure', date: body.date, resourceId: body.resourceId, start: body.start, end: body.end }, now);
   const affected = requireConfirmation(rows, body.confirmAffected, `Closing ${resource ? resource.name : 'the facility'} on ${dateLabel(body.date)}`);
   const id = newId('cl_');
-  await db
+  await scheduleBatch(db, version, [db
     .prepare('INSERT INTO closures (id, date, resource_id, start_min, end_min, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, body.date, body.resourceId, body.start, body.end, body.reason, actor.id, now)
-    .run();
+    .bind(id, body.date, body.resourceId, body.start, body.end, body.reason, actor.id, now)]);
   const detail = `${body.date} ${resource?.name ?? 'facility'} ${body.start ?? 'all'}-${body.end ?? 'day'}${affected.length ? `; affected ${affected.map((a) => a.ref).join(' ')}` : ''}`;
   c.executionCtx.waitUntil(audit(c, actor.id, 'closure_created', 'closure', id, detail));
   return { id, affected };
@@ -310,16 +320,16 @@ export async function setWeeklyHours(c: AppContext, actor: SessionUser, weekday:
     throw unprocessable('VALIDATION_ERROR', 'Please check the highlighted fields.', { close: [`Open for at least one ${slotMinutes}-minute slot.`] });
   }
   const db = c.env.DB;
+  const version = await scheduleVersion(db);
   const current = await db.prepare('SELECT * FROM opening_hours WHERE weekday = ?').bind(weekday).first<HoursRow>();
   const rows = await affectedBookings(c, { kind: 'hours', weekday, isOpen: body.isOpen, open: body.open, close: body.close, slotMinutes });
   const affected = requireConfirmation(rows, body.confirmAffected, `Changing ${WEEKDAYS[weekday]} hours`);
-  await db
+  await scheduleBatch(db, version, [db
     .prepare(
       `INSERT INTO opening_hours (weekday, is_open, open_min, close_min) VALUES (?, ?, ?, ?)
        ON CONFLICT (weekday) DO UPDATE SET is_open = excluded.is_open, open_min = excluded.open_min, close_min = excluded.close_min`,
     )
-    .bind(weekday, body.isOpen ? 1 : 0, body.open, body.close)
-    .run();
+    .bind(weekday, body.isOpen ? 1 : 0, body.open, body.close)]);
   const before = current ? `${current.is_open ? `${current.open_min}-${current.close_min}` : 'closed'}` : 'unset';
   const after = body.isOpen ? `${body.open}-${body.close}` : 'closed';
   const detail = `${WEEKDAYS[weekday]} ${before} -> ${after}${affected.length ? `; affected ${affected.map((a) => a.ref).join(' ')}` : ''}`;

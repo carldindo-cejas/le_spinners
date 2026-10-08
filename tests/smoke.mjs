@@ -13,6 +13,7 @@
  * then deletes them from the remote database):
  *   BASE_URL=https://le-spinners.example.workers.dev npm run test:smoke -- --auth-only
  */
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -57,7 +58,7 @@ class Client {
   }
 
   async req(method, path, { json, form, headers = {}, origin = BASE } = {}) {
-    const h = { ...headers };
+    const h = { ...(method === 'POST' && /^\/api\/(?:admin\/|staff\/)?bookings$/.test(path) ? { 'Idempotency-Key': randomUUID() } : {}), ...headers };
     if (this.cookie) h.Cookie = this.cookie;
     if (method !== 'GET' && method !== 'HEAD' && origin) h.Origin = origin;
     let body;
@@ -1133,6 +1134,13 @@ section('Email / SMS queue and settings');
   const out = await ana.get('/api/admin/outbox');
   check('verification email queued with the right subject', out.data.items.some((o) => o.channel === 'email' && o.subject === 'Le Spinners — Booking Requires Payment Verification'));
   check('SMS queued (no provider yet)', out.data.items.some((o) => o.channel === 'sms' && o.status === 'queued'));
+  check('SMS explicitly reports unsupported delivery', out.data.items.some(o => o.channel === 'sms' && o.deliveryState === 'unsupported'));
+  check('disabled email is visible in queue health', out.data.emailEnabled === false && typeof out.data.summary.ready === 'number');
+  const storage = await ana.get('/api/admin/storage-health');
+  check('admin can inspect upload recovery without private file keys', storage.status === 200 && typeof storage.data.cleanupPending === 'number' && !JSON.stringify(storage.data).includes('r2_key'));
+  check('legacy file scanning is disabled in isolated tests', storage.data.legacyScanEnabled === false);
+  check('staff reading upload recovery → 403', (await rhea.get('/api/admin/storage-health')).status === 403);
+  check('player reading upload recovery → 403', (await juan.get('/api/admin/storage-health')).status === 403);
   const s = await ana.get('/api/admin/settings');
   check('admin can edit settings', s.data.canEdit === true && s.data.delivery.sms === 'queued');
   const bad = await ana.put('/api/admin/settings', { gcashNumber: '12345' });
@@ -1544,12 +1552,17 @@ section('Admin credit tools');
   const made = sql(`SELECT COUNT(*) AS n FROM booking_credits WHERE idempotency_key = '${k}';`)[0].results[0];
   check('manual credit → 201; a retry with the same key adds nothing', g.status === 201 && g2.data.credit?.id === g.data.credit?.id && made.n === 1, { g: g.status, g2: g2.data, made });
   const id = g.data.credit.id;
-  const tooMuch = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 99900, method: 'cash' });
+  const refundOptions = { headers: { 'Idempotency-Key': `smoke-refund-${id}` } };
+  const tooMuch = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 99900, method: 'cash' }, refundOptions);
   check('refund above the balance → 422', tooMuch.status === 422, tooMuch.data);
-  const noRef = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash' });
+  const noRef = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash' }, refundOptions);
   check('a GCash refund needs its reference → 422', noRef.status === 422, noRef.data);
-  const refund = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash', reference: '1234 567 890' });
+  const refund = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash', reference: '1234 567 890' }, refundOptions);
   check('refund recorded: ₱200 left, reference kept', refund.status === 200 && refund.data.credit.remaining === 20000 && refund.data.history.some((h) => h.kind === 'refund' && (h.note ?? '').includes('1234 567 890')), refund.data);
+  const replay = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 5000, method: 'gcash', reference: '1234 567 890' }, refundOptions);
+  check('refund replay preserves one debit and original operation result', replay.status === 200 && replay.data.credit.remaining === 20000 && replay.data.history.filter(h => h.kind === 'refund').length === 1 && replay.data.refund.transactionId === refund.data.refund.transactionId, replay.data);
+  const changedRefund = await ana.post(`/api/admin/credits/${id}/refund`, { amount: 6000, method: 'cash' }, refundOptions);
+  check('refund key cannot be reused for a different amount or method', changedRefund.status === 409 && changedRefund.data.error.code === 'IDEMPOTENCY_KEY_REUSED', changedRefund.data);
 
   // A pending top-up hold reserves the credit: no void until it is settled.
   const summary = (await juan.get('/api/credits')).data.summary.available;

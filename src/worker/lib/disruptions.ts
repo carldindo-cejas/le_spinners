@@ -1,4 +1,5 @@
 import * as z from 'zod';
+import { MAINTENANCE_BATCH_SIZE } from './limits';
 import type { Activity, AppContext, Bindings, BookingRow, BookingStatus, Role, SessionUser } from '../types';
 import { ApiError, conflict, forbidden, notFound, unprocessable } from './errors';
 import { newId, sha256Hex } from './crypto';
@@ -6,6 +7,7 @@ import { SEGMENTS_SQL, effectiveStatus, segmentsOf, type Segment } from './booki
 import { SQL_ID, releaseStmts } from './credits';
 import { DAY_MS, dateLabel, daysBetween, isValidDate, localNow, localToMs, minutesLabel, offsetMinutes, peso } from './time';
 import { zActivity, zDate, zId } from './validate';
+import { scheduleBatch, scheduleVersion } from './schedule';
 
 /**
  * Operator cancellations and facility disruptions (REBOOKING.md §4–§6, §14).
@@ -119,6 +121,7 @@ export type PlanItem = {
 type NotAffected = { booking: Candidate; reason: 'ended' | 'outside' | 'already_compensated' };
 
 export type Plan = {
+  scheduleVersion: number;
   input: DisruptionInput;
   items: PlanItem[];
   notAffected: NotAffected[];
@@ -312,6 +315,7 @@ type PlanOptions = { onlyBookingIds?: string[]; skipPermissions?: boolean };
 /** Everything a disruption would do, computed without writing anything. */
 export async function buildPlan(c: AppContext, actor: SessionUser, raw: DisruptionInput, now: number, opts: PlanOptions = {}): Promise<Plan> {
   const db = c.env.DB;
+  const version = await scheduleVersion(db);
   const offset = offsetMinutes(c.env.TZ_OFFSET_MINUTES);
   const input = normalize(raw, now);
   if (!opts.skipPermissions) checkPermissions(actor, input, now, offset);
@@ -401,7 +405,7 @@ export async function buildPlan(c: AppContext, actor: SessionUser, raw: Disrupti
     items: items.map((i) => [i.booking.id, i.booking.status, i.booking.updated_at, i.action, i.credit, i.affectedMin]),
     closures,
   };
-  return { input, items, notAffected, closures, scopeLabel, previewToken: await sha256Hex(JSON.stringify(fingerprint)) };
+  return { input, items, notAffected, closures, scopeLabel, scheduleVersion: version, previewToken: await sha256Hex(JSON.stringify(fingerprint)) };
 }
 
 const FLAG_LABEL: Record<string, string> = {
@@ -861,11 +865,17 @@ export async function applyDisruption(
   );
 
   try {
-    await db.batch(stmts);
+    await scheduleBatch(db, plan.scheduleVersion, stmts);
   } catch (err) {
-    if (String(err).includes('UNIQUE') && String(err).includes('idempotency_key')) {
-      const won = await db.prepare('SELECT id FROM disruptions WHERE idempotency_key = ?').bind(idempotencyKey).first<{ id: string }>();
-      if (won) return { id: won.id, replay: true };
+    // A same-key winner may have changed the revision before this batch started.
+    const won = await db.prepare('SELECT id, request_hash FROM disruptions WHERE idempotency_key = ?').bind(idempotencyKey).first<{ id: string; request_hash: string }>();
+    if (won) {
+      if (won.request_hash !== requestHash) throw conflict('IDEMPOTENCY_KEY_REUSED', 'This request key was already used for a different change. Reload and try again.');
+      return { id: won.id, replay: true };
+    }
+    if (err instanceof Error && 'code' in err && err.code === 'SCHEDULE_CHANGED') {
+      const fresh = await buildPlan(c, actor, raw, Date.now());
+      throw conflict('DISRUPTION_CHANGED', 'Bookings changed since the preview. Review the updated list, then confirm again.', { preview: previewDTO(fresh) });
     }
     throw err;
   }
@@ -932,7 +942,7 @@ export async function resolveItem(c: AppContext, actor: SessionUser, disruptionI
   if (!p) {
     const why = plan.notAffected.find((n) => n.booking.id === bookingId)?.reason ?? 'ended';
     const reason = item.status_before === 'PAYMENT_SUBMITTED' && why === 'ended' ? 'payment_not_verified' : why;
-    await db.batch([
+    await scheduleBatch(db, plan.scheduleVersion, [
       db
         .prepare(`UPDATE disruption_items SET outcome = 'skipped', skip_reason = ?3, resolved_at = ?4 WHERE disruption_id = ?1 AND booking_id = ?2 AND ${OPEN_ITEM('disruption_items')}`)
         .bind(disruptionId, bookingId, reason, now),
@@ -946,7 +956,7 @@ export async function resolveItem(c: AppContext, actor: SessionUser, disruptionI
 
   const one: Plan = { ...plan, items: [p] };
   const ctx: ApplyContext = { db, disruptionId, actor, input: plan.input, plan: one, now, origin: c.env.APP_ORIGIN };
-  const [row] = await db.batch([
+  const [row] = await scheduleBatch(db, plan.scheduleVersion, [
     db
       .prepare(
         `UPDATE disruption_items
@@ -990,17 +1000,18 @@ export async function resolveDeferredForBooking(c: AppContext, actor: SessionUse
 /** Cron: deferred bookings whose payment never got verified (expired, released) need no credit. */
 export async function closeUnpaidDeferred(env: Bindings, now = Date.now()): Promise<number> {
   const db = env.DB;
-  const { results } = await db
-    .prepare(
-      `UPDATE disruption_items SET outcome = 'skipped', skip_reason = 'payment_not_verified', resolved_at = ?1
-        WHERE outcome = 'deferred' AND booking_id IN (SELECT id FROM bookings WHERE status IN ('EXPIRED', 'CANCELLED'))
-       RETURNING disruption_id`,
-    )
-    .bind(now)
-    .all<{ disruption_id: string }>();
-  const ids = [...new Set(results.map((r) => r.disruption_id))];
-  if (ids.length) await db.batch(ids.map((id) => resolveNoticeStmt(db, id, now)));
-  return results.length;
+  const { results } = await db.prepare(`SELECT disruption_id, booking_id FROM disruption_items
+    WHERE outcome = 'deferred' AND booking_id IN (SELECT id FROM bookings WHERE status IN ('EXPIRED', 'CANCELLED'))
+    ORDER BY disruption_id, booking_id LIMIT ?`).bind(MAINTENANCE_BATCH_SIZE).all<{ disruption_id: string; booking_id: string }>();
+  if (!results.length) return 0;
+  const [updated] = await db.batch([
+    db.prepare(`UPDATE disruption_items SET outcome = 'skipped', skip_reason = 'payment_not_verified', resolved_at = ?1
+      WHERE outcome = 'deferred' AND booking_id IN (SELECT id FROM bookings WHERE status IN ('EXPIRED', 'CANCELLED'))
+        AND EXISTS (SELECT 1 FROM json_each(?2) j WHERE json_extract(j.value, '$[0]') = disruption_id AND json_extract(j.value, '$[1]') = booking_id)`)
+      .bind(now, JSON.stringify(results.map(r => [r.disruption_id, r.booking_id]))),
+    ...[...new Set(results.map(r => r.disruption_id))].map(id => resolveNoticeStmt(db, id, now)),
+  ]);
+  return updated?.meta.changes ?? 0;
 }
 
 // ── Reading ────────────────────────────────────────────────────────────────

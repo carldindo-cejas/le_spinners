@@ -1,13 +1,16 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
 import { openChangePassword, openEditProfile } from '../../core/account.js';
-import { html, on, setBusy } from '../../core/dom.js';
+import { listen, html, on, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { initials, monthDayYear } from './util.js';
 import { memberTag, openModal } from '../../core/ui.js';
-import { navigate, show, state, stopBadgePolling } from '../shell.js';
+import { logout, navigate, show, state } from '../shell.js';
+
+const viewTools = createViewTools({ listen, api, openChangePassword, openEditProfile, on, setBusy, openModal, navigate, show });
 
 let installEvent = null;
-window.addEventListener('beforeinstallprompt', (e) => {
+listen(window, 'beforeinstallprompt', (e) => {
   e.preventDefault();
   installEvent = e;
 });
@@ -36,19 +39,22 @@ function membershipCard(u) {
 }
 
 function editProfile() {
+  const { openEditProfile } = viewTools();
   openEditProfile(state.user, {
     onSaved: (user) => {
       state.user = user;
-      profileView();
+      state.router.refresh();
     },
   });
 }
 
 function changePassword() {
+  const { openChangePassword } = viewTools();
   openChangePassword(state.user.email);
 }
 
 function installHelp() {
+  const { openModal } = viewTools();
   if (installEvent) {
     installEvent.prompt();
     installEvent.userChoice.finally(() => (installEvent = null));
@@ -68,6 +74,7 @@ function installHelp() {
 }
 
 export async function profileView() {
+  const { show, on, setBusy, api, scope } = viewTools();
   const u = state.user;
   let count = null;
   const root = show(html`<div class="screen has-tabbar screen-enter">
@@ -92,17 +99,7 @@ export async function profileView() {
   on(root, 'click', '[data-act="edit"]', editProfile);
   on(root, 'click', '[data-act="password"]', changePassword);
   on(root, 'click', '[data-act="install"]', installHelp);
-  on(root, 'click', '[data-act="logout"]', async (_e, btn) => {
-    setBusy(btn, true, 'Logging out…');
-    try {
-      await api.post('/api/auth/logout');
-    } catch {
-      /* signed out locally anyway */
-    }
-    state.user = null;
-    stopBadgePolling();
-    navigate('/login', { replace: true });
-  });
+  on(root, 'click', '[data-act="logout"]', logout);
   try {
     const res = await api.get('/api/bookings');
     count = res.bookings.length;

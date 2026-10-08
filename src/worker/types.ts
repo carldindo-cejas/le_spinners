@@ -1,17 +1,16 @@
 import type { Context } from 'hono';
 
 /** Bindings configured in wrangler.jsonc plus secrets. */
-export type Bindings = {
-  DB: D1Database;
-  PROOFS: R2Bucket;
-  ASSETS: Fetcher;
+export type Bindings = Omit<Cloudflare.Env, 'TZ_OFFSET_MINUTES' | 'APP_ORIGIN'> & {
+  /** Test/staging runtime values use the same generated binding contract. */
   TZ_OFFSET_MINUTES: string;
   APP_ORIGIN: string;
-  FILE_SIGNING_SECRET: string;
-  /** Key for HMAC-SHA256(PASSWORD_PEPPER, clientHash). A secret, never stored anywhere else. */
-  PASSWORD_PEPPER: string;
   RESEND_API_KEY?: string;
   EMAIL_FROM?: string;
+  /** Enable only after reviewing legacy R2 inventory and the upload migration/rollback procedure. */
+  STORAGE_ORPHAN_SCAN_ENABLED?: string;
+  /** Set to 'false' to pause storage deletion/discovery during a controlled migration or repair. */
+  STORAGE_CLEANUP_ENABLED?: string;
 };
 
 export type Role = 'player' | 'staff' | 'admin';
@@ -39,6 +38,8 @@ export type UserRow = {
   password_salt: string;
   password_iterations: number;
   password_scheme: string;
+  auth_version: number;
+  auth_change_id: string | null;
   role: Role;
   membership: Membership;
   member_code: string | null;
@@ -50,6 +51,7 @@ export type UserRow = {
 
 export type SessionUser = Pick<UserRow, 'id' | 'email' | 'name' | 'phone' | 'role' | 'membership' | 'member_code' | 'member_until'> & {
   session_id: string;
+  auth_version: number;
 };
 
 export type ResourceRow = {

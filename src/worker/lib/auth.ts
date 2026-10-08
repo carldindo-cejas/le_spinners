@@ -1,6 +1,6 @@
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { MiddlewareHandler } from 'hono';
-import type { AppContext, AppEnv, Role, SessionUser } from '../types';
+import type { AppContext, AppEnv, Role, SessionUser, UserRow } from '../types';
 import { ApiError, forbidden, tooMany, unauthorized } from './errors';
 import { newToken, sha256Hex } from './crypto';
 
@@ -31,23 +31,35 @@ export function passwordPepper(c: AppContext): string {
 }
 
 export function clientIp(c: AppContext): string {
-  return c.req.header('CF-Connecting-IP') ?? 'local';
+  const value = c.req.header('CF-Connecting-IP');
+  if (!value || value.length > 45) return 'local';
+  // CF supplies this at the edge. Ignore spoofable X-Forwarded-For/Forwarded.
+  // URL parsing canonicalizes equivalent IPv6 spellings into one limiter identity.
+  if (value.includes(':')) {
+    try { return new URL(`http://[${value}]/`).hostname.toLowerCase(); } catch { return 'local'; }
+  }
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) && value.split('.').every(n => Number(n) <= 255) ? value : 'local';
 }
 
 /**
  * Starts a session. With `remember` off the cookie lasts until the browser
  * closes (shared phones); the server-side expiry still applies.
  */
-export async function createSession(c: AppContext, user: { id: string; role: Role }, remember = true): Promise<void> {
+export async function createSession(c: AppContext, user: Pick<UserRow, 'id' | 'role' | 'auth_version' | 'password_hash'>, remember = true): Promise<void> {
   const token = newToken();
   const id = await sha256Hex(token);
   const now = Date.now();
   const ttl = isStaff(user.role) ? STAFF_TTL_MS : PLAYER_TTL_MS;
-  await c.env.DB.prepare(
-    'INSERT INTO sessions (id, user_id, created_at, expires_at, last_seen_at, user_agent) VALUES (?, ?, ?, ?, ?, ?)',
-  )
-    .bind(id, user.id, now, now + ttl, now, (c.req.header('User-Agent') ?? '').slice(0, 200))
-    .run();
+  const db = c.env.DB;
+  const statements = [db.prepare(`INSERT INTO sessions (id,user_id,created_at,expires_at,last_seen_at,user_agent,auth_version)
+    SELECT ?,id,?,?,?,?,auth_version FROM users
+    WHERE id=? AND role=? AND status='active' AND auth_version=? AND password_hash=?`)
+    .bind(id,now,now + ttl,now,(c.req.header('User-Agent') ?? '').slice(0,200),user.id,user.role,user.auth_version,user.password_hash)];
+  const previous = c.get('user');
+  if (previous) statements.push(db.prepare(`DELETE FROM sessions WHERE id=? AND EXISTS (SELECT 1 FROM sessions WHERE id=?)`)
+    .bind(previous.session_id,id));
+  const results = await db.batch(statements);
+  if (!results[0]?.meta.changes) throw new ApiError(401,'INVALID_CREDENTIALS','Email or password is incorrect.');
   setCookie(c, SESSION_COOKIE, token, {
     httpOnly: true,
     secure: isHttps(c),
@@ -63,7 +75,7 @@ export async function destroySession(c: AppContext): Promise<void> {
   deleteCookie(c, SESSION_COOKIE, { path: '/', secure: isHttps(c) });
 }
 
-type SessionJoin = SessionUser & { expires_at: number; last_seen_at: number; status: string };
+type SessionJoin = SessionUser & { expires_at: number; last_seen_at: number; status: string; session_version: number };
 
 /** Reads the session cookie and sets c.var.user (or null). Never throws for a bad cookie. */
 export const loadSession: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -72,7 +84,7 @@ export const loadSession: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (token && token.length >= 32 && token.length <= 128) {
     const id = await sha256Hex(token);
     const row = await c.env.DB.prepare(
-      `SELECT s.id AS session_id, s.expires_at, s.last_seen_at,
+      `SELECT s.id AS session_id, s.expires_at, s.last_seen_at, s.auth_version AS session_version, u.auth_version,
               u.id, u.email, u.name, u.phone, u.role, u.membership, u.member_code, u.member_until, u.status
          FROM sessions s JOIN users u ON u.id = s.user_id
         WHERE s.id = ?`,
@@ -80,14 +92,16 @@ export const loadSession: MiddlewareHandler<AppEnv> = async (c, next) => {
       .bind(id)
       .first<SessionJoin>();
     const now = Date.now();
-    if (row && row.expires_at > now && row.status === 'active') {
-      const { expires_at, last_seen_at, status: _status, ...user } = row;
+    if (row && row.expires_at > now && row.status === 'active' && row.session_version === row.auth_version) {
+      const { expires_at, last_seen_at, status: _status, session_version: _version, ...user } = row;
       c.set('user', user);
       if (now - last_seen_at > TOUCH_EVERY_MS) {
         // Player sessions slide; staff sessions keep their 12-hour limit.
         const expires = isStaff(user.role) ? expires_at : now + PLAYER_TTL_MS;
         c.executionCtx.waitUntil(
-          c.env.DB.prepare('UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?').bind(now, expires, id).run(),
+          c.env.DB.prepare(`UPDATE sessions SET last_seen_at=?,expires_at=? WHERE id=? AND auth_version=?
+            AND EXISTS (SELECT 1 FROM users WHERE id=sessions.user_id AND status='active' AND auth_version=?)`)
+            .bind(now,expires,id,user.auth_version,user.auth_version).run(),
         );
       }
     } else if (row) {

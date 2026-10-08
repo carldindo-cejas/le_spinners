@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { afterPage, pageRequest, pageResult } from '../lib/pagination';
 import * as z from 'zod';
 import type { AppEnv } from '../types';
 import { audit, isStaff, requirePlayer, requireUser } from '../lib/auth';
@@ -6,7 +7,7 @@ import { playerUnreadChats } from '../lib/chat';
 import { ApiError, notFound } from '../lib/errors';
 import { lazyMaintenance } from '../lib/maintenance';
 import { checkProofSignature, getProof } from '../lib/payments';
-import { jsonBody, parse, zId } from '../lib/validate';
+import { jsonBody, parse, query, zId } from '../lib/validate';
 
 type NotificationRow = {
   id: string;
@@ -45,18 +46,23 @@ export const notificationRoutes = new Hono<AppEnv>();
 notificationRoutes.get('/', async (c) => {
   const user = requirePlayer(c);
   const db = c.env.DB;
+  const q = query(c,z.object({filter:z.enum(['all','bookings','messages']).default('all')}));
+  const page = pageRequest(c.req.query(), `player-notifications:${user.id}:${q.filter}`, ['number','string']);
+  const after = afterPage(page, ['created_at','id']);
+  const group = q.filter === 'messages' ? " AND type='new_message'" : q.filter === 'bookings' ? " AND type!='new_message'" : '';
   const [list, count] = await db.batch([
     db
       .prepare(
         `SELECT id, type, title, body, link, booking_id, read_at, resolved_at, created_at
-           FROM notifications WHERE audience = 'user' AND user_id = ? ORDER BY created_at DESC LIMIT 60`,
+           FROM notifications WHERE audience = 'user' AND user_id = ?${group}${after.sql ? ` AND ${after.sql}` : ''} ORDER BY created_at DESC, id DESC LIMIT ?`,
       )
-      .bind(user.id),
+      .bind(user.id,...after.params,page.limit + 1),
     db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE audience = 'user' AND user_id = ? AND read_at IS NULL`).bind(user.id),
   ]);
   const rows = (list?.results ?? []) as NotificationRow[];
   const unread = ((count?.results ?? [])[0] as { n: number } | undefined)?.n ?? 0;
-  return c.json({ now: Date.now(), unread, notifications: rows.map(notificationDTO) });
+  const result = pageResult(rows,page,n => [n.created_at,n.id]);
+  return c.json({ now: Date.now(), unread, page:result.page, notifications: result.rows.map(notificationDTO) });
 });
 
 notificationRoutes.post('/read', async (c) => {
@@ -139,4 +145,3 @@ fileRoutes.get('/proofs/:id', async (c) => {
     },
   });
 });
-

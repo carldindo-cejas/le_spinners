@@ -1,6 +1,8 @@
 /* Le Spinners — shared design system (player app + staff console).
    Tokens and components follow the design canvas (DS01–DS07). */
 
+.route-mount { display: contents; }
+
 :root {
   --blue-600: #2350E0;
   --blue-700: #1A3DB8;

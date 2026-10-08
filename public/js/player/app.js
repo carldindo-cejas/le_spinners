@@ -1,9 +1,11 @@
 import { api, onUnauthorized } from '../core/api.js';
 import { createRouter } from '../core/router.js';
-import { html, render } from '../core/dom.js';
+import { loginReturnTarget } from '../core/navigation.js';
+import { installLogout, logoutBoundary } from '../core/logout-view.js';
+import { html, listen, render } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { toast } from '../core/ui.js';
-import { main, show, showSessionExpired, startBadges, state } from './shell.js';
+import { logout, main, show, showSessionExpired, startBadges, state, stopBadgePolling } from './shell.js';
 import { loginView, registerView } from './screens/auth.js';
 import { homeView } from './screens/home.js';
 import { activityStep, dateStep, resourceStep, timeStep, reviewStep } from './screens/book.js';
@@ -14,6 +16,7 @@ import { chatView } from './screens/chat.js';
 import { notificationsView } from './screens/notifications.js';
 import { profileView } from './screens/profile.js';
 import { creditDetailView, creditsView } from './screens/credits.js';
+import { landingView, sportsRatesView, courtCalendarView } from './screens/landing.js';
 
 const HOME = { player: '/', staff: '/staff/', admin: '/admin/' };
 const isPlayer = (u) => Boolean(u) && u.role === 'player';
@@ -22,11 +25,11 @@ const isPlayer = (u) => Boolean(u) && u.role === 'player';
 function guarded(view) {
   return (ctx) => {
     if (!state.user) {
-      const next = ctx.path + (location.search || '');
+      const next = ctx.path + location.search + location.hash;
       state.router.navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
       return undefined;
     }
-    if (!isPlayer(state.user)) return wrongAccountView();
+    if (!isPlayer(state.user)) return wrongAccountView(ctx);
     return view(ctx);
   };
 }
@@ -35,7 +38,7 @@ function guarded(view) {
 function publicOnly(view) {
   return (ctx) => {
     if (state.user) {
-      if (isPlayer(state.user)) state.router.navigate('/', { replace: true });
+      if (isPlayer(state.user)) state.router.navigate(loginReturnTarget(ctx.query.get('next')), { replace: true });
       else location.replace(HOME[state.user.role] || '/');
       return undefined;
     }
@@ -43,7 +46,7 @@ function publicOnly(view) {
   };
 }
 
-function wrongAccountView() {
+function wrongAccountView(ctx) {
   const u = state.user;
   const consoleName = u.role === 'admin' ? 'admin console' : 'staff console';
   const root = show(html`<div class="screen">
@@ -55,11 +58,7 @@ function wrongAccountView() {
       <button class="btn btn-secondary btn-md" type="button" data-act="switch">Sign out and use a player account</button>
     </div>
   </div>`);
-  root.querySelector('[data-act="switch"]').addEventListener('click', async () => {
-    await api.post('/api/auth/logout').catch(() => {});
-    state.user = null;
-    state.router.navigate('/login', { replace: true });
-  });
+  listen(root.querySelector('[data-act="switch"]'), 'click', logout);
 }
 
 function notFoundView() {
@@ -76,7 +75,10 @@ function notFoundView() {
 const routes = [
   { path: '/login', view: publicOnly(loginView) },
   { path: '/register', view: publicOnly(registerView) },
-  { path: '/', view: guarded(homeView) },
+  { path: '/', view: (ctx) => isPlayer(state.user) && state.facility ? homeView(ctx) : landingView(ctx) },
+  { path: '/welcome', view: landingView },
+  { path: '/sports-rates', view: sportsRatesView },
+  { path: '/court-calendar', view: courtCalendarView },
   { path: '/book', view: guarded(activityStep) },
   { path: '/book/:activity', view: guarded(dateStep) },
   { path: '/book/:activity/:date', view: guarded(resourceStep) },
@@ -148,17 +150,23 @@ function registerServiceWorker() {
 }
 
 async function boot() {
+  const logoutManager = installLogout({ state, loginPath: '/login', clear: stopBadgePolling });
   onUnauthorized(() => {
     if (state.user) showSessionExpired();
   });
   watchConnection();
   try {
-    const [me, facility] = await Promise.all([
-      api.get('/api/auth/session', { quiet401: true }),
+    const [me, facility] = await Promise.allSettled([
+      logoutManager.read() ? Promise.resolve({ user: null }) : api.get('/api/auth/session', { quiet401: true }),
       api.get('/api/facility'),
     ]);
-    state.user = me.user;
-    state.facility = facility;
+    state.user = !logoutManager.read() && me.status === 'fulfilled' ? me.value.user : null;
+    state.facility = facility.status === 'fulfilled' ? facility.value : null;
+    // Public introduction remains usable when the API cannot be reached.
+    // Authenticated screens still require their facility data.
+    if (!logoutManager.read() && (!state.facility || me.status === 'rejected') && !['/', '/welcome', '/sports-rates', '/court-calendar', '/login', '/register'].includes(location.pathname)) {
+      throw facility.status === 'rejected' ? facility.reason : me.status === 'rejected' ? me.reason : new Error('Facility unavailable');
+    }
   } catch (err) {
     state.user = null;
     if (err && err.code === 'NETWORK') {
@@ -168,7 +176,7 @@ async function boot() {
       return;
     }
   }
-  state.router = createRouter({ routes, notFound: notFoundView, ignore: ['/admin', '/staff', '/api/'] });
+  state.router = createRouter({ routes, notFound: notFoundView, ignore: ['/admin', '/staff', '/api/'], beforeView: () => logoutBoundary(show) });
   if (isPlayer(state.user)) startBadges();
   await state.router.resolve();
   registerServiceWorker();

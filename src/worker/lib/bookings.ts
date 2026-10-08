@@ -2,13 +2,17 @@ import * as z from 'zod';
 import type { Activity, Bindings, BookingRow, BookingSource, BookingStatus, PaymentMethod, ResourceRow, SessionUser } from '../types';
 import { conflict, notFound, unprocessable } from './errors';
 import { newId } from './crypto';
+import { bookingOperation } from './booking-operations';
+import { MAINTENANCE_BATCH_SIZE } from './limits';
 import { isOverspend, planCreditUse, redeemStmts, releaseStmts, spendableCredits, usesNote, type CreditUse } from './credits';
 import { outboxStmt, resolveStaffStmt, staffNoticeStmt, userNoticeStmt, type Guard } from './notify';
 import type { Settings } from './settings';
+import { scheduleBatch, scheduleVersion } from './schedule';
 import {
   addDays,
   dateLabel,
   daysBetween,
+  isValidDate,
   localNow,
   localToMs,
   minutesLabel,
@@ -180,6 +184,8 @@ export function bookingDTO(b: BookingJoin, now: number, settings: Settings, offs
     durationMin: minutes,
     durationLabel: durationLabel(minutes),
     startsAt,
+    /** The final occupied end, in facility time; gaps do not shorten this envelope. */
+    endsAt: localToMs(b.date, b.end_min, offsetMin),
     amountDue: b.amount_due,
     amountLabel: peso(b.amount_due),
     rate: b.rate,
@@ -269,108 +275,98 @@ export function systemMessageStmt(db: D1Database, bookingId: string, body: strin
     .bind(newId('m_'), bookingId, body, now, ...(guard?.params ?? []));
 }
 
-/** Guard: the booking has `column` set to exactly `now` (set by the batch's first UPDATE). */
-export function changedAt(bookingId: string, column: 'submitted_at' | 'confirmed_at' | 'rejected_at' | 'cancelled_at', now: number): Guard {
-  return { sql: `EXISTS (SELECT 1 FROM bookings WHERE id = ? AND ${column} = ?)`, params: [bookingId, now] };
+/** The winning UPDATE stores this request's random identity in the same batch as its effects. */
+export function bookingTransition(bookingId: string): Guard & { id: string } {
+  const id = newId('tr_');
+  return { id, sql: 'EXISTS (SELECT 1 FROM bookings WHERE id = ? AND transition_id = ?)', params: [bookingId, id] };
 }
 
-async function resourceNames(db: D1Database): Promise<Map<string, string>> {
-  const { results } = await db.prepare('SELECT id, name FROM resources').all<{ id: string; name: string }>();
-  return new Map(results.map((r) => [r.id, r.name]));
+// Time-driven transitions use a bounded candidate list and one atomic batch.
+// Recheck eligibility in UPDATE; only rows carrying this pass's token get effects.
+type MaintenanceRow = { id: string; user_id: string; rejected_at: number | null; resource_name: string; date: string; start_min: number };
+function passGuard(id: string, token: string): Guard {
+  return { sql: 'EXISTS (SELECT 1 FROM bookings WHERE id = ? AND transition_id = ?)', params: [id, token] };
 }
 
-// ── Time-driven transitions (cron + lazily on reads) ───────────────────────
-
-type ExpiredRow = { id: string; user_id: string; rejected_at: number | null; resource_id: string; date: string; start_min: number };
-
-/** Expires unpaid holds and closed resubmit windows. Safe to call often; only acts on changed rows. */
-export async function sweepExpired(env: Bindings, now = Date.now()): Promise<number> {
+/** Expires at most eight unpaid holds, including their credit and complete effects. */
+export async function sweepExpired(env: Bindings, now = Date.now(), scope?: { resourceId: string; date: string }): Promise<number> {
   const db = env.DB;
-  const pending = await db
-    .prepare(`SELECT 1 FROM bookings WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at <= ? LIMIT 1`)
-    .bind(now)
-    .first();
-  if (!pending) return 0;
-  // The expiry and the return of any booking credit the holds used commit together.
-  const [expired] = await db.batch([
-    db
-      .prepare(
-        `UPDATE bookings SET status = 'EXPIRED', updated_at = ?1
-          WHERE status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at IS NOT NULL AND hold_expires_at <= ?1
-         RETURNING id, user_id, rejected_at, resource_id, date, start_min`,
-      )
-      .bind(now),
-    ...releaseStmts(db, `b.status = 'EXPIRED' AND b.updated_at = ?`, [now], now),
-  ]);
-  const results = (expired?.results ?? []) as ExpiredRow[];
+  const { results } = await db.prepare(`SELECT b.id, b.user_id, b.rejected_at, r.name AS resource_name, b.date, b.start_min
+    FROM bookings b JOIN resources r ON r.id = b.resource_id
+    WHERE b.status IN ('TEMPORARY', 'REJECTED') AND b.hold_expires_at <= ?
+      ${scope ? 'AND b.resource_id = ? AND b.date = ?' : ''}
+    ORDER BY b.hold_expires_at, b.id LIMIT ?`)
+    .bind(now, ...(scope ? [scope.resourceId, scope.date] : []), MAINTENANCE_BATCH_SIZE).all<MaintenanceRow>();
   if (!results.length) return 0;
-  const names = await resourceNames(db);
-  const stmts: D1PreparedStatement[] = [];
+  const token = newId('tr_');
+  const statements = [db.prepare(`UPDATE bookings SET status = 'EXPIRED', updated_at = ?1, transition_id = ?2
+    WHERE id IN (SELECT value FROM json_each(?3)) AND status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at <= ?1`)
+    .bind(now, token, JSON.stringify(results.map(b => b.id))),
+    ...releaseStmts(db, 'b.id IN (SELECT value FROM json_each(?)) AND b.transition_id = ?', [JSON.stringify(results.map(b => b.id)), token], now)];
   for (const b of results) {
+    const guard = passGuard(b.id, token);
     const wasRejected = b.rejected_at != null;
-    const where = `${names.get(b.resource_id) ?? 'Your slot'} · ${dateLabel(b.date)} · ${minutesLabel(b.start_min)}`;
-    stmts.push(
-      eventStmt(db, b.id, 'expired', null, 'system', wasRejected ? 'No new proof before the resubmit window ended' : 'No payment proof before the hold ended', now),
-      systemMessageStmt(db, b.id, wasRejected ? 'Resubmit window ended · booking expired' : 'Hold ended · booking expired', now),
-      userNoticeStmt(db, b.user_id, { type: 'booking_expired', title: 'Booking expired', body: `${where} · the slot was released`, link: `/bookings/${b.id}`, bookingId: b.id }, now),
-      resolveStaffStmt(db, b.id, ['new_booking', 'hold_expiring', 'proof_submitted'], now),
+    const where = `${b.resource_name} · ${dateLabel(b.date)} · ${minutesLabel(b.start_min)}`;
+    statements.push(
+      eventStmt(db, b.id, 'expired', null, 'system', wasRejected ? 'No new proof before the resubmit window ended' : 'No payment proof before the hold ended', now, guard),
+      systemMessageStmt(db, b.id, wasRejected ? 'Resubmit window ended · booking expired' : 'Hold ended · booking expired', now, guard),
+      userNoticeStmt(db, b.user_id, { type: 'booking_expired', title: 'Booking expired', body: `${where} · the slot was released`, link: `/bookings/${b.id}`, bookingId: b.id }, now, guard),
+      resolveStaffStmt(db, b.id, ['new_booking', 'hold_expiring', 'proof_submitted'], now, guard),
     );
   }
-  await db.batch(stmts);
-  return results.length;
+  const [updated] = await db.batch(statements);
+  return updated?.meta.changes ?? 0;
 }
 
-/** One in-app warning when a hold has `warnMinutes` left. */
+/** One warning per hold, committed with the durable warned checkpoint. */
 export async function warnExpiringHolds(env: Bindings, settings: Settings, now = Date.now()): Promise<number> {
   const db = env.DB;
-  const { results } = await db
-    .prepare(
-      `UPDATE bookings SET warned_at = ?1
-        WHERE status = 'TEMPORARY' AND warned_at IS NULL AND hold_expires_at > ?1 AND hold_expires_at <= ?1 + ?2
-       RETURNING id, user_id, resource_id, date, start_min, hold_expires_at`,
-    )
-    .bind(now, settings.warnMinutes * 60_000)
-    .all<ExpiredRow & { hold_expires_at: number }>();
+  const window = settings.warnMinutes * 60_000;
+  const { results } = await db.prepare(`SELECT b.id, b.user_id, r.name AS resource_name, b.date, b.start_min
+    FROM bookings b JOIN resources r ON r.id = b.resource_id
+    WHERE b.status = 'TEMPORARY' AND b.warned_at IS NULL AND b.hold_expires_at > ? AND b.hold_expires_at <= ?
+    ORDER BY b.hold_expires_at, b.id LIMIT ?`).bind(now, now + window, MAINTENANCE_BATCH_SIZE).all<MaintenanceRow>();
   if (!results.length) return 0;
-  const names = await resourceNames(db);
-  const stmts: D1PreparedStatement[] = [];
+  const token = newId('tr_');
+  const statements = [db.prepare(`UPDATE bookings SET warned_at = ?1, transition_id = ?2
+    WHERE id IN (SELECT value FROM json_each(?3)) AND status = 'TEMPORARY' AND warned_at IS NULL
+      AND hold_expires_at > ?1 AND hold_expires_at <= ?4`).bind(now, token, JSON.stringify(results.map(b => b.id)), now + window)];
   for (const b of results) {
-    const name = names.get(b.resource_id) ?? 'your slot';
-    stmts.push(
+    const guard = passGuard(b.id, token);
+    statements.push(
       userNoticeStmt(db, b.user_id, {
-        type: 'hold_expiring',
-        title: 'Your temporary reservation will expire soon',
-        body: `Upload your payment proof in the next ${settings.warnMinutes} minutes to keep ${name}.`,
-        link: `/bookings/${b.id}/pay`,
-        bookingId: b.id,
-      }, now),
+        type: 'hold_expiring', title: 'Your temporary reservation will expire soon',
+        body: `Upload your payment proof in the next ${settings.warnMinutes} minutes to keep ${b.resource_name}.`,
+        link: `/bookings/${b.id}/pay`, bookingId: b.id,
+      }, now, guard),
       staffNoticeStmt(db, {
-        type: 'hold_expiring',
-        title: 'Payment window expiring',
-        body: `${name} · ${dateLabel(b.date)} · ${minutesLabel(b.start_min)} · no proof yet`,
-        link: `/admin/bookings/${b.id}`,
-        bookingId: b.id,
-      }, now),
+        type: 'hold_expiring', title: 'Payment window expiring',
+        body: `${b.resource_name} · ${dateLabel(b.date)} · ${minutesLabel(b.start_min)} · no proof yet`,
+        link: `/admin/bookings/${b.id}`, bookingId: b.id,
+      }, now, guard),
     );
   }
-  await db.batch(stmts);
-  return results.length;
+  const [updated] = await db.batch(statements);
+  return updated?.meta.changes ?? 0;
 }
 
-/** CONFIRMED bookings whose hour is over become COMPLETED. */
+/** Completes at most eight ended bookings with their timeline entries. */
 export async function completePast(env: Bindings, now = Date.now()): Promise<number> {
+  const db = env.DB;
   const local = localNow(offsetMinutes(env.TZ_OFFSET_MINUTES), now);
-  const { results } = await env.DB.prepare(
-    `UPDATE bookings SET status = 'COMPLETED', updated_at = ?1
-      WHERE status = 'CONFIRMED' AND (date < ?2 OR (date = ?2 AND end_min <= ?3))
-     RETURNING id`,
-  )
-    .bind(now, local.date, local.minutes)
-    .all<{ id: string }>();
-  if (results.length) {
-    await env.DB.batch(results.map((r) => eventStmt(env.DB, r.id, 'completed', null, 'system', null, now)));
-  }
-  return results.length;
+  const { results } = await db.prepare(`SELECT id FROM bookings
+    WHERE status = 'CONFIRMED' AND (date < ? OR (date = ? AND end_min <= ?))
+    ORDER BY date, end_min, id LIMIT ?`).bind(local.date, local.date, local.minutes, MAINTENANCE_BATCH_SIZE).all<{ id: string }>();
+  if (!results.length) return 0;
+  const token = newId('tr_');
+  const [updated] = await db.batch([
+    db.prepare(`UPDATE bookings SET status = 'COMPLETED', updated_at = ?1, transition_id = ?2
+      WHERE id IN (SELECT value FROM json_each(?3)) AND status = 'CONFIRMED'
+        AND (date < ?4 OR (date = ?4 AND end_min <= ?5))`)
+      .bind(now, token, JSON.stringify(results.map(b => b.id)), local.date, local.minutes),
+    ...results.map(b => eventStmt(db, b.id, 'completed', null, 'system', null, now, passGuard(b.id, token))),
+  ]);
+  return updated?.meta.changes ?? 0;
 }
 
 // ── Creating a hold ────────────────────────────────────────────────────────
@@ -410,6 +406,10 @@ async function checkSlots(env: Bindings, settings: Settings, input: SlotInput, n
   const db = env.DB;
   const local = localNow(offsetMinutes(env.TZ_OFFSET_MINUTES), now);
   const { resourceId, date } = input;
+  if (!isValidDate(date)) throw unprocessable('VALIDATION_ERROR', 'Use a real date (YYYY-MM-DD).', { date: ['Invalid date.'] });
+  // Expiry itself changes the schedule. Capture the plan's version afterward.
+  await sweepExpired(env, now, { resourceId, date });
+  const version = await scheduleVersion(db);
   const starts = [...new Set(input.starts)].sort((a, b) => a - b);
   if (!starts.length || starts.length > MAX_SLOTS || starts.some((s) => !Number.isInteger(s))) {
     throw unprocessable('INVALID_SLOT', 'Pick one or more of the listed times.');
@@ -446,12 +446,11 @@ async function checkSlots(env: Bindings, settings: Settings, input: SlotInput, n
   const closure = closures.find((c) => segments.some((s) => closureCovers(c, resourceId, s.start, s.end)));
   if (closure) throw unprocessable('CLOSED', closure.reason ? `Unavailable: ${closure.reason}.` : 'That time is unavailable.');
 
-  // Release stale holds first so they can't trip the unique index.
-  await sweepExpired(env, now);
-  return { resource, segments, slots: starts.length };
+  return { resource, segments, slots: starts.length, version };
 }
 
 type NewBooking = {
+  scheduleVersion: number;
   id: string;
   userId: string;
   resourceId: string;
@@ -538,10 +537,10 @@ async function insertBooking(
     )
     .bind(row.id, row.resourceId, row.date, segs);
   try {
-    const [res] = await db.batch([insert, times, ...extra]);
+    const [res] = await scheduleBatch(db, row.scheduleVersion, [insert, times, ...extra]);
     return res?.meta.changes ?? 0;
   } catch (err) {
-    if (!String(err).includes('UNIQUE')) throw err;
+    if (!/UNIQUE constraint failed: bookings\.resource_id, bookings\.date, bookings\.start_min/.test(String(err))) throw err;
     return 0; // lost a race on the exact slot
   }
 }
@@ -620,93 +619,113 @@ export async function createHold(
   env: Bindings,
   settings: Settings,
   user: SessionUser,
-  input: SlotInput & { useCredit?: boolean; expectedCredit?: number | null },
+  input: SlotInput & { useCredit?: boolean; expectedCredit?: number | null; idempotencyKey?: string },
   now = Date.now(),
 ) {
   const db = env.DB;
   const { resourceId, date } = input;
-  const { resource, segments, slots } = await checkSlots(env, settings, input, now);
-
-  const rate = user.membership === 'member' ? 'member' : 'non_member';
-  const price = (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
-  const quote = input.useCredit ? await creditQuote(db, user.id, price, now) : { price, creditApplied: 0, amountDue: price, uses: [] as CreditUse[] };
-  if (input.useCredit && input.expectedCredit != null && input.expectedCredit !== quote.creditApplied) throw creditChanged(quote);
-  const paidByCredit = quote.creditApplied > 0 && quote.amountDue === 0;
-  const id = newId('b_');
-  let changes: number;
+  const op = await bookingOperation(db, user.id, 'player', input.idempotencyKey, {
+    resourceId, date, starts: [...new Set(input.starts)].sort((a, b) => a - b),
+    useCredit: input.useCredit ?? false, expectedCredit: input.useCredit ? input.expectedCredit ?? null : null,
+  });
+  const replay = await op.replay();
+  if (replay) return getBooking(db, replay);
   try {
-    changes = await insertBooking(db, {
-      id, userId: user.id, resourceId, date, segments,
-      status: paidByCredit ? 'CONFIRMED' : 'TEMPORARY',
-      amount: quote.amountDue,
-      creditApplied: quote.creditApplied,
-      rate,
-      holdUntil: paidByCredit ? null : now + settings.holdMinutes * 60_000,
-      source: 'online',
-      createdBy: user.id,
-      bookerName: null,
-      paymentMethod: paidByCredit ? 'none' : 'gcash',
-      submittedAt: null,
-      confirmedAt: paidByCredit ? now : null,
-      confirmedBy: null,
-    }, now, paidByCredit ? null : MAX_OPEN_HOLDS, redeemStmts(db, { bookingId: id, userId: user.id, uses: quote.uses, now }));
+    const { resource, segments, slots, version } = await checkSlots(env, settings, input, now);
+
+    const rate = user.membership === 'member' ? 'member' : 'non_member';
+    const price = (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+    const quote = input.useCredit ? await creditQuote(db, user.id, price, now) : { price, creditApplied: 0, amountDue: price, uses: [] as CreditUse[] };
+    if (input.useCredit && input.expectedCredit != null && input.expectedCredit !== quote.creditApplied) throw creditChanged(quote);
+    const paidByCredit = quote.creditApplied > 0 && quote.amountDue === 0;
+    const id = newId('b_');
+    const guard: Guard = { sql: 'EXISTS (SELECT 1 FROM bookings WHERE id = ?)', params: [id] };
+    const effects: D1PreparedStatement[] = [];
+    const where = `${resource.name} · ${dateLabel(date)} · ${whenLabel(segments, slots)}`;
+    const credit = quote.uses.length ? usesNote(quote.uses) : null;
+    if (paidByCredit) {
+      effects.push(
+        eventStmt(db, id, 'credit_booked', user.id, 'player', `Paid with ${credit}`, now, guard),
+        systemMessageStmt(db, id, 'Booked with booking credit · confirmed', now, guard),
+        userNoticeStmt(db, user.id, {
+          type: 'credit_booking_confirmed',
+          title: 'Booking confirmed',
+          body: `${where} · paid with ${peso(quote.creditApplied)} booking credit`,
+          link: `/bookings/${id}`,
+          bookingId: id,
+        }, now, guard),
+        staffNoticeStmt(db, {
+          type: 'new_booking',
+          title: 'New booking · paid with credit',
+          body: `${user.name} · ${where} · confirmed`,
+          link: `/admin/bookings/${id}`,
+          bookingId: id,
+        }, now, guard),
+        // Nothing for staff to do: the notice is informational.
+        resolveStaffStmt(db, id, ['new_booking'], now, guard),
+        outboxStmt(db, 'email', user.email, 'Le Spinners — Booking confirmed',
+          `Hi ${user.name},\n\nYour booking is confirmed, paid with ${peso(quote.creditApplied)} booking credit.\n\n${activityLabel(resource.activity)} · ${where}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${id}\n\nSee you on court!\nLe Spinners Recreational Hub`,
+          id, now, guard),
+      );
+    } else {
+      const pay = credit ? `pay ${peso(quote.amountDue)} within ${settings.holdMinutes} minutes (${peso(quote.creditApplied)} credit applied)` : `pay within ${settings.holdMinutes} minutes`;
+      effects.push(
+        eventStmt(db, id, 'created', user.id, 'player', null, now, guard),
+        ...(credit ? [eventStmt(db, id, 'credit_applied', user.id, 'player', credit, now, guard)] : []),
+        systemMessageStmt(db, id, credit ? `Temporary booking created · ${credit} applied` : 'Temporary booking created', now, guard),
+        userNoticeStmt(db, user.id, {
+          type: 'hold_created',
+          title: 'Slot held for you',
+          body: `${where} · ${pay}`,
+          link: `/bookings/${id}/pay`,
+          bookingId: id,
+        }, now, guard),
+        staffNoticeStmt(db, {
+          type: 'new_booking',
+          title: 'New booking created',
+          body: `${user.name} · ${where} · temporary hold${credit ? ` · ${peso(quote.creditApplied)} credit applied` : ''}`,
+          link: `/admin/bookings/${id}`,
+          bookingId: id,
+        }, now, guard),
+      );
+    }
+    let changes: number;
+    try {
+      changes = await insertBooking(db, {
+        id, userId: user.id, resourceId, date, segments, scheduleVersion: version,
+        status: paidByCredit ? 'CONFIRMED' : 'TEMPORARY',
+        amount: quote.amountDue,
+        creditApplied: quote.creditApplied,
+        rate,
+        holdUntil: paidByCredit ? null : now + settings.holdMinutes * 60_000,
+        source: 'online',
+        createdBy: user.id,
+        bookerName: null,
+        paymentMethod: paidByCredit ? 'none' : 'gcash',
+        submittedAt: null,
+        confirmedAt: paidByCredit ? now : null,
+        confirmedBy: null,
+      }, now, paidByCredit ? null : MAX_OPEN_HOLDS, [...redeemStmts(db, { bookingId: id, userId: user.id, uses: quote.uses, now }), ...effects, op.statement(id, now)]);
+    } catch (err) {
+      const replay = await op.replay();
+      if (replay) return getBooking(db, replay);
+      // Another booking spent the same credit a moment earlier: nothing was booked or spent.
+      if (isOverspend(err)) throw creditChanged(await creditQuote(db, user.id, price, now));
+      if (input.useCredit && err instanceof Error && 'code' in err && err.code === 'SCHEDULE_CHANGED') {
+        const fresh = await creditQuote(db, user.id, price, now);
+        if (fresh.creditApplied !== quote.creditApplied) throw creditChanged(fresh);
+      }
+      throw err;
+    }
+    if (changes === 0) await explainRefusal(db, user.id, { resourceId, date, segments, slots }, now, { checkHolds: !paidByCredit, self: true });
+
+    return getBooking(db, id);
   } catch (err) {
-    // Another booking spent the same credit a moment earlier: nothing was booked or spent.
-    if (isOverspend(err)) throw creditChanged(await creditQuote(db, user.id, price, now));
+    // A matching request can commit while this invocation is still validating.
+    const replay = await op.replay();
+    if (replay) return getBooking(db, replay);
     throw err;
   }
-  if (changes === 0) await explainRefusal(db, user.id, { resourceId, date, segments, slots }, now, { checkHolds: !paidByCredit, self: true });
-
-  const where = `${resource.name} · ${dateLabel(date)} · ${whenLabel(segments, slots)}`;
-  const credit = quote.uses.length ? usesNote(quote.uses) : null;
-  if (paidByCredit) {
-    await db.batch([
-      eventStmt(db, id, 'credit_booked', user.id, 'player', `Paid with ${credit}`, now),
-      systemMessageStmt(db, id, 'Booked with booking credit · confirmed', now),
-      userNoticeStmt(db, user.id, {
-        type: 'credit_booking_confirmed',
-        title: 'Booking confirmed',
-        body: `${where} · paid with ${peso(quote.creditApplied)} booking credit`,
-        link: `/bookings/${id}`,
-        bookingId: id,
-      }, now),
-      staffNoticeStmt(db, {
-        type: 'new_booking',
-        title: 'New booking · paid with credit',
-        body: `${user.name} · ${where} · confirmed`,
-        link: `/admin/bookings/${id}`,
-        bookingId: id,
-      }, now),
-      // Nothing for staff to do: the notice is informational.
-      resolveStaffStmt(db, id, ['new_booking'], now),
-      outboxStmt(db, 'email', user.email, 'Le Spinners — Booking confirmed',
-        `Hi ${user.name},\n\nYour booking is confirmed, paid with ${peso(quote.creditApplied)} booking credit.\n\n${activityLabel(resource.activity)} · ${where}\n\nView your ticket: ${env.APP_ORIGIN}/bookings/${id}\n\nSee you on court!\nLe Spinners Recreational Hub`,
-        id, now),
-    ]);
-    return getBooking(db, id);
-  }
-
-  const pay = credit ? `pay ${peso(quote.amountDue)} within ${settings.holdMinutes} minutes (${peso(quote.creditApplied)} credit applied)` : `pay within ${settings.holdMinutes} minutes`;
-  await db.batch([
-    eventStmt(db, id, 'created', user.id, 'player', null, now),
-    ...(credit ? [eventStmt(db, id, 'credit_applied', user.id, 'player', credit, now)] : []),
-    systemMessageStmt(db, id, credit ? `Temporary booking created · ${credit} applied` : 'Temporary booking created', now),
-    userNoticeStmt(db, user.id, {
-      type: 'hold_created',
-      title: 'Slot held for you',
-      body: `${where} · ${pay}`,
-      link: `/bookings/${id}/pay`,
-      bookingId: id,
-    }, now),
-    staffNoticeStmt(db, {
-      type: 'new_booking',
-      title: 'New booking created',
-      body: `${user.name} · ${where} · temporary hold${credit ? ` · ${peso(quote.creditApplied)} credit applied` : ''}`,
-      link: `/admin/bookings/${id}`,
-      bookingId: id,
-    }, now),
-  ]);
-  return getBooking(db, id);
 }
 
 /**
@@ -719,49 +738,66 @@ export async function createConsoleBooking(
   env: Bindings,
   settings: Settings,
   staff: SessionUser,
-  input: SlotInput & { rate: 'member' | 'non_member'; payment: 'on_site' | 'none'; bookerName: string },
+  input: SlotInput & { rate: 'member' | 'non_member'; payment: 'on_site' | 'none'; bookerName: string; idempotencyKey?: string; requestIp?: string },
   now = Date.now(),
 ) {
   const db = env.DB;
   const { resourceId, date, rate, payment, bookerName } = input;
-  const { resource, segments, slots } = await checkSlots(env, settings, input, now);
-  const source: BookingSource = staff.role === 'admin' ? 'admin' : 'staff';
-  const amount = payment === 'none' ? 0 : (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
-  const id = newId('b_');
-  const changes = await insertBooking(db, {
-    id, userId: staff.id, resourceId, date, segments, status: 'CONFIRMED', amount, creditApplied: 0, rate, holdUntil: null,
-    source, createdBy: staff.id, bookerName, paymentMethod: payment,
-    // Paid at the desk counts as a verified payment for revenue; a free booking has no payment.
-    submittedAt: payment === 'on_site' ? now : null,
-    confirmedAt: now,
-    confirmedBy: staff.id,
-  }, now, null);
-  if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false, self: false });
+  const op = await bookingOperation(db, staff.id, 'console', input.idempotencyKey, {
+    resourceId, date, starts: [...new Set(input.starts)].sort((a, b) => a - b), rate, payment, bookerName,
+  });
+  const replay = await op.replay();
+  if (replay) return getBooking(db, replay);
+  try {
+    const { resource, segments, slots, version } = await checkSlots(env, settings, input, now);
+    const source: BookingSource = staff.role === 'admin' ? 'admin' : 'staff';
+    const amount = payment === 'none' ? 0 : (rate === 'member' ? resource.price_member : resource.price_non_member) * slots;
+    const id = newId('b_');
+    const guard: Guard = { sql: 'EXISTS (SELECT 1 FROM bookings WHERE id = ?)', params: [id] };
+    const effects = [
+      eventStmt(db, id, 'console_booked', staff.id, 'staff', payment === 'on_site' ? `Paid on site · ${peso(amount)}` : 'No charge', now, guard),
+      systemMessageStmt(db, id, `Booked on site by ${source === 'admin' ? 'an admin' : 'staff'} · confirmed`, now, guard),
+      db.prepare(`INSERT INTO audit_log (actor_id, action, entity, entity_id, detail, ip, created_at)
+        SELECT ?, 'booking_created_on_site', 'booking', ?, ?, ?, ? WHERE ${guard.sql}`)
+        .bind(staff.id, id, JSON.stringify({ payment, slots }), input.requestIp ?? null, now, ...guard.params),
+      op.statement(id, now),
+    ];
+    const changes = await insertBooking(db, {
+      id, userId: staff.id, resourceId, date, segments, scheduleVersion: version, status: 'CONFIRMED', amount, creditApplied: 0, rate, holdUntil: null,
+      source, createdBy: staff.id, bookerName, paymentMethod: payment,
+      // Paid at the desk counts as a verified payment for revenue; a free booking has no payment.
+      submittedAt: payment === 'on_site' ? now : null,
+      confirmedAt: now,
+      confirmedBy: staff.id,
+    }, now, null, effects);
+    if (changes === 0) await explainRefusal(db, staff.id, { resourceId, date, segments, slots }, now, { checkHolds: false, self: false });
 
-  await db.batch([
-    eventStmt(db, id, 'console_booked', staff.id, 'staff', payment === 'on_site' ? `Paid on site · ${peso(amount)}` : 'No charge', now),
-    systemMessageStmt(db, id, `Booked on site by ${source === 'admin' ? 'an admin' : 'staff'} · confirmed`, now),
-  ]);
-  return getBooking(db, id);
+    return getBooking(db, id);
+  } catch (err) {
+    // A matching request can commit while this invocation is still validating.
+    const replay = await op.replay();
+    if (replay) return getBooking(db, replay);
+    throw err;
+  }
 }
 
 // ── Player actions ─────────────────────────────────────────────────────────
 
 export async function releaseHold(env: Bindings, user: SessionUser, bookingId: string, now = Date.now()) {
   const db = env.DB;
-  const g = changedAt(bookingId, 'cancelled_at', now);
+  const g = bookingTransition(bookingId);
   const [update] = await db.batch([
     db
       .prepare(
-        `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = 'Released by player', hold_expires_at = NULL, updated_at = ?1
+        `UPDATE bookings SET status = 'CANCELLED', cancelled_at = ?1, cancelled_by = ?2, cancel_reason = 'Released by player', hold_expires_at = NULL, updated_at = ?1, transition_id = ?4
           WHERE id = ?3 AND user_id = ?2 AND status IN ('TEMPORARY', 'REJECTED') AND hold_expires_at > ?1`,
       )
-      .bind(now, user.id, bookingId),
+      .bind(now, user.id, bookingId, g.id),
     eventStmt(db, bookingId, 'released', user.id, 'player', null, now, g),
     systemMessageStmt(db, bookingId, 'Hold released by the player', now, g),
     resolveStaffStmt(db, bookingId, ['new_booking', 'hold_expiring', 'proof_submitted'], now, g),
     // A hold paid partly with booking credit gives that credit back.
-    ...releaseStmts(db, 'b.id = ? AND b.cancelled_at = ?', [bookingId, now], now),
+    ...releaseStmts(db, 'b.id = ? AND b.transition_id = ?', [bookingId, g.id], now),
   ]);
   if (!update?.meta.changes) throw conflict('INVALID_STATUS', 'This hold has already ended.');
 }

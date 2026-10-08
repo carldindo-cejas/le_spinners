@@ -1,9 +1,12 @@
 import { api } from '../core/api.js';
+import { createViewTools } from '../core/view.js';
 import { html, on, setBusy } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { openModal, skeletonRows, statusPill, toast } from '../core/ui.js';
 import { API, BASE } from './console.js';
 import { state } from './shell.js';
+
+const viewTools = createViewTools({ api, on, setBusy, openModal, toast });
 
 /**
  * "Cancel & credit" (REBOOKING.md §11): what happened → a preview of what the server will do to
@@ -72,6 +75,7 @@ function itemRow(i) {
  *   onFinish(detail|null)  whenever the dialog closes (null when nothing was applied)
  */
 export function openDisruptionDialog({ title, intro = '', scope, form = true, defaults = {}, showFrom = false, onDone, onFinish }) {
+  const { api, on, setBusy, openModal, toast, scope: routeScope } = viewTools();
   const admin = state.user && state.user.role === 'admin';
   const s = {
     step: form ? 'form' : 'preview',
@@ -111,8 +115,8 @@ export function openDisruptionDialog({ title, intro = '', scope, form = true, de
     <div class="field"><span class="label" id="dz-cat">What happened <span class="req">*</span></span>
       <div class="chip-row wrap" role="radiogroup" aria-labelledby="dz-cat">${CATEGORY_OPTIONS.filter((c) => !c.admin || admin).map((c) => html`<button type="button" class="chip" role="radio" aria-checked="${String(s.category === c.id)}" data-category="${c.id}">${c.label}</button>`)}</div></div>
     <div class="field"><label class="label" for="dz-reason">Reason players see <span class="req">*</span></label>
-      <input class="input" id="dz-reason" data-field="reason" maxlength="120" value="${s.reason}" placeholder="e.g. Heavy rain, Court 2 net broke" autocomplete="off">
-      ${s.errors.reason ? html`<p class="field-error">${icon('alert', 16, 2.2)}${s.errors.reason}</p>` : ''}</div>
+      <input class="input" id="dz-reason" data-field="reason" maxlength="120" value="${s.reason}" placeholder="e.g. Heavy rain, Court 2 net broke" autocomplete="off" ${s.errors.reason ? html`aria-invalid="true" aria-describedby="dz-reason-error"` : ''}>
+      ${s.errors.reason ? html`<p class="field-error" id="dz-reason-error">${icon('alert', 16, 2.2)}${s.errors.reason}</p>` : ''}</div>
     <div class="field"><label class="label" for="dz-note">Internal note <span class="opt">(staff only)</span></label>
       <textarea class="textarea" id="dz-note" data-field="staffNote" maxlength="500" rows="2">${s.staffNote}</textarea></div>
     ${showFrom ? html`<div class="field"><label class="label" for="dz-from">Couldn't be played from</label>
@@ -176,8 +180,9 @@ export function openDisruptionDialog({ title, intro = '', scope, form = true, de
     label: title,
     locked: () => s.busy,
     onClose: () => {
-      if (s.result && onDone) onDone(s.result);
-      if (onFinish) onFinish(s.result);
+      const result = !routeScope || routeScope.isCurrent() ? s.result : null;
+      if (result && onDone) onDone(result);
+      if (onFinish) onFinish(result);
     },
     content: () => (s.step === 'form' ? formStep() : s.step === 'preview' ? previewStep() : resultStep()),
     onOpen: (panel, modal) => {
@@ -226,10 +231,11 @@ export function openDisruptionDialog({ title, intro = '', scope, form = true, de
     s.previewError = null;
     m.rerender();
     try {
-      const res = await api.post(`${API}/disruptions/preview`, request());
+      const res = await api.post(`${API}/disruptions/preview`, request(), { signal: m.signal });
       s.preview = res.preview;
       s.key = newIdempotencyKey(); // a new preview is a new change to confirm
     } catch (err) {
+      if (err.name === 'AbortError') return;
       s.previewError = err.message;
     }
     m.rerender();
@@ -240,7 +246,7 @@ export function openDisruptionDialog({ title, intro = '', scope, form = true, de
     s.busy = true;
     setBusy(btn, true, 'Applying…');
     try {
-      const res = await api.post(`${API}/disruptions`, { ...s.preview.input, previewToken: s.preview.previewToken }, { headers: { 'Idempotency-Key': s.key } });
+      const res = await api.post(`${API}/disruptions`, { ...s.preview.input, previewToken: s.preview.previewToken }, { headers: { 'Idempotency-Key': s.key }, signal: m.signal });
       s.busy = false;
       s.result = res;
       s.step = 'result';

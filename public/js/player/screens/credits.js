@@ -1,3 +1,5 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
 import { $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
@@ -5,6 +7,8 @@ import { dateLabel, dayClock, isoDate } from './util.js';
 import { errorState, skeletonRows, toast } from '../../core/ui.js';
 import { navigate, show, state, subHeader } from '../shell.js';
 import { rebookFromBooking } from '../rebook.js';
+
+const viewTools = createViewTools({ api, on, render, setBusy, toast, navigate, show });
 
 /**
  * Booking credits (REBOOKING.md §12): value Le Spinners owes the player after cancelling or cutting
@@ -29,6 +33,7 @@ function creditRow(c) {
 
 /** Starts a rebooking for the booking a credit came from: same activity, its times preselected. */
 async function rebookFrom(bookingId, btn) {
+  const { setBusy, api, navigate, toast } = viewTools();
   setBusy(btn, true, 'Opening…');
   try {
     const d = await api.get(`/api/bookings/${encodeURIComponent(bookingId)}`);
@@ -40,12 +45,15 @@ async function rebookFrom(bookingId, btn) {
 }
 
 export async function creditsView() {
+  const { show, api, render } = viewTools();
   const root = show(html`${subHeader({ backHref: '/profile', backLabel: 'Back to profile', title: 'Booking credits' })}
     <div class="screen tight screen-enter" data-body>${skeletonRows(1, 'sk-card')}${skeletonRows(3)}</div>`);
   const body = $('[data-body]', root);
+  const pages = historyPager(api, root, load);
+  async function load() {
   let d;
   try {
-    d = await api.get('/api/credits');
+    d = await pages.get('/api/credits');
   } catch (err) {
     show(html`${subHeader({ backHref: '/profile', backLabel: 'Back to profile', title: 'Booking credits' })}<div class="screen">${errorState(err)}</div>`);
     return;
@@ -71,9 +79,12 @@ export async function creditsView() {
       </ol>
       <p class="small">Questions about a credit? Ask in the chat of the booking it came from.</p>
     </section>`);
+  }
+  await load();
 }
 
 export async function creditDetailView({ params }) {
+  const { show, api, on } = viewTools();
   const back = () => subHeader({ backHref: '/credits', backLabel: 'Back to credits', title: 'Booking credit' });
   show(html`${back()}<div class="screen tight">${skeletonRows(1, 'sk-card')}${skeletonRows(3)}</div>`);
   let d;

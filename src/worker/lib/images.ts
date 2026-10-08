@@ -1,12 +1,18 @@
 /**
  * Upload hygiene for payment screenshots: detect the real type from magic bytes
  * (never trust the file name or the browser's MIME type), then rebuild the file
- * from an allowlist of the parts needed to draw it. Everything else is dropped:
+ * from an allowlist of the parts needed to draw it. A valid orientation tag is
+ * rebuilt without private TIFF fields; ICC color profiles are retained unchanged.
+ * Container validation is bounded and fails closed; pixel data is not decoded.
+ * Other metadata is dropped:
  * EXIF (GPS location, device info), XMP, IPTC, C2PA content credentials, maker
  * data, comments, embedded thumbnails, and any bytes after the image ends
  * (phones append secondary images and HDR gain maps there).
  */
 
+import { ApiError } from './errors';
+import { imageCrc, malformedImage, orientationTiff, validateImageStructure } from './image-structure';
+export { MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS } from './image-structure';
 export type ImageKind = { type: 'image/jpeg' | 'image/png' | 'image/webp'; ext: 'jpg' | 'png' | 'webp' };
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -25,13 +31,50 @@ export function sniffImage(b: Uint8Array): ImageKind | null {
 }
 
 export function stripMetadata(bytes: Uint8Array, kind: ImageKind): Uint8Array {
+  if (bytes.length > MAX_UPLOAD_BYTES) throw new ApiError(413, 'FILE_TOO_LARGE', 'The image exceeds the 10 MB limit.');
+  const actual = sniffImage(bytes);
+  if (!kind || actual?.ext !== kind.ext || actual.type !== kind.type) throw malformedImage();
   try {
-    if (kind.ext === 'jpg') return stripJpeg(bytes);
-    if (kind.ext === 'png') return stripPng(bytes);
-    return stripWebp(bytes);
-  } catch {
-    return bytes; // malformed but still an image the browser may render; keep as-is
+    const info = validateImageStructure(bytes, kind);
+    const clean = kind.ext === 'jpg' ? stripJpeg(bytes) : kind.ext === 'png' ? stripPng(bytes) : stripWebp(bytes);
+    return info.orientation && info.orientation !== 1
+      ? keepOrientation(clean, kind, info.orientation, info.width, info.height, Boolean('alpha' in info && info.alpha))
+      : clean;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw malformedImage();
   }
+}
+
+/** Rebuild only the orientation tag, with no links to private TIFF data or thumbnails. */
+function keepOrientation(clean: Uint8Array, kind: ImageKind, value: number, width: number, height: number, alpha: boolean) {
+  const tiff = orientationTiff(value);
+  if (kind.ext === 'jpg') {
+    const segment = new Uint8Array(tiff.length + 10);
+    segment.set([255,225]); new DataView(segment.buffer).setUint16(2,tiff.length + 8);
+    segment.set([69,120,105,102,0,0],4); segment.set(tiff,10);
+    return concat([clean.subarray(0,2),segment,clean.subarray(2)]);
+  }
+  if (kind.ext === 'png') {
+    const chunk = new Uint8Array(tiff.length + 12), v = new DataView(chunk.buffer);
+    v.setUint32(0,tiff.length); chunk.set([101,88,73,102],4); chunk.set(tiff,8);
+    v.setUint32(chunk.length - 4,imageCrc(chunk.subarray(4,chunk.length - 4)));
+    return concat([clean.subarray(0,33),chunk,clean.subarray(33)]);
+  }
+  const exif = new Uint8Array(tiff.length + 8);
+  exif.set([69,88,73,70]); new DataView(exif.buffer).setUint32(4,tiff.length,true); exif.set(tiff,8);
+  let body: Uint8Array;
+  if (ascii(clean,12,4) === 'VP8X') {
+    body = clean.slice(12); body[8] = body[8]! | 8;
+  } else {
+    const extended = new Uint8Array(18), v = new DataView(extended.buffer);
+    extended.set([86,80,56,88]); v.setUint32(4,10,true); extended[8] = 8 | (alpha ? 16 : 0);
+    const x = width - 1, y = height - 1;
+    extended.set([x & 255,x >> 8 & 255,x >> 16 & 255,y & 255,y >> 8 & 255,y >> 16 & 255],12);
+    body = concat([extended,clean.subarray(12)]);
+  }
+  const result = concat([clean.subarray(0,12),body,exif]);
+  new DataView(result.buffer).setUint32(4,result.length - 8,true); return result;
 }
 
 function ascii(b: Uint8Array, start: number, len: number): string {
@@ -73,13 +116,9 @@ function stripJpeg(b: Uint8Array): Uint8Array {
   let i = 2;
   while (i < b.length) {
     if (b[i] !== 0xff) {
-      // Stray bytes between segments: skip to the next marker, as decoders do.
-      const next = b.indexOf(0xff, i);
-      if (next < 0) return b;
-      i = next;
-      continue;
+      throw malformedImage();
     }
-    if (i + 1 >= b.length) return b;
+    if (i + 1 >= b.length) throw malformedImage();
     const marker = b[i + 1]!;
     if (marker === 0xff) {
       i++; // fill byte
@@ -94,9 +133,9 @@ function stripJpeg(b: Uint8Array): Uint8Array {
       i += 2;
       continue;
     }
-    if (i + 4 > b.length) return b;
+    if (i + 4 > b.length) throw malformedImage();
     const end = i + 2 + ((b[i + 2]! << 8) | b[i + 3]!);
-    if (end < i + 4 || end > b.length) return b;
+    if (end < i + 4 || end > b.length) throw malformedImage();
     const kept = keepJpegSegment(b.subarray(i, end), marker);
     if (kept) out.push(kept);
     i = end;
@@ -104,13 +143,12 @@ function stripJpeg(b: Uint8Array): Uint8Array {
       const stop = endOfScan(b, i);
       out.push(b.subarray(i, stop));
       if (stop >= b.length) {
-        out.push(EOI); // truncated file: close it so decoders show what is there
-        return concat(out);
+        throw malformedImage();
       }
       i = stop;
     }
   }
-  return b;
+  throw malformedImage();
 }
 
 function keepJpegSegment(seg: Uint8Array, marker: number): Uint8Array | null {
@@ -149,9 +187,8 @@ function endOfScan(b: Uint8Array, from: number): number {
 const PNG_KEEP = new Set([
   'IHDR', 'PLTE', 'IDAT', 'IEND',
   'tRNS', 'gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT', 'bKGD', 'pHYs',
-  'cICP', 'mDCV', 'mDCv', 'cLLI', 'cLLi',
+  'cICP', 'mDCV', 'cLLI',
 ]);
-const IEND = new Uint8Array([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
 
 function stripPng(b: Uint8Array): Uint8Array {
   const out: Uint8Array[] = [b.subarray(0, 8)];
@@ -159,31 +196,30 @@ function stripPng(b: Uint8Array): Uint8Array {
   let i = 8;
   while (i + 12 <= b.length) {
     const total = 12 + view.getUint32(i);
-    if (i + total > b.length) break;
+    if (i + total > b.length) throw malformedImage();
     const type = ascii(b, i + 4, 4);
     if (PNG_KEEP.has(type)) out.push(b.subarray(i, i + total));
     i += total;
     if (type === 'IEND') return concat(out); // bytes after IEND are dropped
   }
-  out.push(IEND); // truncated file: keep the complete chunks and close it
-  return concat(out);
+  throw malformedImage();
 }
 
 // ── WebP ────────────────────────────────────────────────────────────────────
 
 /** Image data, alpha, animation and the ICC profile. EXIF, XMP and anything else (C2PA, …) are dropped. */
-const WEBP_KEEP = new Set(['VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ANIM', 'ANMF', 'ICCP']);
+const WEBP_KEEP = new Set(['VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ICCP']);
 
 function stripWebp(b: Uint8Array): Uint8Array {
   const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  const end = Math.min(b.length, 8 + view.getUint32(4, true)); // bytes after the RIFF container are dropped
+  const end = 8 + view.getUint32(4, true); // Validated container; trailing bytes are dropped.
   const chunks: Uint8Array[] = [];
   let vp8x: Uint8Array | null = null;
   let i = 12;
   while (i + 8 <= end) {
     const fourcc = ascii(b, i, 4);
     const size = view.getUint32(i + 4, true);
-    if (i + 8 + size > end) return b;
+    if (i + 8 + size > end) throw malformedImage();
     const next = Math.min(end, i + 8 + size + (size & 1));
     if (WEBP_KEEP.has(fourcc)) {
       const chunk = b.slice(i, next);

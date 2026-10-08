@@ -1,5 +1,7 @@
+import { historyPager } from '../core/history.js';
+import { createViewTools } from '../core/view.js';
 import { api } from '../core/api.js';
-import { html, on, render } from '../core/dom.js';
+import { listen, html, on, render } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { firstName } from '../core/format.js';
 import { MESSAGE_MAX_CHARS, charCounter, messageList, openImage } from '../core/chatview.js';
@@ -8,6 +10,8 @@ import { refreshBadges } from './shell.js';
 import { API, BASE } from './console.js';
 import { QUICK } from './screens/messages.js';
 
+const viewTools = createViewTools({ listen, api, on, render, openImage, poll, toast, refreshBadges });
+
 /**
  * The booking chat as a card that expands in place (booking details, payment review)
  * instead of opening the Messages screen. The element is created once per page and
@@ -15,6 +19,7 @@ import { QUICK } from './screens/messages.js';
  * Opened, it fills the rest of its column (see .chat-card.open in admin.css).
  */
 export function miniChat({ bookingId, playerName, unread = 0 }) {
+  const { listen, render, api, setTimeout, refreshBadges, poll, on, openImage, toast } = viewTools();
   const el = document.createElement('section');
   el.className = 'panel chat-card';
   el.setAttribute('aria-label', `Booking chat with ${playerName}`);
@@ -45,6 +50,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
   const form = el.querySelector('[data-form]');
   const input = form.querySelector('textarea');
   const syncCount = charCounter(input);
+  const pages = historyPager(api, body, () => load(false), {label:'Earlier messages'});
 
   function paintHead() {
     el.querySelector('[data-meta]').textContent = open
@@ -66,7 +72,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
 
   async function load(first = false) {
     try {
-      const res = await api.get(`${API}/bookings/${encodeURIComponent(bookingId)}/messages`);
+      const res = await pages.get(`${API}/bookings/${encodeURIComponent(bookingId)}/messages`);
       messages = res.messages;
       paintLog(first);
       if (first) setTimeout(refreshBadges, 300);
@@ -92,12 +98,12 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
     paintHead();
   }
 
-  toggle.addEventListener('click', () => setOpen(!open));
-  input.addEventListener('input', () => {
+  listen(toggle, 'click', () => setOpen(!open));
+  listen(input, 'input', () => {
     input.style.setProperty('height', 'auto');
     input.style.setProperty('height', `${Math.min(input.scrollHeight, 120)}px`);
   });
-  input.addEventListener('keydown', (e) => {
+  listen(input, 'keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       form.requestSubmit();
@@ -109,7 +115,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
     input.focus();
   });
   on(el, 'click', '[data-proof]', (_e, btn) => openImage(btn.dataset.proof));
-  form.addEventListener('submit', async (e) => {
+  listen(form, 'submit', async (e) => {
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
@@ -120,8 +126,8 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
       input.value = '';
       input.style.removeProperty('height');
       syncCount();
-      messages = res.messages;
-      paintLog(true);
+      pages.reset();
+      await load(true);
     } catch (err) {
       toast(err.message, { type: 'error' });
     } finally {
@@ -153,7 +159,7 @@ export function miniChat({ bookingId, playerName, unread = 0 }) {
     /** Opens the chat (if closed) and brings it into view. */
     show() {
       if (!open) setOpen(true);
-      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      el.scrollIntoView({ block: 'nearest', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
       input.focus({ preventScroll: true });
     },
     setUnread(n) {

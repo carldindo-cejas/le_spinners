@@ -3,7 +3,8 @@
   "name": "le-spinners",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-09-01",
-  "observability": { "enabled": true },
+  "observability": { "enabled": true, "traces": { "enabled": true } },
+  "secrets": { "required": ["FILE_SIGNING_SECRET", "PASSWORD_PEPPER"] },
 
   // The PWA lives in public/. The Worker runs first for the API and for the
   // admin and staff consoles so it can add security headers and serve

@@ -1,5 +1,6 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { isoDate } from '../../core/format.js';
 import { clearFieldErrors, errorState, openModal, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
@@ -7,6 +8,8 @@ import { frame } from '../shell.js';
 import { API, BASE, isAdminConsole } from '../console.js';
 import { disruptionAsPromise, followUpNote, withImpactCheck } from '../impact.js';
 import { openDisruptionDialog } from '../disrupt.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, openModal, showFieldErrors, toast, frame });
 
 const TABS = [
   { key: 'all', label: 'All' },
@@ -45,6 +48,7 @@ function card(r) {
  * first cancel the affected bookings with a booking credit (maintenance, disabling, open play).
  */
 async function patch(r, body, done) {
+  const { api, toast } = viewTools();
   const res = await withImpactCheck((confirmAffected) => api.patch(`${API}/facilities/${encodeURIComponent(r.id)}`, { ...body, confirmAffected }), {
     disrupt: (affected) => disruptionAsPromise((finish) => openDisruptionDialog({
       title: `Cancel & credit · ${r.name}`,
@@ -65,7 +69,8 @@ const ADDED_NOTE = {
   disabled: 'It stays hidden until you enable it.',
 };
 
-function editDialog(r, onSaved) {
+function editDialog(r, onSaved, { initialStatus } = {}) {
+  const { listen, openModal, clearFieldErrors, showFieldErrors, setBusy, api, toast } = viewTools();
   let busy = false;
   const tomorrow = isoDate(Date.now() + 86_400_000);
   const m = openModal({
@@ -94,19 +99,28 @@ function editDialog(r, onSaved) {
       const form = $('[data-form]', panel);
       const f = (n) => form.elements.namedItem(n);
       const maint = $('[data-maint-fields]', panel);
-      f('status').value = r ? r.status : 'active';
+      f('status').value = initialStatus ?? (r ? r.status : 'active');
       const sync = () => (maint.hidden = f('status').value !== 'maintenance');
-      f('status').addEventListener('change', sync);
+      listen(f('status'), 'change', sync);
       sync();
-      form.addEventListener('submit', async (e) => {
+      listen(form, 'submit', async (e) => {
         e.preventDefault();
         clearFieldErrors(form);
-        const body = { name: f('name').value.trim(), status: f('status').value };
-        if (body.status === 'maintenance') {
-          body.maintenanceNote = f('maintenanceNote').value.trim() || null;
-          body.maintenanceUntil = f('maintenanceUntil').value || null;
+        const name = f('name').value.trim();
+        const status = f('status').value;
+        const body = {};
+        if (!r || name !== r.name) body.name = name;
+        if (!r || status !== r.status) body.status = status;
+        if (status === 'maintenance') {
+          const note = f('maintenanceNote').value.trim() || null;
+          const until = f('maintenanceUntil').value || null;
+          // An explicit status transition includes its maintenance settings.
+          // A rename or note-only edit must preserve another operator's fields.
+          if (!r || body.status !== undefined || note !== r.maintenanceNote) body.maintenanceNote = note;
+          if (!r || body.status !== undefined || until !== r.maintenanceUntil) body.maintenanceUntil = until;
         }
-        if (body.name.length < 2) return showFieldErrors(form, { name: ['Use at least 2 characters.'] });
+        if (name.length < 2) return showFieldErrors(form, { name: ['Use at least 2 characters.'] });
+        if (r && !Object.keys(body).length) return toast('Nothing changed', { type: 'info' });
         if (!r) {
           body.activity = f('activity').value;
           for (const k of ['priceMember', 'priceNonMember']) {
@@ -124,7 +138,7 @@ function editDialog(r, onSaved) {
         setBusy(btn, true, 'Saving…');
         try {
           if (r) {
-            if (!(await patch(r, body, `${body.name} saved`))) {
+            if (!(await patch(r, body, `${name} saved`))) {
               busy = false;
               setBusy(btn, false);
               return;
@@ -147,6 +161,7 @@ function editDialog(r, onSaved) {
 }
 
 export async function facilitiesView({ query }) {
+  const { listen, frame, render, api, on, setBusy, toast } = viewTools();
   let tab = TABS.some((t) => t.key === query.get('type')) ? query.get('type') : 'all';
   let resources = [];
   const main = frame({
@@ -179,7 +194,7 @@ export async function facilitiesView({ query }) {
       paint();
     } catch (err) {
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
 
@@ -202,7 +217,7 @@ export async function facilitiesView({ query }) {
       toast(err.message, { type: 'error' });
     }
   }
-  on(root, 'click', '[data-maint]', (_e, btn) => editDialog({ ...byId(btn.dataset.maint), status: 'maintenance' }, load));
+  on(root, 'click', '[data-maint]', (_e, btn) => editDialog(byId(btn.dataset.maint), load, { initialStatus: 'maintenance' }));
   on(root, 'click', '[data-activate]', (_e, btn) => {
     const r = byId(btn.dataset.activate);
     quick(btn, r, { status: 'active' }, `${r.name} is bookable again`);

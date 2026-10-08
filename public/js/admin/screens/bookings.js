@@ -1,5 +1,7 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, html, on, render, setBusy } from '../../core/dom.js';
 import { icon, courtArt } from '../../core/icons.js';
 import { bookingTime, clock, dayClock, firstName, initials, isoDate, longDate, minutesLabel, shortDate, weekdayShort } from '../../core/format.js';
 import { errorState, memberTag, openModal, poll, skeletonRows, statusPill, toast } from '../../core/ui.js';
@@ -8,6 +10,8 @@ import { openViewer } from './verify.js';
 import { miniChat } from '../minichat.js';
 import { API, BASE } from '../console.js';
 import { newIdempotencyKey, openDisruptionDialog } from '../disrupt.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, openModal, poll, toast, frame, openViewer, miniChat });
 
 // ── Disruptions and booking credit on the booking page (REBOOKING.md §11) ──
 
@@ -41,6 +45,7 @@ function creditPanel(d) {
 
 /** Admins add a credit by hand for this booking's player (goodwill, a payment verified late…). */
 function openIssueCredit(b, onDone) {
+  const { listen, openModal, toast, setBusy, api } = viewTools();
   const key = newIdempotencyKey();
   let busy = false;
   const m = openModal({
@@ -53,7 +58,7 @@ function openIssueCredit(b, onDone) {
       <div class="field"><label class="label" for="ic-reason">Reason ${firstName(b.user.name)} sees <span class="req">*</span></label><input class="input" id="ic-reason" maxlength="120" placeholder="e.g. Payment verified after the hold ended"></div>
       <div class="dialog-actions"><button type="button" class="btn btn-primary btn-block" data-act="go">Issue credit</button><button type="button" class="btn btn-secondary btn-block" data-close>Cancel</button></div>`,
     onOpen: (panel) => {
-      panel.querySelector('[data-act="go"]').addEventListener('click', async (e) => {
+      listen(panel.querySelector('[data-act="go"]'), 'click', async (e) => {
         const btn = e.currentTarget;
         const pesos = Number(panel.querySelector('#ic-amount').value.replace(/[₱,\s]/g, ''));
         const reason = panel.querySelector('#ic-reason').value.trim();
@@ -155,6 +160,7 @@ function mobileCard(b) {
 }
 
 export function bookingsListView({ query }) {
+  const { listen, frame, render, api, on, setTimeout, poll } = viewTools();
   const f = readFilters(query);
   const root = frame({
     key: 'bookings',
@@ -175,6 +181,7 @@ export function bookingsListView({ query }) {
   });
   for (const sel of root.querySelectorAll('select[data-f]')) sel.value = f[sel.dataset.f] || '';
   const list = $('[data-list]', root);
+  const pages = historyPager(api, list.parentElement, load);
   let data = null;
   let timer = null;
 
@@ -193,7 +200,7 @@ export function bookingsListView({ query }) {
         <thead><tr><th>Reference</th><th>Customer</th><th>Activity · resource</th><th>Date &amp; time</th><th class="r">Amount</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>${data.bookings.map(tableRow)}</tbody></table></div>
       <div class="stack stack-8 only-mobile">${data.bookings.map(mobileCard)}</div>
-      <p class="small">Showing ${data.bookings.length} booking${data.bookings.length === 1 ? '' : 's'}${data.bookings.length === 200 ? ' (first 200 — narrow the filters to see more)' : ''}.</p>`);
+      <p class="small">Showing ${data.bookings.length} booking${data.bookings.length === 1 ? '' : 's'}.</p>`);
   }
 
   async function load() {
@@ -204,11 +211,11 @@ export function bookingsListView({ query }) {
     if (f.activity) qs.set('activity', f.activity);
     if (!f.date) qs.set('scope', f.scope);
     try {
-      data = await api.get(`${API}/bookings?${qs}`);
+      data = await pages.get(`${API}/bookings?${qs}`);
       paint();
     } catch (err) {
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
 
@@ -262,6 +269,7 @@ function heroSide(b) {
 }
 
 function openStaffCancel(b, onDone) {
+  const { listen, openModal, setBusy, api, toast } = viewTools();
   let busy = false;
   const m = openModal({
     label: 'Cancel this booking?',
@@ -274,8 +282,8 @@ function openStaffCancel(b, onDone) {
     onOpen: (panel) => {
       const ta = panel.querySelector('#c-reason');
       const go = panel.querySelector('[data-act="go"]');
-      ta.addEventListener('input', () => (go.disabled = ta.value.trim().length < 3));
-      go.addEventListener('click', async () => {
+      listen(ta, 'input', () => (go.disabled = ta.value.trim().length < 3));
+      listen(go, 'click', async () => {
         busy = true;
         setBusy(go, true, 'Cancelling…');
         try {
@@ -295,6 +303,7 @@ function openStaffCancel(b, onDone) {
 }
 
 export async function bookingDetailView({ params }) {
+  const { listen, frame, render, miniChat, on, openViewer, api, poll } = viewTools();
   const id = params.id;
   let d = null;
   let chat = null;
@@ -379,7 +388,7 @@ export async function bookingDetailView({ params }) {
         </div>
       </div>`);
     for (const a of body.querySelectorAll('[data-back]')) {
-      a.addEventListener('click', (e) => {
+      listen(a, 'click', (e) => {
         if (history.state && history.state.depth > 0) {
           e.preventDefault();
           history.back();
@@ -419,7 +428,7 @@ export async function bookingDetailView({ params }) {
     } catch (err) {
       paintedKey = '';
       render(body, html`<div class="page">${errorState(err, { retry: err.status !== 404, title: err.status === 404 ? 'Booking not found' : undefined })}</div>`);
-      $('[data-act="retry"]', body)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', body), 'click', load);
     }
   }
   await load();

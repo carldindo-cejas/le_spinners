@@ -1,5 +1,6 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, render } from '../../core/dom.js';
+import { listen, $, html, render } from '../../core/dom.js';
 import { icon, logo } from '../../core/icons.js';
 import {
   bookingTime, clock, dateLabel, firstName, greeting, initials, isoDate, longDate, minutesBetween, minutesLabel, mmss, peso, relTime, shortDate,
@@ -7,6 +8,8 @@ import {
 import { errorState, memberTag, poll, skeletonRows, statusPill } from '../../core/ui.js';
 import { frame, state } from '../shell.js';
 import { API, BASE } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, render, poll, frame });
 
 export function waitLabel(submittedAt, now, oldest) {
   const m = minutesBetween(submittedAt, now);
@@ -77,6 +80,7 @@ function facilityPanel(d) {
 }
 
 export async function dashboardView() {
+  const { listen, frame, api, render, poll } = viewTools();
   const u = state.user;
   const nowStr = `${longDate(isoDate(Date.now()))} · ${clock(Date.now())}`;
   const root = frame({
@@ -135,7 +139,7 @@ export async function dashboardView() {
       </div>`);
     } catch (err) {
       render(body, errorState(err));
-      $('[data-act="retry"]', body)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', body), 'click', load);
     }
   }
   load();

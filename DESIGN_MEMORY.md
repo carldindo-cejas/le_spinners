@@ -338,6 +338,8 @@ Each exists once and is reused:
 
 | Screen | Key content |
 |---|---|
+| Public landing page (built 2026-10-04) | Visitors at `/`, all roles at `/welcome`. Court Blue hero with court/paddle artwork and Volt booking CTA; sports with configured member/non-member rates; public Court Calendar; booking steps; chat, updates and credits; facility address and regular hours; FAQs; staff/admin links in the footer. Signed-in players keep their dashboard at `/`. Responsive desktop navigation and mobile booking CTA. |
+| Public Court Calendar (built 2026-10-04) | Date strip and date picker bounded by the configured booking window, sport and court/table filters, resource cards with labeled time slots. Available times lead through login/registration to the selected booking review. Public `GET /api/facility/calendar` returns only allowlisted resource and slot fields, identical for visitors and signed-in roles; no booking IDs, names, references, payment data, maintenance notes, or closure reasons. Refresh every 30 seconds while visible and on focus. Stale times disappear after a failed refresh or offline event, with Retry. Browsing never holds a slot. |
 | Sign in | "Welcome back". Email or mobile number + password, Forgot password?, "Keep me logged in on this device", Create an account. "Members and non-members use the same app." |
 | Sign up | Full name, email, mobile (+63, "Never shown to other players"), password with strength hint, member toggle (Not yet / I'm a member) + member code ("Membership pending" until staff confirm; non-member rates apply), agree to house rules |
 | Home (mobile) | Greeting + date, MEMBER chip "Member rates apply", Book a court (activity tiles with N open today), Upcoming booking card (Chat / View booking), Available today (live list with on-hold markers, maintenance row), Recent history, facility card (OPEN NOW, hours, address, resource count) |
@@ -500,6 +502,7 @@ list (the revenue ledger has one).
 
 | Date | Change |
 |---|---|
+| 2026-10-04 | Public landing page and Court Calendar: browse availability before sign-in; preserve the chosen time through login/registration; reuse current booking rules and facility data. Added responsive layout, FAQ, directions, anonymous availability allowlist, and failure/offline states. |
 | 2026-10-01 | Initial design memory created from the 9 mock PDFs. |
 | 2026-10-02 | Disruptions and booking credits (REBOOKING.md): players never cancel; Le Spinners cancels with **Cancel & credit** or a disruption and issues booking credit; Rebook with credit; Booking credits screens; console Disruptions and Booking credits; Cancel & credit in the affected-bookings dialog (§6, §7, §8, §13, §14, §16). |
 | 2026-10-01 | Role-based consoles: separate sign-in pages for players (`/login`), staff (`/staff/login`) and admins (`/admin/login`); the staff console at `/staff/` shares the admin screens without Settings. Added Resources, Availability, the affected-bookings dialog and My profile (§12, §13, §16). |

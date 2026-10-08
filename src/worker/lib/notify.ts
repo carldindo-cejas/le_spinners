@@ -3,8 +3,8 @@ import { newId } from './crypto';
 
 /**
  * A guard makes a follow-up statement conditional on an earlier statement in the
- * same D1 batch having taken effect (e.g. "the booking is now CONFIRMED at this
- * exact timestamp"), so a status change and its side effects commit together.
+ * same D1 batch having taken effect (e.g. the booking carries this request's
+ * unique transition identity), so state and its side effects commit together.
  */
 export type Guard = { sql: string; params: (string | number | null)[] };
 
@@ -69,40 +69,4 @@ export function outboxStmt(
     .bind(newId('o_'), channel, recipient, subject, body, bookingId, now, ...(guard?.params ?? []));
 }
 
-type OutboxRow = { id: string; channel: 'email' | 'sms'; recipient: string; subject: string | null; body: string; attempts: number };
-
-/**
- * Sends queued email through Resend when RESEND_API_KEY and EMAIL_FROM are set.
- * SMS stays queued until an SMS provider is connected (see README).
- */
-export async function flushOutbox(env: Bindings): Promise<{ sent: number; failed: number }> {
-  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return { sent: 0, failed: 0 };
-  const { results } = await env.DB.prepare(
-    `SELECT id, channel, recipient, subject, body, attempts FROM outbox
-      WHERE status = 'queued' AND channel = 'email' AND attempts < 5
-      ORDER BY created_at LIMIT 20`,
-  ).all<OutboxRow>();
-  let sent = 0;
-  let failed = 0;
-  for (const row of results) {
-    try {
-      const res = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: env.EMAIL_FROM, to: [row.recipient], subject: row.subject ?? 'Le Spinners', text: row.body }),
-      });
-      if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      await env.DB.prepare(`UPDATE outbox SET status = 'sent', sent_at = ?, attempts = attempts + 1 WHERE id = ?`)
-        .bind(Date.now(), row.id)
-        .run();
-      sent++;
-    } catch (err) {
-      failed++;
-      const attempts = row.attempts + 1;
-      await env.DB.prepare(`UPDATE outbox SET attempts = ?, last_error = ?, status = ? WHERE id = ?`)
-        .bind(attempts, String(err).slice(0, 300), attempts >= 5 ? 'failed' : 'queued', row.id)
-        .run();
-    }
-  }
-  return { sent, failed };
-}
+export { flushOutbox } from './outbox';

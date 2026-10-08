@@ -1,16 +1,24 @@
 import { api } from '../core/api.js';
-import { html, render } from '../core/dom.js';
+import { html, render, mount } from '../core/dom.js';
+import { sessionState } from '../core/lifecycle.js';
+import { getLogout } from '../core/logout.js';
 import { initials } from '../core/format.js';
 import { icon, logo } from '../core/icons.js';
 import { openModal, poll, toast } from '../core/ui.js';
 import { API, BASE, CONSOLE, REVENUE, isAdminConsole } from './console.js';
 
-export const state = {
+export const state = sessionState({
   user: null,
   router: null,
   badges: { unresolved: 0, unreadNotifications: 0, pendingVerification: 0, activeHolds: 0, unreadChats: 0 },
   settings: null,
-};
+}, () => {
+  state.settings = null;
+  state.alerts = null;
+  state.badges = { unresolved: 0, unreadNotifications: 0, pendingVerification: 0, activeHolds: 0, unreadChats: 0 };
+  badgesInFlight = null;
+  firstBadges = true;
+});
 
 export const main = () => document.getElementById('main');
 export const navigate = (to, opts) => state.router.navigate(to, opts);
@@ -103,8 +111,7 @@ export function frame({ key, eyebrow = 'Operations', title, actions = '', mobile
   render(document.getElementById('topbar'), html`
     <div class="tb-desktop"><div class="tb-titles"><div class="tb-eyebrow">${eyebrow}</div><h1 class="tb-title">${title}</h1></div><div class="tb-actions">${actions}${bell()}</div></div>
     ${mobileHeader === null ? '' : mobileHeader || html`<div class="tb-mobile"><div class="row row-between"><h1 class="m-title">${mobileTitle || title}</h1>${bell({ dark: true })}</div></div>`}`);
-  const el = main();
-  render(el, template);
+  const el = mount(main(), template);
   return el;
 }
 
@@ -115,8 +122,7 @@ export function bare(template) {
   document.getElementById('sidebar').innerHTML = '';
   document.getElementById('topbar').innerHTML = '';
   document.getElementById('tabbar').hidden = true;
-  const el = main();
-  render(el, template);
+  const el = mount(main(), template);
   return el;
 }
 
@@ -127,10 +133,21 @@ let firstBadges = true;
 const listeners = new Set();
 export const onBadges = (fn) => (listeners.add(fn), () => listeners.delete(fn));
 
-export async function refreshBadges() {
+let badgesInFlight = null;
+export async function refreshBadges({ polling = false } = {}) {
+  if (!state.user) return;
+  if (!badgesInFlight) {
+    const task = fetchBadges().finally(() => { if (badgesInFlight === task) badgesInFlight = null; });
+    badgesInFlight = task;
+  }
+  try { await badgesInFlight; }
+  catch (err) { if (polling) throw err; }
+}
+
+async function fetchBadges() {
   if (!state.user) return;
   try {
-    const b = await api.get(`${API}/badges`);
+    const b = await api.get(`${API}/badges`, { scope: null });
     const prev = state.badges;
     const changed = ['unresolved', 'pendingVerification', 'unreadChats', 'disruptionsOpen'].some((k) => b[k] !== prev[k]);
     if (!firstBadges && b.pendingVerification > prev.pendingVerification && current.key !== 'verify') {
@@ -156,13 +173,11 @@ export async function refreshBadges() {
       }
     }
     for (const fn of listeners) fn(b);
-  } catch {
-    /* retry on the next tick */
-  }
+  } catch (err) { throw err; }
 }
 
 export function startBadges() {
-  if (!stopBadges) stopBadges = poll(refreshBadges, 15_000, { immediate: true });
+  if (!stopBadges) stopBadges = poll(() => refreshBadges({ polling: true }), 60_000, { immediate: true });
 }
 
 export function stopBadgePolling() {
@@ -171,16 +186,7 @@ export function stopBadgePolling() {
   firstBadges = true;
 }
 
-export async function logout() {
-  try {
-    await api.post('/api/auth/logout');
-  } catch {
-    /* ignore */
-  }
-  state.user = null;
-  stopBadgePolling();
-  navigate(`${BASE}/login`, { replace: true });
-}
+export const logout = () => getLogout().start();
 
 document.addEventListener('click', (e) => {
   const btn = e.target instanceof Element ? e.target.closest('[data-act="logout"]') : null;
@@ -191,8 +197,10 @@ let sessionOpen = false;
 export function showSessionExpired() {
   if (sessionOpen) return;
   sessionOpen = true;
+  const next = location.pathname + location.search + location.hash;
   state.user = null;
   stopBadgePolling();
+  state.router.navigate(`${BASE}/login?next=${encodeURIComponent(next)}`, { replace: true });
   openModal({
     role: 'alertdialog',
     label: 'Please sign in again',
@@ -201,7 +209,7 @@ export function showSessionExpired() {
     content: () => html`<span class="tile blue">${icon('lock', 24)}</span>
       <h2 class="dialog-title">Please sign in again</h2>
       <p class="body">Staff sessions end after 12 hours or when you sign out. Nothing you approved or sent was lost.</p>
-      <div class="dialog-actions"><a class="btn btn-primary btn-block" href="${BASE}/login?next=${encodeURIComponent(location.pathname + location.search)}" data-signin>Sign in</a></div>`,
+      <div class="dialog-actions"><a class="btn btn-primary btn-block" href="${BASE}/login?next=${encodeURIComponent(next)}" data-signin>Sign in</a></div>`,
     onOpen: (panel, m) => panel.querySelector('[data-signin]').addEventListener('click', () => {
       sessionOpen = false;
       m.close();

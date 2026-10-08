@@ -1,3 +1,4 @@
+import { createViewTools } from '../../core/view.js';
 import { openChangePassword, openEditProfile } from '../../core/account.js';
 import { $, html, on } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
@@ -5,8 +6,11 @@ import { initials } from '../../core/format.js';
 import { frame, state } from '../shell.js';
 import { CONSOLE } from '../console.js';
 
+const viewTools = createViewTools({ openChangePassword, openEditProfile, on, frame });
+
 /** The signed-in staff member's or admin's own account. Roles are assigned by an administrator, never here. */
 export function profileView() {
+  const { frame, on, openEditProfile, openChangePassword } = viewTools();
   const u = state.user;
   const main = frame({
     key: 'profile',
@@ -37,7 +41,7 @@ export function profileView() {
     phoneHelp: 'So the team can reach you. Never shown to players.',
     onSaved: (user) => {
       state.user = user;
-      profileView();
+      state.router.refresh();
     },
   }));
   on(root, 'click', '[data-act="password"]', () => openChangePassword(state.user.email, { minLength: 12 }));

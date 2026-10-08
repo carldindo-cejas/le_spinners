@@ -1,10 +1,14 @@
+import { createViewTools } from '../../core/view.js';
+import { requestGuard } from '../../core/lifecycle.js';
 import { api } from '../../core/api.js';
-import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, bookingTime, clock, dateLabel, dayClock, isoDate, longDate, peso, shortDate } from '../../core/format.js';
 import { errorState, poll, skeletonRows, toast } from '../../core/ui.js';
 import { bell, frame, showSessionExpired } from '../shell.js';
 import { API, BASE, REVENUE } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, poll, toast, frame });
 
 /**
  * Revenue (admin only, /revenue/). Read-only reporting over verified payments.
@@ -42,7 +46,7 @@ const statusSub = (r) => ({
   pending: '',
   rejected: 'Proof rejected · not collected',
   cancelled_credited: 'Cancelled by Le Spinners · value kept as booking credit',
-  cancelled_paid: 'After payment · refund not recorded',
+  cancelled_paid: 'After payment · reconcile external payment and credit records',
   cancelled_unverified: 'Before verification',
 })[r.payStatus] || '';
 const COLUMNS = [
@@ -271,12 +275,13 @@ function totalsStrip(d) {
   const t = d.totals;
   return html`<div class="ledger-total"><span class="eyebrow">Collected</span><span class="strong mono">${money(t.collected)}</span><span class="meta">${plural(t.collectedCount, 'verified payment')}</span></div>
     <div class="ledger-total"><span class="eyebrow">Pending verification</span><span class="strong mono">${money(t.pending)}</span><span class="meta">${plural(t.pendingCount, 'proof')} · not revenue yet</span></div>
-    ${t.cancelledAfterPaymentCount ? html`<div class="ledger-total amber"><span class="eyebrow">Cancelled after payment</span><span class="strong mono">${money(t.cancelledAfterPayment)}</span><span class="meta">${plural(t.cancelledAfterPaymentCount, 'booking')} · refunds aren't recorded</span></div>` : ''}`;
+    ${t.cancelledAfterPaymentCount ? html`<div class="ledger-total amber"><span class="eyebrow">Cancelled after payment</span><span class="strong mono">${money(t.cancelledAfterPayment)}</span><span class="meta">${plural(t.cancelledAfterPaymentCount, 'booking')} · reconcile credit ledger and external refunds</span></div>` : ''}`;
 }
 
 // ── Screen ────────────────────────────────────────────────────────────────
 
 export function revenueView({ query }) {
+  const { listen, scope, frame, render, api, setBusy, setTimeout, toast, on, poll, setInterval } = viewTools();
   const nowLine = () => `${longDate(isoDate(Date.now()))} · ${clock(Date.now())}`;
   let today = isoDate(Date.now());
   const f = readState(query, today);
@@ -290,6 +295,7 @@ export function revenueView({ query }) {
     template: html`<div class="page revenue">
       <section class="rev-grid" aria-label="Revenue summary" data-cards>${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}${skeletonRows(1, 'sk-card')}</section>
       <p class="small rev-note" data-note>Collected revenue counts payments staff have verified, on the day they were verified. Proofs still waiting, rejected proofs and unpaid holds are never counted.</p>
+      <p class="small rev-note" data-accounting></p>
 
       <section class="panel ledger" aria-labelledby="ledger-title">
         <div class="ledger-head">
@@ -380,6 +386,8 @@ export function revenueView({ query }) {
   async function loadSummary() {
     try {
       const s = await api.get(`${API}/revenue/summary`);
+      const accounting = await api.get(`${API}/revenue/accounting`).catch(() => null);
+      if (accounting) render($('[data-accounting]',root),html`Verified cash recorded (including later cancellations): ${money(accounting.verifiedCash)}. Recorded credit refunds: ${money(accounting.recordedRefunds)}. Active credit balances: ${money(accounting.activeCreditBalances)}. Reconcile cash and refunds against external payment records; active credits are separate from collected revenue.`);
       if (s.today !== today) today = s.today;
       const first = !resources.length;
       resources = s.resources;
@@ -391,7 +399,7 @@ export function revenueView({ query }) {
         Rejected proofs and unpaid holds are never counted.`);
     } catch (err) {
       render($cards, errorState(err, { title: "Revenue totals didn't load" }));
-      $('[data-act="retry"]', $cards)?.addEventListener('click', loadSummary);
+      listen($('[data-act="retry"]', $cards), 'click', loadSummary);
     }
   }
 
@@ -420,7 +428,7 @@ export function revenueView({ query }) {
       render($totals, '');
       render($pager, '');
       render($ledger, errorState(err, { title: "The ledger didn't load" }));
-      $('[data-act="retry"]', $ledger)?.addEventListener('click', loadLedger);
+      listen($('[data-act="retry"]', $ledger), 'click', loadLedger);
     } finally {
       if (seq === ledgerSeq) {
         $ledger.classList.remove('is-loading');
@@ -458,16 +466,23 @@ export function revenueView({ query }) {
 
   /** One part of the CSV (the server sends at most 1,000 rows per request). */
   async function exportPart(qs, part) {
-    const res = await fetch(`${API}/revenue/export?${qs}&part=${part}`, { credentials: 'same-origin', cache: 'no-store' });
-    if (res.status === 401) {
-      showSessionExpired();
-      throw new Error('Your session ended. Sign in again, then export.');
-    }
-    if (!res.ok) {
-      const body = await res.json().catch(() => null);
-      throw new Error(body?.error?.message || "The export didn't work. Please try again.");
-    }
-    return res;
+    const guard = requestGuard({ scope });
+    try {
+      guard.check();
+      const res = await fetch(`${API}/revenue/export?${qs}&part=${part}`, { credentials: 'same-origin', cache: 'no-store', signal: guard.signal });
+      const text = await res.text();
+      guard.check();
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error('Your session ended. Sign in again, then export.');
+      }
+      if (!res.ok) {
+        let body = null;
+        try { body = JSON.parse(text); } catch { /* not JSON */ }
+        throw new Error(body?.error?.message || "The export didn't work. Please try again.");
+      }
+      return { headers: res.headers, text: async () => text };
+    } finally { guard.release(); }
   }
 
   /** Fetches every part and checks nothing changed in between (else starts over, twice at most). */
@@ -495,9 +510,11 @@ export function revenueView({ query }) {
     setBusy(btn, true, 'Exporting…');
     try {
       const { name, chunks, rows } = await exportText(toQuery(f, { paged: false }), btn);
+      scope.assertCurrent();
       // A byte-order mark so spreadsheet apps read the file as UTF-8 (₱, ñ).
       const blob = new Blob([String.fromCharCode(0xfeff), ...chunks], { type: 'text/csv;charset=utf-8' });
       const url = URL.createObjectURL(blob);
+      const release = scope.own(() => URL.revokeObjectURL(url));
       const a = document.createElement('a');
       a.href = url;
       a.download = name;
@@ -505,7 +522,7 @@ export function revenueView({ query }) {
       document.body.append(a);
       a.click();
       a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      setTimeout(release, 10_000);
       toast('Ledger exported', { sub: `${plural(rows, 'record')} · same filters and order as the table` });
     } catch (err) {
       toast(err.message || "The export didn't work.", { type: 'error' });
@@ -574,7 +591,7 @@ export function revenueView({ query }) {
     if (!data || btn.disabled || !Number.isInteger(p) || p < 1 || p > data.pages || p === f.page) return;
     f.page = p;
     changed({ resetPage: false });
-    $('#ledger-title', root).scrollIntoView({ block: 'start', behavior: 'smooth' });
+    $('#ledger-title', root).scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
   });
   on(root, 'change', '[data-size]', (_e, sel) => {
     f.size = SIZES.includes(Number(sel.value)) ? Number(sel.value) : 10;

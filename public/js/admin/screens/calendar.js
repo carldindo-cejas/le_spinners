@@ -1,10 +1,13 @@
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render } from '../../core/dom.js';
+import { listen, $, html, on, render } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, firstName, hourLabel, isoDate, longDate, mmss } from '../../core/format.js';
 import { errorState, poll, skeletonRows } from '../../core/ui.js';
 import { frame } from '../shell.js';
 import { API, BASE } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, render, poll, frame });
 
 const LABEL = { available: 'Available', booked: 'Booked', unavailable: 'Verifying', held: 'Held', closed: 'Closed', past: 'Past', maintenance: 'Maintenance', open_play: 'Open play' };
 
@@ -27,6 +30,7 @@ function cell(s, r, now) {
 }
 
 export function calendarView({ query }) {
+  const { listen, frame, api, render, on, poll } = viewTools();
   let date = /^\d{4}-\d{2}-\d{2}$/.test(query.get('date') || '') ? query.get('date') : isoDate(Date.now());
   let activity = query.get('activity') || '';
   const root = frame({
@@ -66,7 +70,7 @@ export function calendarView({ query }) {
       </div></div>`);
     } catch (err) {
       render(grid, errorState(err));
-      $('[data-act="retry"]', grid)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', grid), 'click', load);
     }
   }
 

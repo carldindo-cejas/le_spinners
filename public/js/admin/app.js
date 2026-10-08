@@ -1,8 +1,9 @@
 import { api, onUnauthorized } from '../core/api.js';
 import { createRouter } from '../core/router.js';
+import { installLogout, logoutBoundary } from '../core/logout-view.js';
 import { html } from '../core/dom.js';
 import { icon } from '../core/icons.js';
-import { bare, frame, showSessionExpired, startBadges, state } from './shell.js';
+import { bare, frame, showSessionExpired, startBadges, state, stopBadgePolling } from './shell.js';
 import { loginView } from './screens/login.js';
 import { dashboardView } from './screens/dashboard.js';
 import { queueView, verifyDetailView } from './screens/verify.js';
@@ -29,7 +30,7 @@ import { BASE, CONSOLE, HOME, REVENUE, isAdminConsole } from './console.js';
 function guarded(view) {
   return (ctx) => {
     if (!state.user) {
-      state.router.navigate(`${BASE}/login?next=${encodeURIComponent(ctx.path + location.search)}`, { replace: true });
+      state.router.navigate(`${BASE}/login?next=${encodeURIComponent(ctx.path + location.search + location.hash)}`, { replace: true });
       return undefined;
     }
     if (state.user.role === CONSOLE.role) return view(ctx);
@@ -104,17 +105,18 @@ function watchConnection() {
 }
 
 async function boot() {
+  const logoutManager = installLogout({ state, loginPath: `${BASE}/login`, clear: stopBadgePolling });
   onUnauthorized(() => {
     if (state.user) showSessionExpired();
   });
   watchConnection();
   try {
-    const me = await api.get('/api/auth/session', { quiet401: true });
-    state.user = me.user;
+    const me = logoutManager.read() ? { user: null } : await api.get('/api/auth/session', { quiet401: true });
+    state.user = !logoutManager.read() ? me.user : null;
   } catch {
     state.user = null;
   }
-  state.router = createRouter({ routes, notFound: guarded(notFound), base: BASE });
+  state.router = createRouter({ routes, notFound: guarded(notFound), base: BASE, beforeView: () => logoutBoundary(bare) });
   if (state.user && state.user.role === CONSOLE.role) startBadges();
   await state.router.resolve();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});

@@ -197,6 +197,7 @@ body.staff { background: var(--chalk); }
 .checklist-panel.complete { border-color: var(--volt-300); box-shadow: inset 4px 0 0 var(--volt-400); }
 
 .viewer { position: fixed; inset: 0; z-index: 85; display: grid; grid-template-rows: auto minmax(0, 1fr); background: #0A111E; color: #fff; }
+.viewer :focus-visible { outline: 3px solid var(--volt-400); outline-offset: 3px; box-shadow: none; }
 @media (min-width: 1024px) { .viewer { grid-template-columns: minmax(0, 1fr) 380px; grid-template-rows: auto minmax(0, 1fr); } .viewer .v-rail { grid-row: 1 / span 2; grid-column: 2; } }
 .v-top { display: flex; align-items: center; gap: 12px; padding: calc(var(--safe-top) + 12px) 16px 12px; border-bottom: 1px solid rgba(255, 255, 255, .08); flex-wrap: wrap; }
 .v-top .icon-btn { background: var(--ink-raised); border-color: transparent; color: #fff; }

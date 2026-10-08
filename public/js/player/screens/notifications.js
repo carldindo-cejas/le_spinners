@@ -1,9 +1,13 @@
+import { historyPager } from '../../core/history.js';
+import { createViewTools } from '../../core/view.js';
 import { api } from '../../core/api.js';
-import { $, html, on, render, safeUrl } from '../../core/dom.js';
+import { listen, $, html, on, render, safeUrl } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { isoDate, relTime } from './util.js';
 import { errorState, poll, skeletonRows } from '../../core/ui.js';
 import { navigate, refreshBadges, show } from '../shell.js';
+
+const viewTools = createViewTools({ listen, api, on, render, poll, navigate, refreshBadges, show });
 
 const LOOK = {
   payment_verified: { tile: 'volt', icon: 'check' },
@@ -38,6 +42,7 @@ function row(n) {
 }
 
 export function notificationsView() {
+  const { listen, show, render, on, api, refreshBadges, navigate, poll } = viewTools();
   let filter = 'all';
   let data = null;
   const root = show(html`<div class="screen has-tabbar screen-enter">
@@ -46,12 +51,12 @@ export function notificationsView() {
     <div data-list>${skeletonRows(5)}</div>
   </div>`, { tab: 'alerts', nav: true });
   const list = $('[data-list]', root);
+  const pages = historyPager(api, list.parentElement, load);
   const filters = $('[data-filters]', root);
 
   function paint() {
-    const unreadMessages = data.notifications.filter((n) => n.type === 'new_message' && !n.read).length;
-    render(filters, FILTERS.map((f) => html`<button type="button" class="chip" data-filter="${f.key}" aria-pressed="${filter === f.key ? 'true' : 'false'}">${f.key === 'messages' && unreadMessages ? `Messages · ${unreadMessages}` : f.label}</button>`));
-    const items = data.notifications.filter((n) => filter === 'all' || (filter === 'messages' ? n.type === 'new_message' : n.type !== 'new_message'));
+    render(filters, FILTERS.map((f) => html`<button type="button" class="chip" data-filter="${f.key}" aria-pressed="${filter === f.key ? 'true' : 'false'}">${f.label}</button>`));
+    const items = data.notifications;
     if (!items.length) {
       render(list, html`<div class="empty"><span class="tile blue lg">${icon('bell', 26)}</span><p class="empty-title">You're all caught up</p><p class="empty-body">Booking updates and messages from Le Spinners show up here.</p></div>`);
       return;
@@ -67,7 +72,8 @@ export function notificationsView() {
 
   on(filters, 'click', '[data-filter]', (_e, btn) => {
     filter = btn.dataset.filter;
-    paint();
+    pages.reset();
+    load();
   });
   on(list, 'click', 'a.notif', async (e, a) => {
     if (a.dataset.read === '1') return;
@@ -88,12 +94,12 @@ export function notificationsView() {
 
   async function load() {
     try {
-      data = await api.get('/api/notifications');
+      data = await pages.get(`/api/notifications?filter=${filter}`);
       paint();
     } catch (err) {
       if (data) return;
       render(list, errorState(err));
-      $('[data-act="retry"]', list)?.addEventListener('click', load);
+      listen($('[data-act="retry"]', list), 'click', load);
     }
   }
   load();

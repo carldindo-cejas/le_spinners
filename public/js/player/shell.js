@@ -1,18 +1,24 @@
 import { api } from '../core/api.js';
-import { $, fragment, html, render } from '../core/dom.js';
+import { $, fragment, html, render, mount } from '../core/dom.js';
+import { sessionState } from '../core/lifecycle.js';
+import { getLogout } from '../core/logout.js';
 import { initials } from '../core/format.js';
 import { icon, logo } from '../core/icons.js';
 import { openModal, poll } from '../core/ui.js';
 
 /** App-wide state for the player shell. */
-export const state = {
+export const state = sessionState({
   user: null,
   facility: null,
   badges: { notifications: 0, chats: 0, holds: [] },
   router: null,
-};
+}, () => {
+  state.badges = { notifications: 0, chats: 0, holds: [] };
+  badgesInFlight = null;
+});
 
 export const main = () => document.getElementById('main');
+export const logout = () => getLogout().start();
 
 export function navigate(to, opts) {
   return state.router.navigate(to, opts);
@@ -105,10 +111,21 @@ export function onBadges(fn) {
   return () => badgeListeners.delete(fn);
 }
 
-export async function refreshBadges() {
+let badgesInFlight = null;
+export async function refreshBadges({ polling = false } = {}) {
+  if (!state.user) return;
+  if (!badgesInFlight) {
+    const task = fetchBadges().finally(() => { if (badgesInFlight === task) badgesInFlight = null; });
+    badgesInFlight = task;
+  }
+  try { await badgesInFlight; }
+  catch (err) { if (polling) throw err; }
+}
+
+async function fetchBadges() {
   if (!state.user) return;
   try {
-    const b = await api.get('/api/notifications/badges');
+    const b = await api.get('/api/notifications/badges', { scope: null });
     const changed = b.notifications !== state.badges.notifications || b.chats !== state.badges.chats;
     state.badges = b;
     if (changed) {
@@ -117,14 +134,12 @@ export async function refreshBadges() {
       refreshBells();
     }
     for (const fn of badgeListeners) fn(b);
-  } catch {
-    /* next poll will retry */
-  }
+  } catch (err) { throw err; }
 }
 
 export function startBadges() {
   if (stopBadges) return;
-  stopBadges = poll(refreshBadges, 15_000, { immediate: true });
+  stopBadges = poll(() => refreshBadges({ polling: true }), 60_000, { immediate: true });
 }
 
 export function stopBadgePolling() {
@@ -174,8 +189,7 @@ export function wireBack(root) {
 /** Standard screen render: sets chrome, renders, wires back links. */
 export function show(template, { tab = null, nav = false } = {}) {
   setChrome({ tab, nav });
-  const el = main();
-  render(el, template);
+  const el = mount(main(), template);
   wireBack(el);
   return el;
 }
@@ -187,9 +201,10 @@ let sessionDialogOpen = false;
 export function showSessionExpired() {
   if (sessionDialogOpen) return;
   sessionDialogOpen = true;
-  const next = location.pathname + location.search;
+  const next = location.pathname + location.search + location.hash;
   state.user = null;
   stopBadgePolling();
+  state.router.navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
   openModal({
     role: 'alertdialog',
     label: 'Please sign in again',

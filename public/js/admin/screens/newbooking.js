@@ -1,10 +1,14 @@
+import { createViewTools } from '../../core/view.js';
+import { postBooking } from '../../core/booking-request.js';
 import { api } from '../../core/api.js';
-import { $, $$, html, on, render, setBusy } from '../../core/dom.js';
+import { listen, $, $$, html, on, render, setBusy } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { addDays, durationLabel, isoDate, longDate, mergeStarts, minutesLabel, peso, rangeLabel, rangeLabelFull } from '../../core/format.js';
 import { clearFieldErrors, errorState, poll, showFieldErrors, skeletonRows, toast } from '../../core/ui.js';
 import { frame, navigate, state } from '../shell.js';
 import { API, BASE, CONSOLE } from '../console.js';
+
+const viewTools = createViewTools({ listen, api, on, render, setBusy, clearFieldErrors, poll, showFieldErrors, toast, frame, navigate });
 
 const ACTIVITIES = [
   { id: 'pickleball', label: 'Pickleball' },
@@ -20,10 +24,12 @@ const NOT_BOOKABLE = { maintenance: ' · maintenance', open_play: ' · open play
 const LOCKED_LABEL = { held: 'On hold', unavailable: 'Verifying', booked: 'Booked', closed: 'Closed', past: 'Started', maintenance: 'Maintenance', open_play: 'Open play' };
 
 async function rules() {
+  const { api } = viewTools();
   if (!state.settings) {
     try {
       state.settings = (await api.get(`${API}/rules`)).settings;
-    } catch {
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
       state.settings = { bookingWindowDays: 14, slotMinutes: 60 };
     }
   }
@@ -38,6 +44,7 @@ async function rules() {
  * and, required, the booker's name for reference.
  */
 export async function newBookingView({ query }) {
+  const { listen, frame, render, api, toast, on, clearFieldErrors, setBusy, navigate, showFieldErrors, poll } = viewTools();
   const r = await rules();
   const me = state.user;
   const today = isoDate(Date.now());
@@ -172,7 +179,7 @@ export async function newBookingView({ query }) {
     } catch (err) {
       if (quiet) return;
       render(slotsEl, errorState(err));
-      $('[data-act="retry"]', slotsEl)?.addEventListener('click', () => load());
+      listen($('[data-act="retry"]', slotsEl), 'click', () => load());
     }
   }
 
@@ -202,7 +209,7 @@ export async function newBookingView({ query }) {
     paintDay();
     slotsEl.querySelector(`[data-start="${start}"]`)?.focus();
   });
-  slotsEl.addEventListener('keydown', (e) => {
+  listen(slotsEl, 'keydown', (e) => {
     if (!['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
     const items = $$('.slot.available', slotsEl);
     const i = items.indexOf(document.activeElement);
@@ -226,14 +233,15 @@ export async function newBookingView({ query }) {
     clearFieldErrors(summaryPanel);
     paintSummary();
   });
-  bookBtn.addEventListener('click', async () => {
+  listen(bookBtn, 'click', async () => {
+    if (bookBtn.disabled) return;
     const bookerName = f.bookerName.trim();
     if (!picked.size || !f.resourceId || bookerName.length < 2) return;
     setBusy(bookBtn, true, 'Booking…');
     try {
-      const res = await api.post(`${API}/bookings`, {
+      const res = await postBooking(`${API}/bookings`, {
         resourceId: f.resourceId, date: f.date, starts: sorted(), rate: f.rate, payment: f.payment, bookerName,
-      });
+      }, state.user.id);
       toast('Booking confirmed', { sub: `${res.booking.bookerName || res.booking.user.name} · ${res.booking.resource.name} · ${res.booking.timeLabel} · ${res.booking.ref}` });
       navigate(`${BASE}/bookings/${res.booking.id}`, { replace: true });
     } catch (err) {
